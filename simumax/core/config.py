@@ -35,9 +35,12 @@ else:
 kNetOp = (
     "all_reduce",
     "all_gather",
+    "all_gatherv",
     "reduce_scatter",
+    "reduce_scatterv",
     "p2p",
     "all2all",
+    "alltoallv",
 )
 
 

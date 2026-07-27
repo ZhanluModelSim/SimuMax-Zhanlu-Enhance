@@ -64,9 +64,57 @@ class Router(LinearBase):
         model_info = f"{format_model_info_microbatch_tag(args)}-layer:{self.layer_idx}-name:{self.__class__.__name__}"
         state = args.thread_state
         rank_info = get_rank_group(args.rank, self.strategy)
-        
+
+        # Gating GEMM
         self.layers.append(AtomModel(fwd_cost=self._cost_info.fwd_compute_time,
                                  bwd_cost=self._cost_info.bwd_grad_act_time+self._cost_info.bwd_grad_w_time,))
+
+        # DP topk communication: allGatherv + allReduce across edp group
+        if self.strategy.edp_size > 1:
+            batch_size = self.input_info.tensors[0].size(0)
+            seq_len = self.input_info.tensors[0].size(1)
+            comm_size = (
+                batch_size * seq_len * self.topk
+                * self.dtype_to_element_size["fp32"]
+            )
+            ag_cost = self.system.compute_net_op_time(
+                "all_gather", comm_size,
+                comm_num=self.strategy.edp_size,
+                net=self._fsdp_moe_net_resolved,
+                strategy=self.strategy,
+                group_kind="edp",
+                comm_stage="Router_FWD_topk_AG",
+            )
+            self.layers.append(all_gather(
+                f"{state.comm_order}-{model_info}-edp_group:{rank_info['edp_group_id']}-topk_ag",
+                rank_info['edp_rank'], self.strategy.edp_size,
+                com_buff=com_buff,
+                fwd_cost=ag_cost, bwd_cost=0,
+                global_rank=args.rank,
+                net=self._fsdp_moe_net_resolved,
+                size_bytes=comm_size,
+            ))
+            state.comm_order += 1
+
+            ar_cost = self.system.compute_net_op_time(
+                "all_reduce", comm_size,
+                comm_num=self.strategy.edp_size,
+                net=self._fsdp_moe_net_resolved,
+                strategy=self.strategy,
+                group_kind="edp",
+                comm_stage="Router_FWD_topk_AR",
+            )
+            self.layers.append(all_reduce(
+                f"{state.comm_order}-{model_info}-edp_group:{rank_info['edp_group_id']}-topk_ar",
+                rank_info['edp_rank'], self.strategy.edp_size,
+                com_buff=com_buff,
+                fwd_cost=ar_cost, bwd_cost=0,
+                global_rank=args.rank,
+                net=self._fsdp_moe_net_resolved,
+                size_bytes=comm_size,
+            ))
+            state.comm_order += 1
+
         for layer in self.layers:
             layer.prefill(args, self.call_stk, com_buff)
     
@@ -108,7 +156,34 @@ class Router(LinearBase):
         assert self.hidden_size == self.input_info.tensors[0].size(2)
 
     def _comp_leaf_intra_net_info(self):
-        """Router does not model extra TP full-logit gather in the all2all path."""
+        """Router does not model extra TP full-logit gather in the all2all path.
+
+        DP topk communication (allGatherv + allReduce across edp group) is
+        modeled here for cost estimation.
+        """
+        if self.strategy.edp_size > 1:
+            batch_size = self.input_info.tensors[0].size(0)
+            seq_len = self.input_info.tensors[0].size(1)
+            comm_size = (
+                batch_size * seq_len * self.topk
+                * self.dtype_to_element_size["fp32"]
+            )
+            self._cost_info.fwd_net_time += self.system.compute_net_op_time(
+                "all_gather", comm_size,
+                comm_num=self.strategy.edp_size,
+                net=self._fsdp_moe_net_resolved,
+                strategy=self.strategy,
+                group_kind="edp",
+                comm_stage="Router_FWD_topk_AG",
+            )
+            self._cost_info.fwd_net_time += self.system.compute_net_op_time(
+                "all_reduce", comm_size,
+                comm_num=self.strategy.edp_size,
+                net=self._fsdp_moe_net_resolved,
+                strategy=self.strategy,
+                group_kind="edp",
+                comm_stage="Router_FWD_topk_AR",
+            )
 
     def _comp_leaf_act_info_impl(self):
         """

@@ -75,13 +75,17 @@ class SWACoreAttention(MetaModule):
         self.use_variance_tail_model = self.use_variance_tail_model or use_variance_tail_model
         if self.is_last_recompute and self.enable_recompute:
             self.set_variance_node(True)
+        # Flag: when True, CP A2A is handled externally (by HybridAttentionBlock),
+        # so skip _append_cp_a2a_layers in prefill.
+        self._skip_cp_a2a = False
 
     # ───  prefill  ───
     def prefill(self, args, call_stk='', com_buff=None):
         self.call_stk = call_stk + self.call_stk
         model_info = f"{format_model_info_microbatch_tag(args)}-name:{self.__class__.__name__}"
         rank_info = get_rank_group(args.rank, self.strategy)
-        self._append_cp_a2a_layers(args, model_info, rank_info, com_buff=com_buff)
+        if not self._skip_cp_a2a:
+            self._append_cp_a2a_layers(args, model_info, rank_info, com_buff=com_buff)
         self.layers.append(AtomModel(
             fwd_cost=self._cost_info.fwd_compute_time,
             bwd_cost=self._cost_info.bwd_grad_act_time + self._cost_info.bwd_grad_w_time,
