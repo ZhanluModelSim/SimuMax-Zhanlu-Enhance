@@ -398,6 +398,13 @@ class StrategyConfig(Config):
     efficiency_overrides: Optional[Dict[str, Any]] = None
 
     mem_factor: float = 0.94
+
+    # Layout transform overhead (µs) per all2all call in the levels cost
+    # path. Models the _fused_dim01_transpose_kernel that flanks each
+    # alltoallv in real profiling (e.g. Ulysses SP around attention).
+    # Added to each all2all phase's base_latency in
+    # _compute_net_op_time_levels. Default 0 (backward-compatible).
+    layout_transform_overhead_us: float = 0.0
     
     valid_recompute_granularity = [
             "full_block",
@@ -1670,10 +1677,13 @@ class SystemConfig(Config):
                     continue
                 actual_size_base = size * scale + size * scale / comm_num * offset
                 phase_size = actual_size_base * (composition[i] - 1) / composition[i]
-            phase_time = (
-                phase_size / (bw * 1024**3 * eff_factor) * 1e3
-                + (base_latency + fixed_latency) / 1e3
-            )
+            base_time = phase_size / (bw * 1024**3 * eff_factor) * 1e3
+            latency_time = (base_latency + fixed_latency) / 1e3
+            # Layout transform overhead (e.g. dim01_transpose around all2allv)
+            layout_oh = 0.0
+            if op_name == "all2all":
+                layout_oh = (getattr(strategy, 'layout_transform_overhead_us', 0) or 0) / 1e3
+            phase_time = base_time + latency_time + layout_oh
             phases.append((span, phase_size, bw, eff_factor, phase_time, base_latency))
         if not phases:
             # Group of one (or no crossed level): no communication.
