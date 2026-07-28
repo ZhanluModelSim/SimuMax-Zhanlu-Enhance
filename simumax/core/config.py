@@ -1370,6 +1370,9 @@ class SystemConfig(Config):
                 op_name, size, comm_num, comm_stage, strategy, group_kind)
         net_data = self.networks.get(net, None)
         assert net_data is not None, f"{net} not exist on {self.networks.keys()}, op_name={op_name}"
+        # alltoallv falls back to all2all when the network config only defines all2all
+        if op_name == "alltoallv" and "alltoallv" not in net_data.op and "all2all" in net_data.op:
+            op_name = "all2all"
         op:NetOpConfig = net_data.op.get(op_name, None)  # 0: scale 1: offset 2: efficient_factor
         assert op is not None, f"{op_name} not exist on {net_data}"
         scale, offset, eff_factor = op.scale, op.offset, op.efficient_factor
@@ -1981,6 +1984,9 @@ class ModelConfig(Config):
     swa_kv_head_num: int = None         # SWA KV head count (None = same as swa_head_num)
     swa_head_dim: int = None            # SWA head dim (None = use head_size)
     swa_window_size: int = 1028         # sliding window size (from op_define)
+    # ───  Trunk CP divisor (decouples trunk from attention CP sharding)  ───
+    trunk_cp_divisor: int = 1           # trunk seq = seq_len / (cp_size // divisor)
+                                        # e.g. divisor=2 -> trunk uses cp/2, attn uses cp
     # Per-layer SWA head count override. When set (list of length == layer_num),
     # each layer uses layers_swa_head_num[i] instead of swa_head_num, so that
     # the SWA/GQA ratio can vary across layers. None = backward-compatible,
