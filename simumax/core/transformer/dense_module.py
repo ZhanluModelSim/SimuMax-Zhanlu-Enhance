@@ -35,7 +35,8 @@ class Embedding(MetaModule):
         assert vocab_size % self.strategy.tp_size == 0
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size // self.strategy.tp_size
-    
+        self._cp_seq_mult = 1  # CP full-sequence gather multiplier
+
     def prefill(self, args, call_stk='', com_buff=None):
         self.call_stk = call_stk + self.call_stk
         model_info = f"{format_model_info_microbatch_tag(args)}-name:{self.__class__.__name__}"
@@ -179,7 +180,7 @@ class Embedding(MetaModule):
 
     def _comp_leaf_mem_accessed_info(self):
         batch_size = self.input_info.tensors[0].size(0)
-        seq_len = self.input_info.tensors[0].size(1)
+        seq_len = self.input_info.tensors[0].size(1) * self._cp_seq_mult
         input_size = batch_size * seq_len * 4
         weight_size = self.vocab_size * self.hidden_size * self.element_size
         output_size = batch_size * seq_len * self.hidden_size * self.element_size
@@ -2185,6 +2186,7 @@ class ParallelCE(MetaModule):
 
     def __init__(self, strategy:StrategyConfig, system, specific_name='') -> None:
         super().__init__(strategy, system, specific_name)
+        self._cp_seq_mult = 1  # CP full-sequence gather multiplier
     def prefill(self, args, call_stk='', com_buff=None):
         self.call_stk = call_stk + self.call_stk
         self.layers.append(AtomModel(fwd_cost=self._cost_info.fwd_compute_time,
