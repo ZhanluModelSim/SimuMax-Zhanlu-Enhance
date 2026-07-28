@@ -127,7 +127,8 @@ class SWACoreAttention(MetaModule):
         hidden_states = self.input_info.tensors[0]
         batch, seq_len = hidden_states.shape[:2]
         if self.strategy.cp_size > 1:
-            seq_len = seq_len * self.strategy.cp_size
+            td = getattr(self, '_trunk_cp_div', 1)
+            seq_len = seq_len * (self.strategy.cp_size // td)
             head_num = self.head_num // self.strategy.cp_size
             kv_head_num = self.kv_head_num // self.strategy.cp_size
         else:
@@ -151,7 +152,9 @@ class SWACoreAttention(MetaModule):
                 assert self.head_num % self.strategy.cp_size == 0, (
                     f"head_num {self.head_num} must be divisible by cp_size {self.strategy.cp_size}"
                 )
-                seq_len = seq_len * self.strategy.cp_size
+                td = getattr(self, '_trunk_cp_div', 1)
+                # SWA operates on full global seq = input_seq * (cp_size // td)
+                seq_len = seq_len * (self.strategy.cp_size // td)
                 head_num = self.head_num // self.strategy.cp_size
             else:
                 raise NotImplementedError(

@@ -1193,9 +1193,15 @@ class CoreAttention(MetaModule):
         hidden_states = self.input_info.tensors[0]
         batch, seq_len = hidden_states.shape[:2]
         if self.strategy.cp_size > 1:
-            seq_len = seq_len * self.strategy.cp_size
-            head_num = self.head_num // self.strategy.cp_size
-            kv_head_num = self.kv_head_num//self.strategy.cp_size
+            td = getattr(self, '_trunk_cp_div', 1)
+            if td > 1:
+                seq_len = seq_len // td
+                head_num = self.head_num
+                kv_head_num = self.kv_head_num
+            else:
+                seq_len = seq_len * self.strategy.cp_size
+                head_num = self.head_num // self.strategy.cp_size
+                kv_head_num = self.kv_head_num // self.strategy.cp_size
         else:
             head_num = self.head_num
             kv_head_num = self.kv_head_num
@@ -1576,11 +1582,16 @@ class CoreAttention(MetaModule):
         seq_len = self.input_info.tensors[0].size(1)
         if self.strategy.cp_size > 1:
             if self.strategy.cp_comm_type == "a2a":
-                assert self.head_num % self.strategy.cp_size == 0, (
-                    f"head_num {self.head_num} must be divisible by cp_size {self.strategy.cp_size}"
-                )
-                seq_len = seq_len * self.strategy.cp_size
-                head_num = self.head_num // self.strategy.cp_size
+                td = getattr(self, '_trunk_cp_div', 1)
+                if td > 1:
+                    # trunk_cp_divisor: FA operates on attn_seq = input_seq // td
+                    seq_len = seq_len // td
+                    head_num = self.head_num  # all heads per rank (sequence-parallel)
+                else:
+                    # Standard Ulysses: seq = per-rank * cp_size, heads divided
+                    assert self.head_num % self.strategy.cp_size == 0
+                    seq_len = seq_len * self.strategy.cp_size
+                    head_num = self.head_num // self.strategy.cp_size
             elif self.strategy.cp_comm_type == "all_gather":
                 raise NotImplementedError(f"cp_comm_type {self.strategy.cp_comm_type} not implemented yet.")
             else:
