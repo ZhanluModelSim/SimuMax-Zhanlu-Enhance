@@ -1599,9 +1599,17 @@ class CoreAttention(MetaModule):
         else:
             head_num = self.head_num
         batch_size = self.input_info.tensors[0].size(0)
-        base_flops = (
-            2 * batch_size * head_num * self.head_size * seq_len * seq_len
-        )  # 1 bmm
+        # Sparse attention: when global_tokens is set, each token attends to
+        # only global_tokens positions instead of the full sequence.
+        attn_tokens = getattr(self, '_fa_global_tokens', None)
+        if attn_tokens is not None:
+            base_flops = (
+                2 * batch_size * head_num * self.head_size * seq_len * attn_tokens
+            )  # sparse: S * g
+        else:
+            base_flops = (
+                2 * batch_size * head_num * self.head_size * seq_len * seq_len
+            )  # full: S * S
         base_flops *= 1 - self.attention_sparse_ratio
         # fwd is calculated by 2 bmm, bwd is calculated by 4 bmm
         self._compute_info.fwd_flops = 2 * base_flops

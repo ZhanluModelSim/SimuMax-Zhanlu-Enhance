@@ -2001,6 +2001,9 @@ class ModelConfig(Config):
     # compression ratio (head_num // kv_head_num) can vary across layers independently
     # of the SWA split. None = backward-compatible, all layers use the global kv_head_num.
     layers_kv_head_num: List[int] = None
+    # Per-operator compute time calibration ratios (profiling_time / sim_time).
+    # Applied as post-processing; not used by the framework directly.
+    calibration: Optional[Dict[str, float]] = None
     # ───  BT Model config  ───
     enable_vwn: bool = False            # True = VWN 层, False = 标准层
     use_attn_gate: bool = False         # True = AttnGate, False = ContextNorm
