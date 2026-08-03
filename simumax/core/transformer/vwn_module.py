@@ -212,9 +212,9 @@ class VWNInModule(MetaModule):
     # ───  Method 6: efficiency lookup  ───
     def _comp_cost_info(self):
         self._comp_cost_info_impl(
-            fwd_op="default",
-            bwd_grad_act_op="default",
-            bwd_grad_w_op="default",
+            fwd_op="vwn_in",
+            bwd_grad_act_op="vwn_in",
+            bwd_grad_w_op="vwn_in",
             enable_recompute=False,
         )
 
@@ -387,9 +387,9 @@ class VWNOutModule(MetaModule):
     # ───  Method 6: efficiency lookup  ───
     def _comp_cost_info(self):
         self._comp_cost_info_impl(
-            fwd_op="default",
-            bwd_grad_act_op="default",
-            bwd_grad_w_op="default",
+            fwd_op="vwn_out",
+            bwd_grad_act_op="vwn_out",
+            bwd_grad_w_op="vwn_out",
             enable_recompute=False,
         )
 

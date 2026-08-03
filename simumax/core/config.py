@@ -1417,16 +1417,24 @@ class SystemConfig(Config):
             if op_name == "all2all":
                 if "ep" in comm_stage.lower():
                     # Only consider the case where ep is an integer multiple of num_per_node
-                    # K machines cross ep, the total communication size = (k-1)/k *actual_size, 1 piece of data is sent to the self. 
+                    # K machines cross ep, the total communication size = (k-1)/k *actual_size, 1 piece of data is sent to the self.
                     # At the same time, cross-machine a2a will use one network card, so the bw is the bw of the single network card
-                    
+
                     # decision comm_size
                     k = max(1, math.ceil(comm_num / self.num_per_node))
-                    actual_size = (k-1)/k * actual_size
-                    
-                    # decision bw
-                    bw /= clos_divisor # bw of the single network card 
-                elif "cp" in comm_stage.lower(): 
+                    if k <= 1:
+                        # ep group fully intra-node: a2a still moves the full payload
+                        # on the node fabric (previously zeroed to latency-only).
+                        node_net = self._node_level_net()
+                        if node_net and node_net in self.networks:
+                            nb = self.networks[node_net].bandwidth
+                            bw = nb.gbps
+                            eff_factor = nb.efficient_factor
+                    else:
+                        actual_size = (k-1)/k * actual_size
+                        # decision bw
+                        bw /= clos_divisor # bw of the single network card
+                elif "cp" in comm_stage.lower():
                     # Similar to ep all2all: when cp spans multiple nodes, only cross-node
                     # traffic contributes to inter-node transfer and each group is limited by one NIC.
                     if strategy is not None:
@@ -1435,11 +1443,24 @@ class SystemConfig(Config):
                         # arithmetic-progression mesh math; the legacy ceil-based
                         # (k-1)/k is wrong for non-contiguous strides (e.g. cp
                         # with tp=8 spans 2 nodes -> real ratio 0.5, legacy k=1 -> 0).
-                        actual_size = group_cross_node_ratio("cp", strategy, self.num_per_node) * actual_size
+                        ratio = group_cross_node_ratio("cp", strategy, self.num_per_node)
+                        if ratio <= 0:
+                            # Fully intra-node cp group: a2a still moves the full
+                            # payload on the node fabric (previously zeroed to
+                            # latency-only).
+                            node_net = self._node_level_net()
+                            if node_net and node_net in self.networks:
+                                nb = self.networks[node_net].bandwidth
+                                bw = nb.gbps
+                                eff_factor = nb.efficient_factor
+                            # else: keep inter_node bw with full payload (conservative)
+                        else:
+                            actual_size *= ratio
+                            bw /= clos_divisor
                     else:
                         k = max(1, math.ceil(comm_num / self.num_per_node))
                         actual_size = (k - 1) / k * actual_size
-                    bw /= clos_divisor
+                        bw /= clos_divisor
             
             # 3. tp+sp & ag cp & dp
             if op_name in ["all_reduce", "all_gather", "reduce_scatter"]:
@@ -1546,6 +1567,17 @@ class SystemConfig(Config):
             kind = "clos"
         # Legacy default convergence_ratio = num_per_node for clos
         return kind, self.num_per_node
+
+    def _node_level_net(self):
+        """Net name of the innermost (node) topology level, if declared.
+
+        Used to cost intra-node collectives (groups that fit entirely on one
+        node) at the node fabric instead of collapsing to zero traffic.
+        """
+        levels = (self.topology or {}).get("levels")
+        if levels:
+            return levels[0].get("net")
+        return None
 
     def _level_net_params(self, net: str, op_name: str, comm_num: int):
         """Resolve (scale, offset, eff_factor, bw_gbps, latency_us, fixed_latency_us)
@@ -2001,9 +2033,6 @@ class ModelConfig(Config):
     # compression ratio (head_num // kv_head_num) can vary across layers independently
     # of the SWA split. None = backward-compatible, all layers use the global kv_head_num.
     layers_kv_head_num: List[int] = None
-    # Per-operator compute time calibration ratios (profiling_time / sim_time).
-    # Applied as post-processing; not used by the framework directly.
-    calibration: Optional[Dict[str, float]] = None
     # ───  BT Model config  ───
     enable_vwn: bool = False            # True = VWN 层, False = 标准层
     use_attn_gate: bool = False         # True = AttnGate, False = ContextNorm

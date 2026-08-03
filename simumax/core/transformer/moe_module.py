@@ -280,9 +280,9 @@ class Router(LinearBase):
 
     def _comp_cost_info(self):
         self._comp_cost_info_impl(
-            fwd_op="matmul",
-            bwd_grad_act_op="matmul",
-            bwd_grad_w_op="matmul",
+            fwd_op="router",
+            bwd_grad_act_op="router",
+            bwd_grad_w_op="router",
             enable_recompute=self.enable_recompute,
         )
 
@@ -597,13 +597,16 @@ class Permutation(MetaModule):
         ) * self.dtype_to_element_size[self.strategy.dtype]
 
         def split_stage_time(op_name, mem_chunks):
+            # compute_end2end_time returns ms; _cost_info.*_time fields are
+            # seconds (base _comp_cost_info_impl divides by 1e3). Missing the
+            # /1e3 inflated the permute stage 1000x.
             return sum(
                 self.compute_end2end_time(
                     compute_time=0,
                     mem_time=self.system.compute_mem_access_time(op_name, mem_bytes),
                 )
                 for mem_bytes in mem_chunks
-            )
+            ) / 1e3
 
         self._cost_info.fwd_compute_time = split_stage_time(
             "permute_fwd",
@@ -913,13 +916,16 @@ class UnPermutation(MetaModule):
         ) * self.dtype_to_element_size[self.strategy.dtype]
 
         def split_stage_time(op_name, mem_chunks):
+            # compute_end2end_time returns ms; _cost_info.*_time fields are
+            # seconds (base _comp_cost_info_impl divides by 1e3). Missing the
+            # /1e3 inflated the permute stage 1000x.
             return sum(
                 self.compute_end2end_time(
                     compute_time=0,
                     mem_time=self.system.compute_mem_access_time(op_name, mem_bytes),
                 )
                 for mem_bytes in mem_chunks
-            )
+            ) / 1e3
 
         self._cost_info.fwd_compute_time = split_stage_time(
             "permute_fwd",
@@ -1135,16 +1141,16 @@ class GroupLinearCol(GroupLinearBase):
     def _comp_cost_info(self):
         if self.strategy.fp8:
             self._comp_cost_info_impl(
-                fwd_op="fp8_group_matmul",
-                bwd_grad_act_op="fp8_group_matmul",
-                bwd_grad_w_op="fp8_group_matmul",
+                fwd_op="fp8_group_linear_col",
+                bwd_grad_act_op="fp8_group_linear_col",
+                bwd_grad_w_op="fp8_group_linear_col",
                 enable_recompute=self.enable_recompute,
             )
         else:
             self._comp_cost_info_impl(
-                fwd_op="group_matmul",
-                bwd_grad_act_op="group_matmul",
-                bwd_grad_w_op="group_matmul",
+                fwd_op="group_linear_col",
+                bwd_grad_act_op="group_linear_col",
+                bwd_grad_w_op="group_linear_col",
                 enable_recompute=self.enable_recompute,
             )
 
@@ -1366,16 +1372,16 @@ class GroupLinearRow(GroupLinearBase):
     def _comp_cost_info(self):
         if self.strategy.fp8:
             self._comp_cost_info_impl(
-                fwd_op="fp8_group_matmul",
-                bwd_grad_act_op="fp8_group_matmul",
-                bwd_grad_w_op="fp8_group_matmul",
+                fwd_op="fp8_group_linear_row",
+                bwd_grad_act_op="fp8_group_linear_row",
+                bwd_grad_w_op="fp8_group_linear_row",
                 enable_recompute=self.enable_recompute,
             )
         else:
             self._comp_cost_info_impl(
-                fwd_op="group_matmul",
-                bwd_grad_act_op="group_matmul",
-                bwd_grad_w_op="group_matmul",
+                fwd_op="group_linear_row",
+                bwd_grad_act_op="group_linear_row",
+                bwd_grad_w_op="group_linear_row",
                 enable_recompute=self.enable_recompute,
             )
 

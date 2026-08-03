@@ -1022,9 +1022,9 @@ class LayerNorm(MetaModule):
 
     def _comp_cost_info(self):
         self._comp_cost_info_impl(
-            fwd_op="default",
-            bwd_grad_act_op="default",
-            bwd_grad_w_op="default",
+            fwd_op="layer_norm",
+            bwd_grad_act_op="layer_norm",
+            bwd_grad_w_op="layer_norm",
             enable_recompute=self.enable_recompute,
         )
 
@@ -1623,46 +1623,73 @@ class CoreAttention(MetaModule):
         self._compute_info.bwd_grad_w_flops = 0
 
     def _comp_leaf_mem_accessed_info(self):
+        """Memory access per op_define.md MojoPagedPrefillGQAOp (L522-535).
+
+        Training (KV_LEN=0): Q is bf16, K/V are read from int8 cache,
+        output is bf16, LSE is fp32.  FA attends to _fa_global_tokens (window)
+        K/V positions; SWA (CoreAttention sub-class) is handled in swa_module.py.
+
+        CP: applies trunk_cp_divisor to seq_len (same as _comp_leaf_flops_info),
+        so FA operates on attn_seq = input_seq // td per rank.
+        """
         batch_size = self.input_info.tensors[0].size(0)
         seq_len = self.input_info.tensors[0].size(1)
-        hidden_size = self.input_info.tensors[0].size(2)
+        if self.strategy.cp_size > 1 and self.strategy.cp_comm_type == "a2a":
+            td = getattr(self, '_trunk_cp_div', 1)
+            if td > 1:
+                seq_len = seq_len // td
+
+        # FA window: each query token attends to only attn_tokens positions.
+        attn_tokens = getattr(self, '_fa_global_tokens', seq_len)
+
+        # Q / output: bf16 (2 B)   K / V: int8 cache (1 B)   LSE: fp32 (4 B)
+        q_elem = self.dtype_to_element_size['bf16']   # 2
+        kv_elem = self.dtype_to_element_size['fp8']   # 1  (int8)
+        o_elem = self.dtype_to_element_size['bf16']   # 2
+        lse_elem = self.dtype_to_element_size['fp32'] # 4
+
         q_size = batch_size * self.head_num * seq_len * self.head_size
-        k_size = q_size
-        v_size = q_size
-        # output_grad_size = batch_size * seq_len * hidden_size
-        output_grad_size = batch_size * seq_len * self.head_num * self.head_size
-        lse_size = batch_size * self.head_num * seq_len
+        k_size = batch_size * self.kv_head_num * attn_tokens * self.head_size
+        v_size = batch_size * self.kv_head_num * attn_tokens * self.head_size
+
+        q_bytes = q_size * q_elem
+        k_bytes = k_size * kv_elem
+        v_bytes = v_size * kv_elem
+        o_bytes = batch_size * seq_len * self.head_num * self.head_size * o_elem
+        lse_bytes = batch_size * self.head_num * seq_len * lse_elem
+
         if self.use_flash_sdp:
             self._compute_info.fwd_accessed_mem = (
-                q_size + k_size + v_size + output_grad_size + lse_size
-            ) * self.element_size
+                q_bytes + k_bytes + v_bytes + o_bytes + lse_bytes
+            )
+            # bwd: Q/K/V are read 2x (once in recompute-like fashion + grad).
             self._compute_info.bwd_grad_act_accessed_mem = (
-                2 * q_size + 2 * k_size + 2 * v_size + output_grad_size + lse_size
-            ) * self.element_size
+                2 * q_bytes + 2 * k_bytes + 2 * v_bytes + o_bytes + lse_bytes
+            )
             self._compute_info.bwd_grad_w_accessed_mem = 0
             self._compute_info.recompute_accessed_mem = (
                 self._compute_info.fwd_accessed_mem if self.enable_recompute else 0
             )
             return
+        # ── math_sdp fallback (kept for completeness) ──
         softmax_size = batch_size * self.head_num * seq_len * seq_len
+        softmax_bytes = softmax_size * self.element_size  # math-SDP uses bf16 softmax
         self._compute_info.fwd_accessed_mem += (
-            q_size + k_size + softmax_size
-        ) * self.element_size
-        self._compute_info.fwd_accessed_mem += 2 * softmax_size * self.element_size
+            q_bytes + k_bytes + softmax_bytes
+        )
+        self._compute_info.fwd_accessed_mem += 2 * softmax_bytes
         self._compute_info.fwd_accessed_mem += (
-            softmax_size + v_size + output_grad_size
-        ) * self.element_size
+            softmax_bytes + v_bytes + o_bytes
+        )
         self._compute_info.recompute_accessed_mem = (
             self._compute_info.fwd_accessed_mem if self.enable_recompute else 0
         )
         self._compute_info.bwd_grad_act_accessed_mem += (
-            2 * (softmax_size + v_size + output_grad_size) * self.element_size
+            2 * (softmax_bytes + v_bytes + o_bytes)
         )
+        self._compute_info.bwd_grad_act_accessed_mem += 2 * softmax_bytes
         self._compute_info.bwd_grad_act_accessed_mem += (
-            2 * softmax_size * self.element_size
-        )
-        self._compute_info.bwd_grad_act_accessed_mem += (
-            2 * (q_size + k_size + softmax_size) * self.element_size
+            2 * (q_bytes + k_bytes + softmax_bytes)
         )
         self._compute_info.bwd_grad_w_accessed_mem = 0
 

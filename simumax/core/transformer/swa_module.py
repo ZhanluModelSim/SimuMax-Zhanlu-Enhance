@@ -183,26 +183,52 @@ class SWACoreAttention(MetaModule):
 
     # ───  Method 2: memory access  ───
     def _comp_leaf_mem_accessed_info(self):
-        """Matches CoreAttention.flash_sdp memory access pattern.
-        Note: k_size = v_size = q_size (all use head_num, not kv_head_num),
-        consistent with CoreAttention's estimation convention.
+        """Memory access per op_define.md MojoPagedPrefillSWAOp (L548-575).
+
+        Training (KV_LEN=0): Q is bf16, K/V are read from int8 cache,
+        output is bf16, LSE is fp32.  K/V access is limited to the sliding
+        window — each query only reads ~window_size K/V tokens.
+
+        CP: SWA operates on full global seq (input_seq × cp_size/td) with
+        heads divided by cp_size (same as _comp_leaf_flops_info).
         """
         batch_size = self.input_info.tensors[0].size(0)
         seq_len = self.input_info.tensors[0].size(1)
-        q_size = batch_size * self.head_num * seq_len * self.head_size
-        k_size = q_size   # consistent with CoreAttention
-        v_size = q_size   # consistent with CoreAttention
-        output_grad_size = batch_size * seq_len * self.head_num * self.head_size
-        lse_size = batch_size * self.head_num * seq_len
+        head_num = self.head_num
+        kv_head_num = self.kv_head_num
+        if self.strategy.cp_size > 1:
+            if self.strategy.cp_comm_type == "a2a":
+                td = getattr(self, '_trunk_cp_div', 1)
+                # SWA operates on full global seq = input_seq * (cp_size // td)
+                seq_len = seq_len * (self.strategy.cp_size // td)
+                head_num = self.head_num // self.strategy.cp_size
+                kv_head_num = self.kv_head_num // self.strategy.cp_size
+
+        # Per op_define.md: K/V cache is int8 (1 B); Q / output are bf16 (2 B);
+        # LSE is fp32 (4 B).
+        q_elem = self.dtype_to_element_size['bf16']   # 2
+        kv_elem = self.dtype_to_element_size['fp8']   # 1  (int8)
+        o_elem = self.dtype_to_element_size['bf16']   # 2
+        lse_elem = self.dtype_to_element_size['fp32'] # 4
+
+        q_size = batch_size * head_num * seq_len * self.head_size
+        # SWA: each query attends to at most window_size K/V tokens.
+        k_size = batch_size * kv_head_num * self.window_size * self.head_size
+        v_size = batch_size * kv_head_num * self.window_size * self.head_size
+
+        q_bytes = q_size * q_elem
+        k_bytes = k_size * kv_elem
+        v_bytes = v_size * kv_elem
+        o_bytes = batch_size * seq_len * head_num * self.head_size * o_elem
+        lse_bytes = batch_size * head_num * seq_len * lse_elem
 
         if self.use_flash_sdp:
             self._compute_info.fwd_accessed_mem = (
-                q_size + k_size + v_size + output_grad_size + lse_size
-            ) * self.element_size
+                q_bytes + k_bytes + v_bytes + o_bytes + lse_bytes
+            )
             self._compute_info.bwd_grad_act_accessed_mem = (
-                2 * q_size + 2 * k_size + 2 * v_size
-                + output_grad_size + lse_size
-            ) * self.element_size
+                2 * q_bytes + 2 * k_bytes + 2 * v_bytes + o_bytes + lse_bytes
+            )
             self._compute_info.bwd_grad_w_accessed_mem = 0
             self._compute_info.recompute_accessed_mem = (
                 self._compute_info.fwd_accessed_mem
@@ -212,24 +238,23 @@ class SWACoreAttention(MetaModule):
 
         # math_sdp fallback
         softmax_size = batch_size * self.head_num * seq_len * seq_len
+        softmax_bytes = softmax_size * self.element_size
         self._compute_info.fwd_accessed_mem += (
-            q_size + k_size + softmax_size
-        ) * self.element_size
-        self._compute_info.fwd_accessed_mem += 2 * softmax_size * self.element_size
+            q_bytes + k_bytes + softmax_bytes
+        )
+        self._compute_info.fwd_accessed_mem += 2 * softmax_bytes
         self._compute_info.fwd_accessed_mem += (
-            softmax_size + v_size + output_grad_size
-        ) * self.element_size
+            softmax_bytes + v_bytes + o_bytes
+        )
         self._compute_info.recompute_accessed_mem = (
             self._compute_info.fwd_accessed_mem if self.enable_recompute else 0
         )
         self._compute_info.bwd_grad_act_accessed_mem += (
-            2 * (softmax_size + v_size + output_grad_size) * self.element_size
+            2 * (softmax_bytes + v_bytes + o_bytes)
         )
+        self._compute_info.bwd_grad_act_accessed_mem += 2 * softmax_bytes
         self._compute_info.bwd_grad_act_accessed_mem += (
-            2 * softmax_size * self.element_size
-        )
-        self._compute_info.bwd_grad_act_accessed_mem += (
-            2 * (q_size + k_size + softmax_size) * self.element_size
+            2 * (q_bytes + k_bytes + softmax_bytes)
         )
         self._compute_info.bwd_grad_w_accessed_mem = 0
 
@@ -238,9 +263,10 @@ class SWACoreAttention(MetaModule):
         batch_size = self.input_info.tensors[0].size(0)
         seq_len = self.input_info.tensors[0].size(1)
 
+        # K/V saved in bf16 (training dtype), full seq_len, kv_head_num heads
         q_size = batch_size * self.head_num * seq_len * self.head_size
-        k_size = q_size
-        v_size = q_size
+        k_size = batch_size * self.kv_head_num * seq_len * self.head_size
+        v_size = batch_size * self.kv_head_num * seq_len * self.head_size
         lse_size = batch_size * self.head_num * seq_len
         output_grad_size = batch_size * seq_len * self.head_size * self.head_num
 
@@ -279,11 +305,12 @@ class SWACoreAttention(MetaModule):
 
     # ───  Method 6: efficiency lookup op_name ───
     def _comp_cost_info(self):
-        """SWA reuses sdp_fwd/sdp_bwd efficiency entries (same compute pattern)."""
+        """SWA uses dedicated swa_fwd/swa_bwd entries (per-rank head = 3 → low
+        tensor-core utilization, distinct from FA's sdp_fwd/sdp_bwd)."""
         self._comp_cost_info_impl(
-            fwd_op="sdp_fwd",
-            bwd_grad_act_op="sdp_bwd",
-            bwd_grad_w_op="sdp_bwd",
+            fwd_op="swa_fwd",
+            bwd_grad_act_op="swa_bwd",
+            bwd_grad_w_op="swa_bwd",
             enable_recompute=self.enable_recompute,
         )
 

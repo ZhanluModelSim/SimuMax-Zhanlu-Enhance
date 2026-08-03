@@ -901,7 +901,9 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
 
             # save details for each stage, for analysis
             self.set_details(stage, compute_details, io_details)
-            return end2end_time
+            # end2end_time is in ms (from compute_op_accuracy_time / compute_mem_access_time);
+            # _cost_info consumers expect seconds → convert ms → s.
+            return end2end_time / 1e3
         # 1. forward   
         self._cost_info.fwd_compute_time = compute_details(fwd_op, 'fwd', self._compute_info.fwd_flops, self._compute_info.fwd_accessed_mem)
         self._cost_info.bwd_grad_act_time = compute_details(bwd_grad_act_op, 'bwd_grad_act', self._compute_info.bwd_grad_act_flops, self._compute_info.bwd_grad_act_accessed_mem)
