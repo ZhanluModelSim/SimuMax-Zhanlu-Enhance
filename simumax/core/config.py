@@ -958,6 +958,14 @@ class NetOpConfig:
     fixed_latency_us: float = None
     fixed_latency_us_by_comm_num: Dict[str, float] = None
     dp_fixed_bw: float = None
+    # Volume calibration (measured-wire / model-formula-wire). Applied to the
+    # payload after scale/offset topology factor. Default 1.0 = formula volume.
+    # Used e.g. by hccs_fsdp to reconcile the model full-params formula with the
+    # real FSDP AG/RS per-step volume read from profiling (RDMA+HCCS, SDMA
+    # deduped): all_gather 6.53GB / formula 9.80GB = 0.666, reduce_scatter
+    # 7.42GB / 9.80GB = 0.757. Real AG != RS because AG carries bf16 weights
+    # while RS scatters grads (partly fp32) - measured asymmetry.
+    volume_scale: float = 1.0
 
 
 @dataclass
@@ -1383,6 +1391,13 @@ class SystemConfig(Config):
         actual_size = size * scale
         chunk_size = actual_size / comm_num
         actual_size += chunk_size * offset
+        # Per-op volume calibration (measured-wire / model-formula-wire), e.g.
+        # hccs_fsdp AG/RS reconciled to real per-step volume from profiling.
+        # Applied after the scale/offset topology factor so it only adjusts the
+        # payload, not the ring/group semantics.
+        vs = getattr(op, 'volume_scale', 1.0)
+        if vs != 1.0:
+            actual_size *= vs
 
         # Specially adapted to the dense-dp-family communication bandwidth of
         # A100 PCIe. `dp_cp` is Megatron's dense optimizer/data-parallel group
@@ -1427,8 +1442,11 @@ class SystemConfig(Config):
                         # on the node fabric (previously zeroed to latency-only).
                         node_net = self._node_level_net()
                         if node_net and node_net in self.networks:
-                            nb = self.networks[node_net].bandwidth
-                            bw = nb.gbps
+                            net_cfg = self.networks[node_net]
+                            nb = net_cfg.bandwidth
+                            # node fabric effective bw = gbps + overlay
+                            # (topology_skeleton_templates: 56 + 224 = 280 GB/s)
+                            bw = nb.gbps + (getattr(net_cfg, 'overlay_bandwidth_gbps', 0) or 0)
                             eff_factor = nb.efficient_factor
                     else:
                         actual_size = (k-1)/k * actual_size
@@ -1450,8 +1468,11 @@ class SystemConfig(Config):
                             # latency-only).
                             node_net = self._node_level_net()
                             if node_net and node_net in self.networks:
-                                nb = self.networks[node_net].bandwidth
-                                bw = nb.gbps
+                                net_cfg = self.networks[node_net]
+                                nb = net_cfg.bandwidth
+                                # node fabric effective bw = gbps + overlay
+                                # (topology_skeleton_templates: 56 + 224 = 280 GB/s)
+                                bw = nb.gbps + (getattr(net_cfg, 'overlay_bandwidth_gbps', 0) or 0)
                                 eff_factor = nb.efficient_factor
                             # else: keep inter_node bw with full payload (conservative)
                         else:

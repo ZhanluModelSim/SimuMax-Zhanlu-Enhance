@@ -353,9 +353,7 @@ class Permutation(MetaModule):
 
 
         if self.strategy.ep_size > 1:
-            comm_size = (
-                self.permuted_act_size * self.dtype_to_element_size[self.strategy.dtype]
-            )
+            comm_size = self.dispatch_comm_size
             cost = self.system.compute_net_op_time(
                 "all2all",
                 comm_size,
@@ -363,10 +361,10 @@ class Permutation(MetaModule):
                 net=self.strategy.ep_net,
                 strategy=self.strategy,
                 group_kind="ep",
-            )   
-            self.layers.append(all2all(f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}", 
+            )
+            self.layers.append(all2all(f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}",
                                          rank_info['ep_rank'], self.strategy.ep_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank, net=self.strategy.ep_net, size_bytes=comm_size))      
+                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank, net=self.strategy.ep_net, size_bytes=comm_size))
             state.comm_order += 1
         if self.strategy.etp_size > 1:
             comm_size = (
@@ -430,6 +428,20 @@ class Permutation(MetaModule):
         hidden_size = self.input_info.tensors[0].size(2)
         return batch_size * seq_len * hidden_size
 
+    @property
+    def dispatch_comm_size(self):
+        """MoE dispatch payload (full all-to-all).
+
+        communication_matrix.json 的 8-pair alltoall 实测显示 MoE dispatch 是
+        全 8-rank alltoall（cross≈746MB = 100.7MB×7，每条 token 全 hidden 发往
+        每个持有其 topk 专家的 peer），不是部分发送。故直接用完整 permuted
+        payload 作为 comm_size。
+        """
+        return (
+            self.permuted_act_size
+            * self.dtype_to_element_size[self.strategy.dtype]
+        )
+
     def _pre_op(self):
         super()._pre_op()
         # if self.strategy.dispatch_probs:
@@ -461,9 +473,7 @@ class Permutation(MetaModule):
 
     def _comp_leaf_intra_net_info(self):
         if self.strategy.ep_size > 1:
-            comm_size = (
-                self.permuted_act_size * self.dtype_to_element_size[self.strategy.dtype]
-            )
+            comm_size = self.dispatch_comm_size
             # fwd
             self._cost_info.fwd_net_time += self.system.compute_net_op_time(
                 "all2all",
