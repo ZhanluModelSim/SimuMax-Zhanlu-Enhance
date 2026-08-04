@@ -455,24 +455,41 @@ def group_level_span(group_kind, strategy, levels):
 def all2all_level_fraction(group_kind, strategy, levels, level_index):
     """Fraction of an all2all member's traffic that uses the given level's links.
 
-    For the innermost level (index 0), ALL traffic uses its fabric since
-    there is no lower level to handle within-unit traffic: frac = 1.0.
-    For outer levels (index > 0), only peers in different units of this
-    level cross its boundary: frac = (K - members_per_unit) / (K - 1).
+    A member's K-1 peers partition into bands by the innermost level whose
+    unit contains them: peers in the same unit of level i but in different
+    units of level i-1 use level i's fabric. The band fraction is
+    (members_i - members_{i-1}) / (K - 1) with members_{-1} = 1 (self).
+
+    Innermost level (index 0): the band is the intra-unit peers,
+    (members_0 - 1) / (K - 1). When the group fits entirely within one
+    level-0 unit (units_touched == 1), members_0 == K and the fraction is 1.0.
+    Outermost level: carries the residual traffic — peers not in the same
+    unit of the second-to-last level — (K - members_{n-2}) / (K - 1). This
+    handles degenerate outer levels (size=1) whose members_per_unit does not
+    grow, e.g. a so_clos fabric connecting whole nodes.
+    The fractions across all levels sum to 1.0.
     """
     group_size, _ = _group_size_and_stride(group_kind, strategy)
     if group_size <= 1:
         return 0.0
     _, spans = group_level_span(group_kind, strategy, levels)
+    n_levels = len(spans)
     span = spans[level_index]
-    if level_index == 0:
-        # Innermost level: all traffic uses this fabric (no lower level
-        # to offload within-unit traffic). Under the default "max" policy
-        # this only matters when the group fits entirely within one unit
-        # (e.g. EP=128 within a 128-GPU pod) — without this, the cost
-        # would be incorrectly 0.
+    if n_levels == 1:
+        # Single level: all traffic uses this fabric.
         return 1.0
-    return (group_size - span.members_per_unit) / (group_size - 1)
+    if level_index == 0:
+        # Innermost level: only intra-unit peers use this fabric. When the
+        # group fits entirely within one unit (e.g. EP=128 within a 128-GPU
+        # pod), members_0 == K and the fraction is 1.0.
+        return (span.members_per_unit - 1) / (group_size - 1)
+    prev_members = spans[level_index - 1].members_per_unit
+    if level_index == n_levels - 1:
+        # Outermost level: residual traffic (peers in different units of the
+        # second-to-last level), including peers split across this level's
+        # own units. Handles degenerate size=1 outer levels.
+        return (group_size - prev_members) / (group_size - 1)
+    return (span.members_per_unit - prev_members) / (group_size - 1)
 
 
 # --- Machine-level straggler model (design_simu_network_fabric.md, Phase C) ---
