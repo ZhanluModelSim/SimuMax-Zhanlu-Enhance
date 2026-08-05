@@ -346,6 +346,17 @@ class StrategyConfig(Config):
     megatron_recompute: bool = False
     megatron_recompute_modules: Optional[List[str]] = None
 
+    # QKV projection recompute. 16p profiling: MatMulV3 5120 = 24 counts ~ 25
+    # layers, 1 fwd/rank, no recompute -> the 16p strategy sets this False.
+    # Config-driven so another run that does recompute the QKV proj is expressible.
+    qkv_recompute: bool = False
+
+    # CP all-to-all group size (explicit). None = node-local default
+    # min(cp_size, num_per_node): 16p profiling shows the CP a2a runs as
+    # 4-rank quads (num_per_node), not the full cp group. Set to cp_size for
+    # full-group Ulysses.
+    cp_a2a_group: Optional[int] = None
+
     # fused kernel
     use_flash_sdp: bool = True
     use_math_sdp: bool = False
@@ -2029,6 +2040,10 @@ class ModelConfig(Config):
     swa_kv_head_num: int = None         # SWA KV head count (None = same as swa_head_num)
     swa_head_dim: int = None            # SWA head dim (None = use head_size)
     swa_window_size: int = 1028         # sliding window size (from op_define)
+    # FA (global) window size for windowed FlashAttention. 16p profiling report
+    # docs/mxx_profiling_alignment.md §1.2 gives win=(2048,2048); overridable per
+    # model so a different FA window doesn't require code changes.
+    fa_window_size: int = 2048
     # ───  Trunk CP divisor (decouples trunk from attention CP sharding)  ───
     trunk_cp_divisor: int = 1           # trunk seq = seq_len / (cp_size // divisor)
                                         # e.g. divisor=2 -> trunk uses cp/2, attn uses cp

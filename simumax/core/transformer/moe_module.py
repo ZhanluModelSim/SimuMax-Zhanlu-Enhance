@@ -607,16 +607,15 @@ class Permutation(MetaModule):
         ) * self.dtype_to_element_size[self.strategy.dtype]
 
         def split_stage_time(op_name, mem_chunks):
-            # compute_end2end_time returns ms; _cost_info.*_time fields are
-            # seconds (base _comp_cost_info_impl divides by 1e3). Missing the
-            # /1e3 inflated the permute stage 1000x.
+            # compute_end2end_time returns ms; keep _cost_info.*_time fields
+            # in ms to stay consistent with compute/net times.
             return sum(
                 self.compute_end2end_time(
                     compute_time=0,
                     mem_time=self.system.compute_mem_access_time(op_name, mem_bytes),
                 )
                 for mem_bytes in mem_chunks
-            ) / 1e3
+            )
 
         self._cost_info.fwd_compute_time = split_stage_time(
             "permute_fwd",
@@ -926,16 +925,15 @@ class UnPermutation(MetaModule):
         ) * self.dtype_to_element_size[self.strategy.dtype]
 
         def split_stage_time(op_name, mem_chunks):
-            # compute_end2end_time returns ms; _cost_info.*_time fields are
-            # seconds (base _comp_cost_info_impl divides by 1e3). Missing the
-            # /1e3 inflated the permute stage 1000x.
+            # compute_end2end_time returns ms; keep _cost_info.*_time fields
+            # in ms to stay consistent with compute/net times.
             return sum(
                 self.compute_end2end_time(
                     compute_time=0,
                     mem_time=self.system.compute_mem_access_time(op_name, mem_bytes),
                 )
                 for mem_bytes in mem_chunks
-            ) / 1e3
+            )
 
         self._cost_info.fwd_compute_time = split_stage_time(
             "permute_fwd",
