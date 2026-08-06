@@ -2,7 +2,7 @@
 
 from copy import deepcopy
 from simumax.core.tensor import TensorSize, Float8Tensor
-from simumax.core.base_struct import MetaModule, InputOutputInfo, PathDebugContext, LinearBase
+from simumax.core.base_struct import MetaModule, InputOutputInfo, PathDebugContext, LinearBase, CostShape
 from simumax.core.base_struct import (all_gather, reduce_scatter, all_reduce, all_gather_bwd, all2all_fwd, all2all_bwd,
                            AtomModel, LeafModel, FwdQue,
                            send_next, send_prev, recv_next, recv_prev,
@@ -223,32 +223,20 @@ class LinearCol(LinearBase):
         is_last_recompute = False,
         use_variance_tail_model: bool = False,
         disable_tensor_parallel = False,
-        specific_name='ColumnParallelLinear'
+        specific_name='ColumnParallelLinear',
+        cost_shape: CostShape = None,
     ) -> None:
         super().__init__(input_size, output_size, strategy, system, specific_name)
         assert output_size % self.strategy.tp_size == 0
         self.layer_idx = layer_idx
         self.input_size = input_size
         self.output_size = output_size if disable_tensor_parallel else output_size // self.strategy.tp_size # Split the output size across tp_size, tensor parallel on attention heads dimension
-        # Optional cost-time override: the topology (output_info / forward
-        # split) keeps the structural output_size, but cost/flops/weight/mem
-        # methods use the real per-layer width when set. Used by the 16p
-        # fused-QKV proj, whose forward QKV_Split is coupled to the structural
-        # 5120 sections while the real projection width varies per layer
-        # (4608/5120). None = backward-compatible, all cost methods use
-        # self.output_size (512p / 16k models unaffected).
-        self.cost_output_size = None
-        # Optional cost-seq multiplier: scales the cost model's token count (M)
-        # only — the topology/forward keeps per-rank tokens. Used by the 16p
-        # lm_head, whose real kernel runs the FULL sequence (131072, 64 chunks)
-        # while the forward input is per-rank (32768). 1 = backward-compatible,
-        # all cost methods unchanged (512p / 16k models unaffected).
-        self.cost_seq_mult = 1
-        # Optional skip-dw: forces bwd_grad_w_flops = 0. Used by the 16p lm_head,
-        # whose real kernel has NO dW GEMM (96 kernels = fwd 64 + dX 32 only —
-        # weight tied to the embedding, gradient handled by the embedding-side
-        # scatter, not a GEMM). False = backward-compatible (512p/16k unchanged).
-        self.cost_skip_dw = False
+        # Unified cost-shape override (CostShape, see base_struct): decouples
+        # the cost model's gemm dimensions (N width / M seq / dW) from the
+        # forward topology. None = backward-compatible, all cost methods use the
+        # structural values (512p / 16k models unaffected). Passed in at
+        # construction — a structural property, not a post-hoc patch.
+        self.cost_shape = cost_shape
         self.use_bias = use_bias  # FIXME(for now unless)
         self.has_cached_inputs = has_cached_inputs
         self.enable_recompute = enable_recompute
@@ -267,8 +255,17 @@ class LinearCol(LinearBase):
         self.a_element_size = self.dtype_to_element_size[self.a_dtype]
 
     def _eff_output_size(self):
-        """Cost-relevant output size (real per-layer width if overridden)."""
-        return self.cost_output_size if self.cost_output_size is not None else self.output_size
+        """Cost-relevant output width (real per-layer width if overridden)."""
+        cs = self.cost_shape
+        return cs.output_size if cs is not None and cs.output_size is not None else self.output_size
+
+    def _eff_seq_mult(self):
+        """Cost-relevant seq multiplier (full-seq token count if overridden)."""
+        return self.cost_shape.seq_mult if self.cost_shape is not None else 1
+
+    def _skip_dw(self):
+        """Whether to skip bwd_grad_w (lm_head tied to embedding, no dW GEMM)."""
+        return bool(self.cost_shape is not None and self.cost_shape.skip_dw)
 
     def prefill(self, args, call_stk='', com_buff=None):
         self.call_stk = call_stk + self.call_stk
@@ -506,13 +503,13 @@ class LinearCol(LinearBase):
         self._record_te_dummy_wgrad_shape()
 
     def _comp_leaf_flops_info(self):
-        base_flops = 2 * self.micro_hidden_state_size * self._eff_output_size() * self.cost_seq_mult
+        base_flops = 2 * self.micro_hidden_state_size * self._eff_output_size() * self._eff_seq_mult()
         self._compute_info.fwd_flops = base_flops
         self._compute_info.recompute_flops = (
             self._compute_info.fwd_flops if self.enable_recompute else 0
         )
         self._compute_info.bwd_grad_act_flops = base_flops
-        self._compute_info.bwd_grad_w_flops = 0 if self.cost_skip_dw else base_flops
+        self._compute_info.bwd_grad_w_flops = 0 if self._skip_dw() else base_flops
 
     def _comp_leaf_mem_accessed_info(self):
         # weight_size = self.input_size * self.output_size * self.w_element_size  # fp8_enabled = True, w_element_size=1
@@ -526,7 +523,7 @@ class LinearCol(LinearBase):
         )
         main_grad_size =  self.input_size * self._eff_output_size() * 4 # fp32
         self._compute_info.bwd_grad_w_accessed_mem = (
-            0 if self.cost_skip_dw else (
+            0 if self._skip_dw() else (
                 output_size + input_size + weight_size + (main_grad_size if self.strategy.use_fused_grad_accumulation else 0)
             )
         )

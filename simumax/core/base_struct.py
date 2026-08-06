@@ -1144,6 +1144,22 @@ class RecomputeBreakModule(MetaModule):
     def create_output_info(self):
         output_info = InputOutputInfo(tensors=[t.new() for t in self.input_info.tensors])
         return output_info
+class CostShape:
+    """Unified cost-shape override for a linear layer: decouples the cost
+    model's gemm dimensions from the forward topology, so a single object
+    carries all cost-shape corrections instead of scattered per-op hooks:
+      - output_size: cost N width (16p F 族 QKV 4608/5120 vs structural 5120)
+      - seq_mult:    cost M scaling (16p lm_head full-seq 131072 vs per-rank)
+      - skip_dw:     skip bwd_grad_w (lm_head weight tied to embedding, no dW)
+    None / defaults = use structural values (backward-compatible)."""
+    __slots__ = ('output_size', 'seq_mult', 'skip_dw')
+
+    def __init__(self, output_size=None, seq_mult=1, skip_dw=False):
+        self.output_size = output_size
+        self.seq_mult = seq_mult
+        self.skip_dw = skip_dw
+
+
 class LinearBase(MetaModule):
     def __init__(self, input_size, output_size, strategy, system, specific_name='', parent_module=None):
         super().__init__(strategy, system, specific_name, parent_module)
@@ -1203,15 +1219,14 @@ class LinearBase(MetaModule):
         else:
             bs, seq_len = inp_tensor.shape[:2] 
         inp = self.input_size
-        # LinearCol optional cost-output override (16p fused QKV): the structural
-        # output_size is kept for the forward topology, but the cost model's gemm
-        # shape (N here) reflects the real per-layer width when cost_output_size
-        # is set. getattr keeps this a no-op for every other module.
-        out = getattr(self, 'cost_output_size', None) or self.output_size
-        # Optional cost-seq multiplier (16p lm_head): scale the cost M to the
-        # full-sequence token count while the forward stays per-rank. getattr
-        # keeps this a no-op for every module that does not set it.
-        seq_len = int(seq_len * getattr(self, 'cost_seq_mult', 1))
+        # Unified cost-shape override (16p): the structural output_size / seq_len
+        # are kept for the forward topology, but the cost model's gemm shape
+        # (N / M here) reflects the real per-layer width / full-seq token count
+        # when a CostShape is attached. No CostShape = no-op for every other module.
+        cs = getattr(self, 'cost_shape', None)
+        out = (cs.output_size if cs is not None and cs.output_size is not None
+               else self.output_size)
+        seq_len = int(seq_len * (cs.seq_mult if cs is not None else 1))
         bs, seq_len, inp, out = int(bs), int(seq_len), int(inp), int(out)
         if stage == 'fwd':
             return [[bs, seq_len, inp], [inp, out], [bs, out]] if format else dict(B=bs, M=seq_len, K=inp, N=out, layout='TN', accumulate=False, out_dtype='bf16')
