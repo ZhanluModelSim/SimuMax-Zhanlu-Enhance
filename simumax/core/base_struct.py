@@ -1203,7 +1203,15 @@ class LinearBase(MetaModule):
         else:
             bs, seq_len = inp_tensor.shape[:2] 
         inp = self.input_size
-        out = self.output_size
+        # LinearCol optional cost-output override (16p fused QKV): the structural
+        # output_size is kept for the forward topology, but the cost model's gemm
+        # shape (N here) reflects the real per-layer width when cost_output_size
+        # is set. getattr keeps this a no-op for every other module.
+        out = getattr(self, 'cost_output_size', None) or self.output_size
+        # Optional cost-seq multiplier (16p lm_head): scale the cost M to the
+        # full-sequence token count while the forward stays per-rank. getattr
+        # keeps this a no-op for every module that does not set it.
+        seq_len = int(seq_len * getattr(self, 'cost_seq_mult', 1))
         bs, seq_len, inp, out = int(bs), int(seq_len), int(inp), int(out)
         if stage == 'fwd':
             return [[bs, seq_len, inp], [inp, out], [bs, out]] if format else dict(B=bs, M=seq_len, K=inp, N=out, layout='TN', accumulate=False, out_dtype='bf16')

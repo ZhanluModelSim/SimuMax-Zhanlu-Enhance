@@ -2061,6 +2061,39 @@ class ModelConfig(Config):
     # compression ratio (head_num // kv_head_num) can vary across layers independently
     # of the SWA split. None = backward-compatible, all layers use the global kv_head_num.
     layers_kv_head_num: List[int] = None
+    # ───  Second attention group (16p fused-QKV + latent BMM)  ───
+    # 16p profiling (docs/16p算子shape对齐报告.md) shows the fused QKV proj is
+    # heterogeneous per layer (4608/5120) instead of a uniform 5120, the deep
+    # layers carry a second QKV projection (count=2), L18 has an extra 1536,
+    # L24 feeds a standalone 48-head 6144 block, and every layer runs a latent
+    # BatchMatMul (8,m,1536)x(8,1536,n)->(8,m,n). These fields carry those
+    # profiling-derived per-layer values. None/[] = backward-compatible, no
+    # second group (512p / 16k models unaffected).
+    enable_second_attn_group: bool = False
+    # 25-entry list: real first-QKV-proj width per layer (4608/5120).
+    layers_qkv_width: List[int] = None
+    # 25-entry list: number of first-QKV projections per layer (1 / deep=2).
+    layers_qkv_count: List[int] = None
+    # 25-entry list: extra QKV-proj widths per layer beyond count (L18 -> [1536]).
+    layers_qkv_extra_widths: List[List[int]] = None
+    # Standalone wide block after the last layer (L24 -> [6144, 6144]), NOT
+    # recomputed (profiling: fwd count == 2, no rc pass).
+    second_qkv_block_widths: List[int] = None
+    # 25-entry list of [m, n] for the per-layer latent BatchMatMul. n follows
+    # cycle[layer%8] = {4099,4109,4118,4127,4136,4144,4152,4161}; m = 1024 on
+    # the F5120 layers, else 512.
+    layers_latent_bmm: List[List[int]] = None
+    latent_bmm_batch: int = 8
+    latent_bmm_hidden: int = None          # latent BMM inner dim (None = hidden_size)
+    # ───  BMMV2 族（latent 内部自注意力，aclnnMatmul_BatchMatMulNd_BatchMatMulV2）  ───
+    # 1125 核 / 45.92ms（16p step 9），纯 fwd（无 rc/bwd，实测只发现 fwd 形态）。
+    # 每层每相位两个 480 维实例（batch 10/20）+ 一个 128 维实例（batch 4/6，绑定 F 族），
+    # 每实例 3 个 BMM（QKᵀ / PV / 内部）。全部 profiling 导出，非硬编码。
+    latent_attn_phase_num: int = 0             # 每层相位数（实跑 5）
+    latent_attn_dim480: int = 0                # 480 族维度（480）
+    latent_attn_dim128: int = 0                # 128 族维度（128）
+    latent_attn_batches_480: List[int] = None  # [10, 20] 两个 480 实例的 batch
+    latent_attn_batches_128: List[int] = None  # 25 项逐层 128 实例 batch（4/6）
     # ───  BT Model config  ───
     enable_vwn: bool = False            # True = VWN 层, False = 标准层
     use_attn_gate: bool = False         # True = AttnGate, False = ContextNorm

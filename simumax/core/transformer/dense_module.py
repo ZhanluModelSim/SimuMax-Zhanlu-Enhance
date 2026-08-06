@@ -230,6 +230,25 @@ class LinearCol(LinearBase):
         self.layer_idx = layer_idx
         self.input_size = input_size
         self.output_size = output_size if disable_tensor_parallel else output_size // self.strategy.tp_size # Split the output size across tp_size, tensor parallel on attention heads dimension
+        # Optional cost-time override: the topology (output_info / forward
+        # split) keeps the structural output_size, but cost/flops/weight/mem
+        # methods use the real per-layer width when set. Used by the 16p
+        # fused-QKV proj, whose forward QKV_Split is coupled to the structural
+        # 5120 sections while the real projection width varies per layer
+        # (4608/5120). None = backward-compatible, all cost methods use
+        # self.output_size (512p / 16k models unaffected).
+        self.cost_output_size = None
+        # Optional cost-seq multiplier: scales the cost model's token count (M)
+        # only — the topology/forward keeps per-rank tokens. Used by the 16p
+        # lm_head, whose real kernel runs the FULL sequence (131072, 64 chunks)
+        # while the forward input is per-rank (32768). 1 = backward-compatible,
+        # all cost methods unchanged (512p / 16k models unaffected).
+        self.cost_seq_mult = 1
+        # Optional skip-dw: forces bwd_grad_w_flops = 0. Used by the 16p lm_head,
+        # whose real kernel has NO dW GEMM (96 kernels = fwd 64 + dX 32 only —
+        # weight tied to the embedding, gradient handled by the embedding-side
+        # scatter, not a GEMM). False = backward-compatible (512p/16k unchanged).
+        self.cost_skip_dw = False
         self.use_bias = use_bias  # FIXME(for now unless)
         self.has_cached_inputs = has_cached_inputs
         self.enable_recompute = enable_recompute
@@ -246,6 +265,10 @@ class LinearCol(LinearBase):
 
         self.w_element_size = self.dtype_to_element_size[self.w_dtype]
         self.a_element_size = self.dtype_to_element_size[self.a_dtype]
+
+    def _eff_output_size(self):
+        """Cost-relevant output size (real per-layer width if overridden)."""
+        return self.cost_output_size if self.cost_output_size is not None else self.output_size
 
     def prefill(self, args, call_stk='', com_buff=None):
         self.call_stk = call_stk + self.call_stk
@@ -442,9 +465,9 @@ class LinearCol(LinearBase):
                 comm_stage="LinearCol_BWD_W_SP"
 
             )
-    
+
     def _comp_gemm_mem_accessed_size(self):
-        weight_size = self.input_size * self.output_size * self.w_element_size  # fp8_enabled = True, w_element_size=1
+        weight_size = self.input_size * self._eff_output_size() * self.w_element_size  # fp8_enabled = True, w_element_size=1
         input_size = self.micro_hidden_state_size * self.a_element_size         # fp8_enabled = True, a_element_size=1
         output_size = self.micro_output_grad_size * self.element_size           # fp8_enabled = True, o_element_size=2
         return weight_size, input_size, output_size
@@ -461,12 +484,12 @@ class LinearCol(LinearBase):
             self._act_info.activation_mem_cache = 0
         # if seqence parallel is anabled, the input sequence is multiplied by tp_size(after All-gather)
         weight_size, input_size, output_size = self._comp_gemm_mem_accessed_size()
-        
+
         self._act_info.fwd_peak_mem_no_cache = input_size + output_size + (0 if self.strategy.use_accm_weight else weight_size)
         self._act_info.bwd_peak_mem_no_cache = input_size + output_size + (0 if self.strategy.use_accm_weight else weight_size)
 
     def _comp_leaf_model_info_impl(self):
-        weight_numel = self.input_size * self.output_size
+        weight_numel = self.input_size * self._eff_output_size()
         self._model_info.weight_numel = weight_numel * self.strategy.tp_size # Statistics the parameters of all tp ranks
         self._model_info.dense_weight_bytes = weight_numel * self.w_element_size # fp8_enabled = True, w_element_size=1
         self._model_info.dense_grad_bytes = weight_numel * self.main_grad_element_size
@@ -483,13 +506,13 @@ class LinearCol(LinearBase):
         self._record_te_dummy_wgrad_shape()
 
     def _comp_leaf_flops_info(self):
-        base_flops = 2 * self.micro_hidden_state_size * self.output_size
+        base_flops = 2 * self.micro_hidden_state_size * self._eff_output_size() * self.cost_seq_mult
         self._compute_info.fwd_flops = base_flops
         self._compute_info.recompute_flops = (
             self._compute_info.fwd_flops if self.enable_recompute else 0
         )
         self._compute_info.bwd_grad_act_flops = base_flops
-        self._compute_info.bwd_grad_w_flops = base_flops
+        self._compute_info.bwd_grad_w_flops = 0 if self.cost_skip_dw else base_flops
 
     def _comp_leaf_mem_accessed_info(self):
         # weight_size = self.input_size * self.output_size * self.w_element_size  # fp8_enabled = True, w_element_size=1
@@ -501,10 +524,12 @@ class LinearCol(LinearBase):
         self._compute_info.bwd_grad_act_accessed_mem = (
             weight_size + output_size + input_size
         )
-        main_grad_size =  self.input_size * self.output_size * 4 # fp32
+        main_grad_size =  self.input_size * self._eff_output_size() * 4 # fp32
         self._compute_info.bwd_grad_w_accessed_mem = (
-            output_size + input_size + weight_size + (main_grad_size if self.strategy.use_fused_grad_accumulation else 0
-        ))
+            0 if self.cost_skip_dw else (
+                output_size + input_size + weight_size + (main_grad_size if self.strategy.use_fused_grad_accumulation else 0)
+            )
+        )
 
         self._compute_info.recompute_accessed_mem = (
             self._compute_info.fwd_accessed_mem if self.enable_recompute else 0
