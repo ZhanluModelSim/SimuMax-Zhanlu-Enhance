@@ -2091,6 +2091,11 @@ class ModelConfig(Config):
     # compression ratio (head_num // kv_head_num) can vary across layers independently
     # of the SWA split. None = backward-compatible, all layers use the global kv_head_num.
     layers_kv_head_num: List[int] = None
+    # MQA-per-rank structure: the dense (FA) branch holds one KV head per rank
+    # (kv_head_num does not divide cp_size) — skip the Ulysses-style KV-head-
+    # split check in CP-a2a validation. Declared as a structure flag, not a
+    # model_type string special-case.
+    mqa_per_rank: bool = False
     # ───  Second attention group (16p fused-QKV + latent BMM)  ───
     # 16p profiling (docs/16p算子shape对齐报告.md) shows the fused QKV proj is
     # heterogeneous per layer (4608/5120) instead of a uniform 5120, the deep

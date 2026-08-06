@@ -1504,12 +1504,12 @@ class PerfLLM(PerfBase):
             assert self.model_config.head_num % self.strategy.cp_size == 0, (
                 f"head_num {self.model_config.head_num} must be divisible by cp_size {self.strategy.cp_size} when cp_comm_type='a2a'"
             )
-            # mxx_model: the dense (FA) branch is structural MQA-per-rank
-            # (kv_head_num = _fa_kv_dim // head_size, one KV head per rank, see
-            # MxxModel), so the model-level kv_head_num need not divide cp_size.
-            # This is not a Ulysses-style KV-head split — skip the generic check.
+            # MQA-per-rank models (dense FA branch holds one KV head per rank,
+            # so the model-level kv_head_num need not divide cp_size) skip the
+            # Ulysses-style KV-head-split check. Declared via config flag
+            # `mqa_per_rank`, not a model_type string special-case.
             if (self.model_config.kv_head_num is not None
-                    and self.model_config.model_type != "mxx_model"):
+                    and not getattr(self.model_config, 'mqa_per_rank', False)):
                 assert self.model_config.kv_head_num % self.strategy.cp_size == 0, (
                     f"kv_head_num {self.model_config.kv_head_num} must be divisible by cp_size {self.strategy.cp_size} when cp_comm_type='a2a'"
                 )
