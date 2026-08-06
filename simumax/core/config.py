@@ -1230,6 +1230,26 @@ class SystemConfig(Config):
         self.hit_efficiency.clear()
         self.real_comm_bw.clear()
 
+    @staticmethod
+    def _lookup_accurate_eff(accurate_factor, shape_desc):
+        """Cross-scale reuse: strip the m (seq) and b (batch) dims from the key
+        and match a 16p-calibrated entry with identical remaining structure
+        (k / n / layout / op-kind). Efficiency is per-FLOP for a fixed shape
+        structure + hardware, so reusing the 16p value across 8p/32p is the
+        validation hypothesis — whether it holds is answered by cross-config
+        comparison. None when no entry matches after stripping."""
+        if not accurate_factor:
+            return None
+
+        def _strip(k):
+            return re.sub(r'\bb=\d+', '', re.sub(r'\bm=\d+', '', k))
+
+        core = _strip(shape_desc)
+        for k, v in accurate_factor.items():
+            if _strip(k) == core:
+                return v
+        return None
+
     def compute_op_accuracy_time(
         self, op_name: str, flops: int, shape_desc: str, reture_detail=False,
         class_key=None, path_key=None,
@@ -1300,15 +1320,25 @@ class SystemConfig(Config):
         (op.accurate_efficient_factor.get(shape_desc, None) is not None):
             # marmul use accurate efficient factor to get accurate time
             efficient_factor = op.accurate_efficient_factor[shape_desc]
-            self.record_hit_efficiency(op_name, flops, shape_desc, efficient_factor) 
+            self.record_hit_efficiency(op_name, flops, shape_desc, efficient_factor)
             if SIMU_DEBUG:
                 print(f"=== \033[32m{op_name} input shape {shape_desc} use accurate compute efficient factor {efficient_factor}\033[0m, flops={flops}")
         else:
-            efficient_factor = op.efficient_factor
-            self.record_miss_efficiency(op_name, flops, shape_desc, efficient_factor)
+            eff_w = (self._lookup_accurate_eff(op.accurate_efficient_factor, shape_desc)
+                     if op.accurate_efficient_factor else None)
+            if eff_w is not None:
+                # 16p 校准 eff 跨规模复用（m/b 通配）——同 shape 结构 + 同硬件，
+                # eff 每 FLOP 恒定，跨 8p/32p 复用是验证假设（是否成立由跨配置对照回答）。
+                efficient_factor = eff_w
+                self.record_hit_efficiency(op_name, flops, shape_desc, efficient_factor)
+                if SIMU_DEBUG:
+                    print(f"=== \033[32m{op_name} input shape {shape_desc} reuse 16p accurate eff {efficient_factor} (cross-scale)\033[0m, flops={flops}")
+            else:
+                efficient_factor = op.efficient_factor
+                self.record_miss_efficiency(op_name, flops, shape_desc, efficient_factor)
 
-            if SIMU_DEBUG:
-                print(f"{op_name} input shape {shape_desc} use default compute efficient factor {efficient_factor}, flops={flops}")
+                if SIMU_DEBUG:
+                    print(f"{op_name} input shape {shape_desc} use default compute efficient factor {efficient_factor}, flops={flops}")
 
         time = flops / (op.tflops * 1e12 * efficient_factor) * 1e3
         if reture_detail:
@@ -2083,7 +2113,7 @@ class ModelConfig(Config):
     # cycle[layer%8] = {4099,4109,4118,4127,4136,4144,4152,4161}; m = 1024 on
     # the F5120 layers, else 512.
     layers_latent_bmm: List[List[int]] = None
-    latent_bmm_batch: int = 8
+    latent_bmm_batch: int = 0    # 0 = 未设 → 用 strategy.cp_size（LAT 对 CP 切分的 seq 块注意力，batch=cp）
     latent_bmm_hidden: int = None          # latent BMM inner dim (None = hidden_size)
     # ───  BMMV2 族（latent 内部自注意力，aclnnMatmul_BatchMatMulNd_BatchMatMulV2）  ───
     # 1125 核 / 45.92ms（16p step 9），纯 fwd（无 rc/bwd，实测只发现 fwd 形态）。
