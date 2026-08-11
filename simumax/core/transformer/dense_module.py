@@ -2130,10 +2130,13 @@ class Swiglu(MetaModule):
         )
 
     def _comp_cost_info(self):
+        # SwishGlu 实测融合 kernel（(M,480)→(M,480)）用独立 op 名 → 走
+        # bandwidth.swiglu 校准（mem-bound）；其他 system 无 swiglu 条目时
+        # fallback default，行为不变。
         self._comp_cost_info_impl(
-            fwd_op="default",
-            bwd_grad_act_op="default",
-            bwd_grad_w_op="default",
+            fwd_op="swiglu",
+            bwd_grad_act_op="swiglu",
+            bwd_grad_w_op="swiglu",
             enable_recompute=self.enable_recompute,
         )
 
@@ -2522,10 +2525,16 @@ class ParallelCE(MetaModule):
         )
 
     def _comp_cost_info(self):
-        ce_op = "ce_fusion" if self.strategy.cross_entropy_loss_fusion else "ce"
+        # Fused CE fwd/bwd have different memory-access efficiency, so they are
+        # calibrated as separate ops (ce_fwd / ce_bwd, or ce_fusion /
+        # ce_fusion_bwd). fwd scans logits for max/sum/exp and writes prob; bwd
+        # reads prob and writes grad_input — a single fused kernel, not the
+        # per-step unfused pipeline.
+        ce_fwd = "ce_fusion" if self.strategy.cross_entropy_loss_fusion else "ce_fwd"
+        ce_bwd = "ce_fusion_bwd" if self.strategy.cross_entropy_loss_fusion else "ce_bwd"
         self._comp_cost_info_impl(
-            fwd_op=ce_op,
-            bwd_grad_act_op=ce_op,
+            fwd_op=ce_fwd,
+            bwd_grad_act_op=ce_bwd,
             bwd_grad_w_op="default",
             enable_recompute=self.enable_recompute,
         )

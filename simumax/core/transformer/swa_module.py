@@ -128,9 +128,10 @@ class SWACoreAttention(MetaModule):
         batch, seq_len = hidden_states.shape[:2]
         if self.strategy.cp_size > 1:
             td = getattr(self, '_trunk_cp_div', 1)
+            per_rank_cp = max(1, self.strategy.cp_size // td)   # 等效序列并行秩
             seq_len = seq_len * (self.strategy.cp_size // td)
-            head_num = self.head_num // self.strategy.cp_size
-            kv_head_num = self.kv_head_num // self.strategy.cp_size
+            head_num = self.head_num // per_rank_cp
+            kv_head_num = self.kv_head_num // per_rank_cp
         else:
             head_num = self.head_num
             kv_head_num = self.kv_head_num
@@ -149,13 +150,16 @@ class SWACoreAttention(MetaModule):
         seq_len = self.input_info.tensors[0].size(1)
         if self.strategy.cp_size > 1:
             if self.strategy.cp_comm_type == "a2a":
-                assert self.head_num % self.strategy.cp_size == 0, (
-                    f"head_num {self.head_num} must be divisible by cp_size {self.strategy.cp_size}"
-                )
                 td = getattr(self, '_trunk_cp_div', 1)
+                per_rank_cp = max(1, self.strategy.cp_size // td)
+                assert self.head_num % per_rank_cp == 0, (
+                    f"head_num {self.head_num} must be divisible by per-rank "
+                    f"sequence-parallel {per_rank_cp} "
+                    f"(cp_size {self.strategy.cp_size} // td {td})"
+                )
                 # SWA operates on full global seq = input_seq * (cp_size // td)
                 seq_len = seq_len * (self.strategy.cp_size // td)
-                head_num = self.head_num // self.strategy.cp_size
+                head_num = self.head_num // per_rank_cp
             else:
                 raise NotImplementedError(
                     f"SWA cp_comm_type {self.strategy.cp_comm_type} not implemented yet."

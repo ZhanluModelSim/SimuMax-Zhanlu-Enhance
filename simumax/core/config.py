@@ -2096,6 +2096,19 @@ class ModelConfig(Config):
     # split check in CP-a2a validation. Declared as a structure flag, not a
     # model_type string special-case.
     mqa_per_rank: bool = False
+    # lm_head effective-seq ratio (0,1]: fraction of the global sequence the
+    # lm_head/CE actually process. 16p profiling: embedding/transformer run the
+    # full 131072 but lm_head only processes half (65536 = 32 chunks), so
+    # ratio=0.5. Declared as model structure (like head_num/seq_len), not a
+    # per-model patch. 1.0 = full sequence (default, other models unaffected).
+    lm_head_seq_ratio: float = 1.0
+    # SWA per-head Q/KV RMSNorm pass count per layer (profiling: kernel count
+    # per layer = q_ops for the Q norm + kv_ops for the KV norm, 16p = 9 + 3).
+    # These are independent fused rmsnorm kernels (393210x128 Q / 131064x128
+    # KV on the global SWA sequence) not covered by NormRoPE. 0/0 = no
+    # standalone SWA norm (default, other models unaffected).
+    swa_norm_q_ops: int = 0
+    swa_norm_kv_ops: int = 0
     # ───  Second attention group (16p fused-QKV + latent BMM)  ───
     # 16p profiling (docs/16p算子shape对齐报告.md) shows the fused QKV proj is
     # heterogeneous per layer (4608/5120) instead of a uniform 5120, the deep
@@ -2105,6 +2118,11 @@ class ModelConfig(Config):
     # profiling-derived per-layer values. None/[] = backward-compatible, no
     # second group (512p / 16k models unaffected).
     enable_second_attn_group: bool = False
+    # 25-entry list: per-layer FA-branch KV head count (16p trace: 2 on the
+    # 4608-width layers / 4 on the 5120-width layers; flash_attn_num_kvheads).
+    # Drives the fused-QKV width via the two-QKV structure formula, so the
+    # width is derived from structure rather than declared (CostShape-free).
+    layers_fa_kv_head_num: List[int] = None
     # 25-entry list: real first-QKV-proj width per layer (4608/5120).
     layers_qkv_width: List[int] = None
     # 25-entry list: number of first-QKV projections per layer (1 / deep=2).
