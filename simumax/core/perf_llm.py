@@ -995,14 +995,27 @@ class PerfLLM(PerfBase):
             unit_kind,
         )
 
+    def _per_rank_seq_len(self):
+        """Per-rank sequence length after CP, trunk-aware.
+
+        Real 16p qkv MatMul m=32768 = 131072 / (8/2): the HybridAttention trunk
+        (trunk_cp_divisor=2) halves the effective CP group, so each rank handles
+        seq/(cp/td) tokens — NOT seq/cp (16384, which under-counts every compute
+        cost by 2×). td=1 (plain models) is unchanged.
+        """
+        td = getattr(self.model_config, 'trunk_cp_divisor', 1)
+        per_rank_cp = max(1, self.strategy.cp_size // td)
+        return max(1, self.strategy.seq_len // per_rank_cp)
+
     def _build_chunk_input_info(self, preprocess: bool):
+        per_rank_seq = self._per_rank_seq_len()
         if preprocess:
             return InputOutputInfo(
                 tensors=[
                     TensorSize(
                         shape=(
                             self.strategy.micro_batch_size,
-                            self.strategy.seq_len // self.strategy.cp_size,
+                            per_rank_seq,
                         )
                     )
                 ]
@@ -1017,7 +1030,7 @@ class PerfLLM(PerfBase):
                 TensorSize(
                     shape=(
                         self.strategy.micro_batch_size,
-                        seq_len // self.strategy.cp_size,
+                        per_rank_seq,
                         self.model_config.hidden_size,
                     )
                 )
@@ -1579,10 +1592,10 @@ class PerfLLM(PerfBase):
             l2_norm_after_reduce_time = self.system.compute_mem_access_time('default', grads_chunk_after_reduce_time) # read grads chunk
             grads_clip_after_reduce_time = self.system.compute_mem_access_time('default', 2 * grads_chunk_after_reduce_time) # read and write grad_chunk, when l2 norm is scaler
 
-            adam_time = self.system.compute_mem_access_time('default',
+            adam_time = self.system.compute_mem_access_time('optimizer',
                 grads_chunk_after_reduce_time + 3 * state_weight_bytes # read and write m/w/v, read grad_chunk
             )
-            copy_main_params_to_model_params_time = self.system.compute_mem_access_time('default', weight_bytes + 0.5 * weight_bytes) # fp32 -> bf16
+            copy_main_params_to_model_params_time = self.system.compute_mem_access_time('optimizer', weight_bytes + 0.5 * weight_bytes) # fp32 -> bf16
 
             result['zero_grad_buffer_time'] = zero_grad_buffer_time
             result['l2_norm_before_reduce_time'] = l2_norm_before_reduce_time
@@ -1591,7 +1604,13 @@ class PerfLLM(PerfBase):
             result['grads_clip_after_reduce_time'] = grads_clip_after_reduce_time
             result['adam_time'] = adam_time
             result['copy_main_params_to_model_params_time'] = copy_main_params_to_model_params_time
-            optim_time = sum(result.values())
+            # The non-adam steps (zero_grad / l2_norm / clip / copy) are real
+            # but they show up in the trace as independent kernels (ZerosLike /
+            # ReduceSum / Cast), already modeled in the per-layer elementwise
+            # leaf. Counting them here as well double-counts the weight/grad
+            # memory traffic; the measured fused_sgd kernel (~10ms/step on the
+            # 16p trace) covers the adam update only.
+            optim_time = adam_time
             result['optim_time'] = optim_time
             result['optim_exposed_time'] = optim_time
             return result
@@ -3396,7 +3415,7 @@ class PerfLLM(PerfBase):
         input_info_first_stage = InputOutputInfo(
             tensors=[
                 TensorSize(
-                    shape=(self.strategy.micro_batch_size, self.strategy.seq_len//self.strategy.cp_size)
+                    shape=(self.strategy.micro_batch_size, self._per_rank_seq_len())
                 )
             ]
         )
@@ -3421,7 +3440,7 @@ class PerfLLM(PerfBase):
                     TensorSize(
                         shape=(
                             self.strategy.micro_batch_size,
-                            seq_len//self.strategy.cp_size,
+                            self._per_rank_seq_len(),
                             self.model_config.hidden_size,
                         )
                     )
@@ -3448,7 +3467,7 @@ class PerfLLM(PerfBase):
                     TensorSize(
                         shape=(
                             self.strategy.micro_batch_size,
-                            seq_len // self.strategy.cp_size,
+                            self._per_rank_seq_len(),
                             self.model_config.hidden_size,
                         )
                     )
@@ -3470,7 +3489,7 @@ class PerfLLM(PerfBase):
             input_info_first_stage_vpp = InputOutputInfo(
                 tensors=[
                     TensorSize(
-                        shape=(self.strategy.micro_batch_size, self.strategy.seq_len // self.strategy.cp_size)
+                        shape=(self.strategy.micro_batch_size, self._per_rank_seq_len())
                     )
                 ]
             )
@@ -3484,7 +3503,7 @@ class PerfLLM(PerfBase):
                     TensorSize(
                         shape=(
                             self.strategy.micro_batch_size,
-                            seq_len_hidden // self.strategy.cp_size,
+                            self._per_rank_seq_len(),
                             self.model_config.hidden_size,
                         )
                     )

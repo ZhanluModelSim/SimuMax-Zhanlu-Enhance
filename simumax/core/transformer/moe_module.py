@@ -330,8 +330,11 @@ class Permutation(MetaModule):
 
     
         #permutate1 for ep all2all
+        # concat (sort_by_expert chunks) writes the permuted buffer once more
+        # than the plain permute read+write above (real ConcatD kernel at
+        # 2087/step9 on the 16p trace).
         permutate1_mem_accessed = (
-            self.input_act_size + self.permuted_act_size
+            self.input_act_size + 2 * self.permuted_act_size
         ) * self.dtype_to_element_size[self.strategy.dtype]
         fwd_mem_time = self.system.compute_mem_access_time(
             "permute_fwd",
@@ -365,6 +368,16 @@ class Permutation(MetaModule):
             self.layers.append(all2all(f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}",
                                          rank_info['ep_rank'], self.strategy.ep_size, com_buff=com_buff,
                                          fwd_cost=cost, bwd_cost=cost, global_rank=args.rank, net=self.strategy.ep_net, size_bytes=comm_size))
+            state.comm_order += 1
+            # router-probs small a2a (measured 26×0.4MB fwd @ step9, 1/layer)
+            prob_size = self.topk * self._per_rank_seq() * self.dtype_to_element_size[self.strategy.dtype]
+            prob_cost = self.system.compute_net_op_time(
+                "moe_small_a2a", prob_size, self.strategy.ep_size,
+                net=self.strategy.ep_net, strategy=self.strategy, group_kind="ep",
+            )
+            self.layers.append(all2all(f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}-prob",
+                                         rank_info['ep_rank'], self.strategy.ep_size, com_buff=com_buff,
+                                         fwd_cost=prob_cost, bwd_cost=0, global_rank=args.rank, net=self.strategy.ep_net, size_bytes=prob_size))
             state.comm_order += 1
         if self.strategy.etp_size > 1:
             comm_size = (
@@ -412,34 +425,56 @@ class Permutation(MetaModule):
     @property
     def permuted_act_size(self):
         # only consider balanced case for now
+        # Use the per-rank full token count, not input_info's seq: input_info
+        # seq is CP-split (seq//cp) on the DES path, which halves the MoE
+        # dispatch payload vs the manual/prefill path (per-rank full token =
+        # seq_len // (cp//td)). Same root cause as CP a2a volume. MoE dispatch
+        # moves per-rank tokens to expert-holding ranks regardless of CP split.
         batch_size = self.input_info.tensors[0].size(0)
-        seq_len = self.input_info.tensors[0].size(1)
+        seq_len = self._per_rank_seq()
         hidden_size = self.input_info.tensors[0].size(2)
         token_num = self.topk * batch_size * seq_len
         if self.moe_pad_expert_input_to_capacity:
             token_num = math.ceil(token_num/self.expert_num) * self.expert_num * self.capacity
         return token_num * hidden_size
 
+    def _per_rank_seq(self):
+        """Per-rank full sequence (not CP-split): seq_len // (cp//td).
+        input_info seq is CP-split (seq//cp) on the DES path; MoE dispatch
+        moves per-rank tokens regardless of CP split, so derive from strategy.
+        td comes from the model config, exposed on the strategy by the mxx
+        model builder (MxxModelLayer sets strategy.mxx_trunk_cp_divisor).
+        """
+        td = getattr(self.strategy, 'mxx_trunk_cp_divisor', None)
+        if td is None:
+            td = 1
+        per_rank_cp = max(1, self.strategy.cp_size // td)
+        return max(1, self.strategy.seq_len // per_rank_cp)
+
     @property
     def input_act_size(self):
         # only consider balanced case for now
         batch_size = self.input_info.tensors[0].size(0)
-        seq_len = self.input_info.tensors[0].size(1)
+        seq_len = self._per_rank_seq()
         hidden_size = self.input_info.tensors[0].size(2)
         return batch_size * seq_len * hidden_size
 
     @property
     def dispatch_comm_size(self):
-        """MoE dispatch payload (full all-to-all).
+        """MoE dispatch payload (external all-to-all transfers only).
 
         communication_matrix.json 的 8-pair alltoall 实测显示 MoE dispatch 是
-        全 8-rank alltoall（cross≈746MB = 100.7MB×7，每条 token 全 hidden 发往
-        每个持有其 topk 专家的 peer），不是部分发送。故直接用完整 permuted
-        payload 作为 comm_size。
+        全 8-rank alltoall：本卡 permute 后的 token 分成 (n-1)/n 外发到 peer +
+        1/n LOCAL 自留。通信只传输外发部分（实测 @558 top1 外发 746MB vs
+        LOCAL 805MB），LOCAL 是本地拷贝不占 HCCS 带宽。故 comm_size 取
+        permuted payload 的 (ep-1)/ep，不把 LOCAL 计入传输量。
         """
+        ep = max(1, self.strategy.ep_size)
+        local_share = (ep - 1) / ep if ep > 1 else 1
         return (
             self.permuted_act_size
             * self.dtype_to_element_size[self.strategy.dtype]
+            * local_share
         )
 
     def _pre_op(self):
@@ -666,6 +701,10 @@ class UnPermutation(MetaModule):
         self.enable_recompute = enable_recompute
         self.moe_dispatcher_policy = moe_dispatcher_policy
         self.ori_shape = None
+        # capacity-based padding not passed to UnPermutation ctor; default to
+        # off (balanced) so act_size_before_combined's topk expansion is exact.
+        self.moe_pad_expert_input_to_capacity = getattr(self, 'moe_pad_expert_input_to_capacity', False)
+        self.capacity = getattr(self, 'capacity', 0)
 
     def prefill(self, args, call_stk='', com_buff=None):
         self.call_stk = call_stk + self.call_stk
@@ -721,6 +760,7 @@ class UnPermutation(MetaModule):
             comm_size = (
                 self.act_size_before_combined
                 * self.dtype_to_element_size[self.strategy.dtype]
+                * ((self.strategy.ep_size - 1) / self.strategy.ep_size)
             )
             cost = self.system.compute_net_op_time(
                 "all2all",
@@ -729,11 +769,22 @@ class UnPermutation(MetaModule):
                 net=self.strategy.ep_net,
                 strategy=self.strategy,
                 group_kind="ep",
-            )   
-            self.layers.append(all2all(f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}", 
+            )
+            self.layers.append(all2all(f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}",
                                          rank_info['ep_rank'], self.strategy.ep_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank, net=self.strategy.ep_net, size_bytes=comm_size))      
+                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank, net=self.strategy.ep_net, size_bytes=comm_size))
             state.comm_order += 1
+            # router-probs small a2a (measured 49×0.4MB bwd @ step9, 2/layer)
+            prob_size = self.topk * self._per_rank_seq() * self.dtype_to_element_size[self.strategy.dtype]
+            for pi in range(2):
+                prob_cost = self.system.compute_net_op_time(
+                    "moe_small_a2a", prob_size, self.strategy.ep_size,
+                    net=self.strategy.ep_net, strategy=self.strategy, group_kind="ep",
+                )
+                self.layers.append(all2all(f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}-prob{pi}",
+                                             rank_info['ep_rank'], self.strategy.ep_size, com_buff=com_buff,
+                                             fwd_cost=0, bwd_cost=prob_cost, global_rank=args.rank, net=self.strategy.ep_net, size_bytes=prob_size))
+                state.comm_order += 1
 
         #permutate2 and combine
         unpermutate2_and_combine_mem_accessed = (
@@ -761,9 +812,27 @@ class UnPermutation(MetaModule):
 
     @property
     def act_size_before_combined(self):
-        # only consider balanced case
-        act_size = self.input_info.tensors[0].numel()
-        return act_size
+        # Combine a2a is symmetric with dispatch: it moves the topk-expanded
+        # expert output back to the source ranks, so the payload is the
+        # per-rank token count x topk x hidden (mirror of permuted_act_size),
+        # NOT the plain input token x hidden (which would under-size by topk).
+        # Per-rank full seq (not CP-split) — same fix as dispatch.
+        batch_size = self.input_info.tensors[0].size(0) if self.input_info.tensors[0].ndim == 3 else 1
+        seq_len = self._per_rank_seq()
+        hidden_size = self.input_info.tensors[0].size(-1)
+        token_num = self.topk * batch_size * seq_len
+        if self.moe_pad_expert_input_to_capacity:
+            token_num = math.ceil(token_num/self.expert_num) * self.expert_num * self.capacity
+        return token_num * hidden_size
+
+    def _per_rank_seq(self):
+        """Per-rank full sequence (not CP-split): seq_len // (cp//td).
+        See Permutation._per_rank_seq — same fix, UnPermutation combine payload."""
+        td = getattr(self.strategy, 'mxx_trunk_cp_divisor', None)
+        if td is None:
+            td = 1
+        per_rank_cp = max(1, self.strategy.cp_size // td)
+        return max(1, self.strategy.seq_len // per_rank_cp)
 
     @property
     def act_size_after_combined(self):
@@ -820,6 +889,7 @@ class UnPermutation(MetaModule):
             comm_size = (
                 self.act_size_before_combined
                 * self.dtype_to_element_size[self.strategy.dtype]
+                * ((self.strategy.ep_size - 1) / self.strategy.ep_size)
             )
             # fwd
             self._cost_info.fwd_net_time += self.system.compute_net_op_time(

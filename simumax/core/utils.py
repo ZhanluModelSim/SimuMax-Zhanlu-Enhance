@@ -393,7 +393,8 @@ class LevelSpan:
     """How one comm domain decomposes across one topology level."""
 
     def __init__(self, name, size, net, span, units_touched, members_per_unit,
-                 kind="clos", convergence_ratio=1.0):
+                 kind="clos", convergence_ratio=1.0, port_num=None,
+                 bandwidth_per_port_gbps=None):
         self.name = name
         self.size = size
         self.net = net
@@ -404,6 +405,10 @@ class LevelSpan:
         # per-pair links; "clos" = shared switch uplink with convergence.
         self.kind = kind
         self.convergence_ratio = convergence_ratio
+        # Physical fabric params (完整物理描述，可选): per-device port count and
+        # per-port effective bandwidth → 层有效带宽 = port_num × per_port ÷ conv.
+        self.port_num = port_num
+        self.bandwidth_per_port_gbps = bandwidth_per_port_gbps
 
     def __repr__(self):
         return (f"LevelSpan({self.name}: size={self.size} net={self.net} "
@@ -442,7 +447,9 @@ def group_level_span(group_kind, strategy, levels):
             entry["name"], int(entry["size"]), entry["net"],
             cumulative, units, members,
             kind=entry.get("kind", "clos"),
-            convergence_ratio=entry.get("convergence_ratio", 1.0)))
+            convergence_ratio=entry.get("convergence_ratio", 1.0),
+            port_num=entry.get("port_num"),
+            bandwidth_per_port_gbps=entry.get("bandwidth_per_port_gbps")))
     composition = []
     prev = group_size
     for span in spans:

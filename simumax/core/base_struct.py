@@ -485,6 +485,9 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
             phase="recompute_fwd",
         )
         recompute_cost = self._cost_info.recompute_compute_time if self.is_leaf_module else recompute_cost_override
+        rc_ratio = getattr(self.strategy, 'recompute_cost_ratio', 1.0)
+        if recompute_cost is not None:
+            recompute_cost = recompute_cost * rc_ratio
         for layer in self.layers:
             fwd.append(layer.prefill_recompute_fwd(recompute_cost))
         return fwd
@@ -2674,6 +2677,26 @@ class Com(LeafModel):
         self._bwd_done_t = None
         self._batch_submit_by_gid = {}
 
+    def _dp_comm_push(self, ctx, t, end_t, launch_st):
+        """FSDP（dp_comm lane）通信对 comp lane 的推挤。
+
+        实测 fsdp 通信与计算**部分**重叠（16p：AG 暴露 ~30%、RS ~48%，
+        墙钟增量 ~0.67s），掩盖率 ≈ 计算占墙钟比例。ctx.fsdp_exposure_ratio
+        是暴露率（1 − 掩盖率），由 simu_runner 从结构量解方程得到：
+          - 设了 ratio：通信 dur 中不与计算重叠的比例推进 comp lane
+          - 未设（None）：保持旧语义，dp_comm 完全不推 comp（全掩盖）
+        """
+        if self.stream == 'dp_comm':
+            ratio = getattr(ctx, 'fsdp_exposure_ratio', None)
+            if ratio is not None:
+                launch = launch_st if launch_st is not None else t['comp']
+                # 只推通信 dur 的暴露部分（dur × ratio）：fsdp 通信 layer-wise
+                # 分布在计算中，launch 偏移（tail 串行）是调度位置而非真实
+                # 暴露，不应额外推 comp —— 否则尾部集中会过度暴露。
+                return t['comp'] + (end_t - launch) * ratio
+            return t['comp']  # 全掩盖（旧语义）
+        return end_t
+
     def _prime_batch_submit(self, phase, submit_t):
         gid = (phase, self.id)
         self._batch_submit_by_gid.setdefault(gid, submit_t)
@@ -2785,7 +2808,7 @@ class Com(LeafModel):
                 rank=self.global_rank,
                 gid=gid,
                 cost=self.fwd_cost,
-                issue_t=t["comp"],
+                issue_t=(t["dp_comm"] if "dp_comm" in t else t["comp"]) if self.stream == "dp_comm" else t["comp"],
                 stream=self.stream,
                 mode="sync",
                 backend_kind=backend_kind,
@@ -2805,7 +2828,10 @@ class Com(LeafModel):
         self._fwd_launch_st = self._event_start_t(entry)
         self._fwd_done_t = end_t
         t[self.stream] = max(t[self.stream], end_t)
-        t["comp"] = max(t["comp"], end_t)
+        # FSDP（dp_comm lane）与计算**部分**重叠：按 ctx.fsdp_exposure_ratio
+        # 暴露率推进 comp lane（掩盖率 = 1 − 暴露率，结构推导）。未设 ratio
+        # 时保持旧语义（全掩盖，不推 comp）。
+        t["comp"] = max(t["comp"], self._dp_comm_push(ctx, t, end_t, self._fwd_launch_st))
         self._completed.add(gid)
         return True, None
 
@@ -2832,7 +2858,7 @@ class Com(LeafModel):
                 rank=self.global_rank,
                 gid=gid,
                 cost=self.bwd_cost,
-                issue_t=t["comp"],
+                issue_t=t["dp_comm"] if self.stream == "dp_comm" else t["comp"],
                 stream=self.stream,
                 mode="sync",
                 backend_kind=backend_kind,
@@ -2852,9 +2878,38 @@ class Com(LeafModel):
         self._bwd_launch_st = self._event_start_t(entry)
         self._bwd_done_t = end_t
         t[self.stream] = max(t[self.stream], end_t)
-        t["comp"] = max(t["comp"], end_t)
+        # 同 fwd：FSDP（dp_comm）按暴露率部分推 comp
+        t["comp"] = max(t["comp"], self._dp_comm_push(ctx, t, end_t, self._bwd_launch_st))
         self._completed.add(gid)
         return True, None
+
+    def prefill_recompute_fwd(self, recompute_cost_override=None):
+        """Clone for recompute forward so the _completed idempotency guard
+        doesn't skip re-issue. LeafModel's default returns self, so a
+        recomputed comm op re-enters _step with gid already in _completed and
+        is dropped — the DES trace then has no recompute-forward comm events
+        (CP/MoE a2a recompute segments missing). The clone carries
+        recompute_cost as fwd_cost; bwd_cost stays 0 (recompute only runs
+        _step, not _bwd). Mirrors AtomModel.prefill_recompute_fwd.
+
+        Recompute cost is the op's own fwd_cost (replaying a communication
+        moves the same payload again). An incoming recompute_cost_override
+        comes from compute-stage rc modelling (e.g. Permutation's
+        recompute_compute_time = permute-only mem) and must NOT shrink a comm
+        op's payload — otherwise MoE a2a recompute segments collapse to the
+        permute mem time (~2ms) instead of the full alltoall volume (~21ms).
+        """
+        recompute_cost = self.fwd_cost
+        clone = type(self)(
+            self.id, self.rank, self.group_size,
+            com_buff=None,
+            fwd_cost=recompute_cost, bwd_cost=0,
+            call_stk=self.call_stk,
+            global_rank=self.global_rank,
+            stream=self.stream, net=self.net,
+            size_bytes=self.size_bytes)
+        clone.forward_op = "recompute_fwd"
+        return clone
 
     def _blocking_step_impl(self, t, ctx, *, phase):
         if self.global_rank is None:

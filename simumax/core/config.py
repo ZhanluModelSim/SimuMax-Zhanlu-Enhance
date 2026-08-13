@@ -41,6 +41,13 @@ kNetOp = (
     "p2p",
     "all2all",
     "alltoallv",
+    "fsdp_all_gather",
+    "fsdp_reduce_scatter",
+    "model_embed_ag",
+    "model_moe_ag",
+    "model_moe_rs",
+    "sync_all_reduce",
+    "moe_small_a2a",
 )
 
 
@@ -330,6 +337,11 @@ class StrategyConfig(Config):
     # current compute). 2+ = explicit prefetch (multiple AGs fly simultaneously).
     # Only meaningful when zero_state >= 3 and fsdp_mode == "layer-wise".
     fsdp_prefetch_layers: int = 1
+    # Fraction of the forward cost replayed by gradient checkpointing
+    # (recompute). The 16p trace recomputes only part of the layer forward
+    # (attention/vwn kernels, ~0.65s) while a full-block replay would re-run
+    # every module. 1.0 = full forward replay.
+    recompute_cost_ratio: float = 1.0
 
     attention_sparse_ratio: float = (
         0.0  # 0.0 means dense attention; 0.5 means compute optimize for causal attention
@@ -935,6 +947,12 @@ class BandwidthConfig:
     latency_us: int
     fixed_latency: float = 0
     fixed_latency_us_by_comm_num: Dict[str, float] = None
+    # Per-card-count effective bandwidth (GiB/s), keyed by str(comm_num).
+    # When present, compute_net_op_time uses gbps_by_comm_num[comm_num] instead
+    # of the single `gbps` value — the bandwidth is a property of the comm
+    # group size (physical link utilization), not of the net/domain name.
+    # Absent = legacy single-gbps behavior (other models unaffected).
+    gbps_by_comm_num: Dict[str, float] = None
 
 
 @dataclass
@@ -1015,6 +1033,22 @@ class SystemConfig(Config):
     # {"cube": {"peak_tflops": 320}, "vector": {"peak_tflops": 80}}.
     # None means single-engine, which reproduces the current behavior.
     engines: Optional[Dict[str, dict]] = None
+    # FSDP 通信-计算重叠效率（治本暴露模型，design doc 4.2 补充）：
+    # 掩盖率 = fsdp_overlap_coefficient × (计算墙钟/总墙钟)。=1.0 时退化为
+    # 计算占用率方程；>1 表示 fsdp 通信集中在计算密集段（layer-wise 交错），
+    # 被计算覆盖的比例高于计算占墙钟比例（16p 实测 ~1.16）。
+    fsdp_overlap_coefficient: float = 1.0
+    # CP a2a 的 alltoall 有效带宽（GB/s，1e9 换算）。CP a2a 走 node 内全互联
+    # 层带宽（16p = 49 GB/s），但 alltoall 为每对 rank 小包（Q 25.2MB/peer），
+    # 实测有效带宽低于全互联（16p: 39.5 GB/s，30.2GB/764ms）。缺省 None =
+    # 走 node 层推导；声明后对 alltoallv/all2all + cp 通信组生效。
+    cp_a2a_bandwidth_gbps: Optional[float] = None
+    # 内存写带宽（GB/s，1e9）。写量模型：all_gather 每 rank 收/写全量 W、
+    # reduce_scatter 每 rank 收/写 W/N，时间 = 传输 + 写量/写带宽 →
+    # RS 有效带宽 = 1/(1/β_tx + 1/(N·β_w))，AG = 1/(1/β_tx + 1/β_w) = per-card-count。
+    # 16p 从 edp AG/RS transit 反推：β_w ≈ 88.9 GB/s（910B HBM 写路径）。
+    # 缺省 None = 不启用写量模型（AG/RS 用同一 per-card-count 带宽）。
+    write_bandwidth_gbps: Optional[float] = None
     # Network fabric model selection (network-fabric design doc section 6):
     # None = off (current behavior), "nic" = per-GPU NIC servers,
     # "nic+tor" = additionally activates ToR servers (Preview),
@@ -1079,6 +1113,9 @@ class SystemConfig(Config):
         fabric_model = config_dict.pop("fabric_model", None)
         topology = config_dict.pop("topology", None)
         operator_efficiency = config_dict.pop("operator_efficiency", None)
+        fsdp_overlap_coefficient = config_dict.pop("fsdp_overlap_coefficient", 1.0)
+        cp_a2a_bandwidth_gbps = config_dict.pop("cp_a2a_bandwidth_gbps", None)
+        write_bandwidth_gbps = config_dict.pop("write_bandwidth_gbps", None)
         return cls(
             sys_name=sys_name,
             num_per_node=num_per_node,
@@ -1091,6 +1128,9 @@ class SystemConfig(Config):
             fabric_model=fabric_model,
             topology=topology,
             operator_efficiency=operator_efficiency,
+            fsdp_overlap_coefficient=fsdp_overlap_coefficient,
+            cp_a2a_bandwidth_gbps=cp_a2a_bandwidth_gbps,
+            write_bandwidth_gbps=write_bandwidth_gbps,
         )
     
     def record_miss_efficiency(self, op_name:str, flops:int, shape_desc:str, use_eff):
@@ -1414,6 +1454,21 @@ class SystemConfig(Config):
         # alltoallv falls back to all2all when the network config only defines all2all
         if op_name == "alltoallv" and "alltoallv" not in net_data.op and "all2all" in net_data.op:
             op_name = "all2all"
+        # fsdp_all_gather/fsdp_reduce_scatter and the 16p-calibrated
+        # model-level/sync/probs ops fall back to the base collective op when
+        # the net profile doesn't declare them (configs without 16p α/β
+        # calibration keep the plain collective cost).
+        _OP_FALLBACK = {
+            "fsdp_all_gather": "all_gather",
+            "fsdp_reduce_scatter": "reduce_scatter",
+            "model_embed_ag": "all_gather",
+            "model_moe_ag": "all_gather",
+            "model_moe_rs": "reduce_scatter",
+            "sync_all_reduce": "all_reduce",
+            "moe_small_a2a": "all2all",
+        }
+        if op_name in _OP_FALLBACK and op_name not in net_data.op:
+            op_name = _OP_FALLBACK[op_name]
         op:NetOpConfig = net_data.op.get(op_name, None)  # 0: scale 1: offset 2: efficient_factor
         assert op is not None, f"{op_name} not exist on {net_data}"
         scale, offset, eff_factor = op.scale, op.offset, op.efficient_factor
@@ -1435,9 +1490,69 @@ class SystemConfig(Config):
             dp_fixed_bw = op.dp_fixed_bw.get(str(comm_num))
             self.real_comm_bw[op_name + "_dp"] = {"net":net, "bw":f"{dp_fixed_bw} GB/S", "comm_num":comm_num, "latency": None} 
             return actual_size / (dp_fixed_bw * 1024**3)  * 1000
-        
+
         # Intra Bandwidth decision
         bw = net_data.bandwidth.gbps
+        # 基于互联拓扑：node/跨板层有效带宽（物理参数推导优先，level_bandwidth_gbps
+        # 校准 fallback），通信组跨 node 流量比 r（group_cross_node_ratio）用层带宽
+        # 加权求有效带宽。r=0（组内单 node）走板内；r>0 按跨板流量比例加权。
+        _lv_bw = ((self.topology or {}).get('level_bandwidth_gbps') or {})
+        _lv = (self.topology or {}).get('levels') or []
+        _topo_bw = None
+        if strategy is not None and group_kind and len(_lv) >= 2:
+            _b0 = self._level_effective_bandwidth(_lv[0], _lv_bw.get(_lv[0].get('name')))
+            _b1 = self._level_effective_bandwidth(_lv[1], _lv_bw.get(_lv[1].get('name')))
+            if _b0 and _b1:
+                # a2a（cp/ep）用层流量分解（all2all_level_fraction 的跨板占比）；
+                # collective（AG/RS/AR）用组跨 node 比。二者跨板流量比例不同。
+                # node 内 a2a（comm_num <= num_per_node，如 CP a2a 的
+                # a2a_group = min(cp, num_per_node)）不走跨板层 → β = node 层。
+                _r = group_cross_node_ratio(group_kind, strategy, self.num_per_node)
+                if op_name.startswith('all2all') or op_name.startswith('alltoall'):
+                    if group_kind in ('cp', 'ep'):
+                        if comm_num <= self.num_per_node:
+                            _r = 0.0  # node 内 a2a（a2a_group=min(cp, num_per_node)）
+                        elif len(_lv) >= 2:
+                            _f = all2all_level_fraction(group_kind, strategy, _lv, 1)
+                            if _f > 0:
+                                _r = _f
+                if _r > 0:
+                    _topo_bw = 1 / ((1 - _r) / _b0 + _r / _b1)
+                else:
+                    _topo_bw = _b0  # 同 node：板内带宽
+        # Per-card-count bandwidth (align by comm group size, not by net/domain
+        # name): when the net profile declares gbps_by_comm_num, use the value
+        # for this comm_num; the op's efficient_factor below still applies
+        # (AG vs RS relative cost). Absent = legacy single-gbps.
+        by_cn = getattr(net_data.bandwidth, 'gbps_by_comm_num', None)
+        # FSDP collective 用 per-card-count 实测有效带宽（edp 2→18.9、dense
+        # 16→30.9 GB/s），而非拓扑 node 全互联 49：2 卡对传只用部分链路，
+        # 聚合带宽低于板内全互联（实测 fsdp 有效带宽 ~18.6 GB/s）。a2a/sync
+        # 保留拓扑路径（现有对齐）。
+        if op_name in ("fsdp_all_gather", "fsdp_reduce_scatter") and by_cn:
+            bw = by_cn.get(str(comm_num), _topo_bw or bw)
+            # 写量模型（AG/RS 带宽差，替代固定 op 因子）：all_gather 每 rank
+            # 收/写全量 W、reduce_scatter 收/写 W/N（N=组规模）→ RS 写量少、
+            # 有效带宽更高，且随 N 变（edp N=2: 22.9、dense N=16: 45.9 GB/s）。
+            # β_tx（传输带宽）从 per-card-count(=AG 有效带宽) 与写带宽 β_w 反推。
+            if op_name == "fsdp_reduce_scatter" and self.write_bandwidth_gbps:
+                beta_w = self.write_bandwidth_gbps * 1e9 / (1024 ** 3)  # GB/s → GiB/s
+                if 0 < bw < beta_w:
+                    beta_tx = 1.0 / (1.0 / bw - 1.0 / beta_w)
+                    bw = 1.0 / (1.0 / beta_tx + 1.0 / (comm_num * beta_w))
+        elif _topo_bw is not None:
+            bw = _topo_bw
+            # 保留 op 的 efficient_factor（fsdp_all_gather 0.394 / model_* 等）
+            # 作为相对成本：层带宽是跨板基准，op eff 区分 fsdp 与 collective。
+            # β_eff 是纯带宽（GB/s），时间 = actual_size/(β_eff × op_eff)。
+        elif by_cn:
+            bw = by_cn.get(str(comm_num), bw)
+        # CP a2a 的 alltoall 有效带宽（GiB/s，1024^3，与层带宽口径一致）：
+        # 每对 rank 小包（Q 25.2MB/peer），有效带宽低于 node 全互联层带宽
+        # （16p: node 49 GiB/s vs 实测 36.8 GiB/s = 39.5 GB/s）。
+        if self.cp_a2a_bandwidth_gbps and op_name in ("alltoallv", "all2all") \
+                and 'cp' in (comm_stage or '').lower():
+            bw = self.cp_a2a_bandwidth_gbps
         if self.FC8 and net == "high_intra_node": # If the internal bandwidth is FC8 mode, the bandwidth changes according to the number of communications.
             bw *= (comm_num-1)/7
 
@@ -1625,6 +1740,22 @@ class SystemConfig(Config):
         if levels:
             return levels[0].get("net")
         return None
+
+    def _level_effective_bandwidth(self, level_entry: dict, fallback_bw=None):
+        """层有效带宽：物理参数推导（port_num × bandwidth_per_port ÷ conv）优先。
+
+        fullmesh: port_num × per_port（每 device 聚合出口带宽，无收敛折损）
+        clos:     port_num × per_port ÷ convergence_ratio（共享上行收敛）
+        未声明物理参数（port_num / bandwidth_per_port_gbps）→ fallback_bw
+        （level_bandwidth_gbps 校准值 / 层 net 带宽）。
+        """
+        port = level_entry.get('port_num')
+        ppb = level_entry.get('bandwidth_per_port_gbps')
+        if port and ppb:
+            kind = level_entry.get('kind', 'clos')
+            conv = level_entry.get('convergence_ratio', 1.0)
+            return port * ppb / (conv if kind == 'clos' else 1.0)
+        return fallback_bw
 
     def _level_net_params(self, net: str, op_name: str, comm_num: int):
         """Resolve (scale, offset, eff_factor, bw_gbps, latency_us, fixed_latency_us)
@@ -1833,7 +1964,10 @@ class SystemConfig(Config):
     # `networks`; resolved to topology["levels"] at call time.
     LEVELS_NET = "levels"
     # Hierarchical-topology keys of the `topology` dict (design doc section 3).
-    LEVELS_TOPOLOGY_KEYS = ("levels", "composition_policy")
+    # `level_bandwidth_gbps` = per-level effective bandwidth (node 板内 hccs /
+    # su_clos 跨板) for the topology-weighted collective cost path in
+    # compute_net_op_time (based on the group's physical node spread).
+    LEVELS_TOPOLOGY_KEYS = ("levels", "composition_policy", "level_bandwidth_gbps")
     # composition_policy keys and values (design doc sections 3/6).
     COMPOSITION_POLICY_KEYS = ("all2all", "collectives", "p2p")
     COMPOSITION_POLICIES = ("max", "serial")
@@ -1984,7 +2118,11 @@ class SystemConfig(Config):
                 f"topology['levels'][{idx}] must be a dict, but got {type(entry)}"
             )
             required_keys = {"name", "size", "net"}
-            optional_keys = {"kind", "convergence_ratio"}
+            # 完整物理描述（可选）：kind/clos、convergence_ratio（clos 收敛）、
+            # port_num（每 device 端口数）、bandwidth_per_port_gbps（每端口有效带宽）、
+            # latency_us（静态延迟）。层有效带宽 = port_num × per_port ÷ conv（clos）。
+            optional_keys = {"kind", "convergence_ratio", "port_num",
+                             "bandwidth_per_port_gbps", "latency_us"}
             entry_keys = set(entry.keys())
             assert entry_keys.issuperset(required_keys), (
                 f"topology['levels'][{idx}] must have keys "
