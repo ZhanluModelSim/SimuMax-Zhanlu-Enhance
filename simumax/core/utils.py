@@ -289,16 +289,48 @@ def get_rank_group(global_rank, strategy, placement=None):
     # above are placement-aware, so the flattening stays valid (a bijection
     # within the group) under any order.
     dp_cp_rank = cp_rank + dp_rank * strategy.cp_size
+    dense_group_id_suffix = None
+    # When fsdp_shard_size overrides the dense FSDP group, project the
+    # rank into [0, fsdp_dense_group_size) so the comm op's local rank
+    # is valid. The exact group composition is an approximation; the
+    # levels router uses _group_size_and_stride for cross-node routing.
+    if strategy.fsdp_shard_size is not None:
+        dense_group_size = strategy.fsdp_dense_group_size
+        dense_base_stride = min(strides["cp"], strides["dp"])
+        dense_stride = dense_base_stride
+        if dense_group_size * dense_base_stride > strategy.world_size:
+            dense_stride = max(1, strategy.world_size // dense_group_size)
+        dp_cp_rank = (global_rank // dense_stride) % dense_group_size
+        dense_group_id_suffix = global_rank % dense_stride
     pp_rank = global_rank // strides["pp"]
     ep_rank = global_rank % strategy.ep_size
-    edp_rank = global_rank // strategy.ep_size % strategy.edp_size
+    logical_edp_rank = global_rank // strategy.ep_size % strategy.edp_size
+    edp_rank = logical_edp_rank
+    moe_group_id_suffix = None
+    if strategy.oe_shard_size is not None:
+        moe_group_size = strategy.fsdp_moe_group_size
+        moe_base_stride = strategy.ep_size * strategy.etp_size
+        moe_stride = moe_base_stride
+        if moe_group_size * moe_base_stride > strategy.world_size:
+            moe_stride = max(1, strategy.world_size // moe_group_size)
+        edp_rank = (global_rank // moe_stride) % moe_group_size
+        moe_group_id_suffix = global_rank % moe_stride
     tp_group_id = f"pp:{pp_rank}-cp:{cp_rank}-dp:{dp_rank}"
     pp_group_id = f"tp:{tp_rank}-cp:{cp_rank}-dp:{dp_rank}"
     dp_group_id = f"tp:{tp_rank}-pp:{pp_rank}"
     dp_cp_group_id = f"tp:{tp_rank}-pp:{pp_rank}"
+    if dense_group_id_suffix is not None:
+        dp_cp_group_id += f"-fsdp:{dense_group_id_suffix}"
     cp_group_id = f"tp:{tp_rank}-pp:{pp_rank}-dp:{dp_rank}"
-    ep_group_id = f"tp:{tp_rank}-pp:{pp_rank}-edp:{edp_rank}"
-    edp_group_id = f"tp:{tp_rank}-pp:{pp_rank}-ep:{ep_rank}"
+    # EP collectives retain the logical EP×EDP mesh.  An OE/FSDP shard
+    # override must not leak into the router EP group id.
+    ep_group_id = f"tp:{tp_rank}-pp:{pp_rank}-edp:{logical_edp_rank}"
+    if moe_group_id_suffix is None:
+        edp_group_id = f"tp:{tp_rank}-pp:{pp_rank}-ep:{ep_rank}"
+    else:
+        # OE shard groups are formed by the configured arithmetic-progression
+        # stride and therefore span the logical EP ranks.
+        edp_group_id = f"tp:{tp_rank}-pp:{pp_rank}-oe:{moe_group_id_suffix}"
     dic = {
         "tp_group_id": tp_group_id,
         "tp_rank": tp_rank,
@@ -343,15 +375,36 @@ def _group_size_and_stride(group_kind, strategy, placement=None):
             # progression — the outer dim's blocks are strided by more than
             # the inner dim's span — and we keep the inner dim's stride as
             # the contiguous-plane approximation (v1 limitation).
-            return (strategy.dp_size * strategy.cp_size,
-                    min(strides["cp"], strides["dp"]))
+            override = getattr(strategy, 'fsdp_shard_size', None)
+            if override is not None:
+                group_size = override
+            else:
+                group_size = strategy.dp_size * strategy.cp_size
+            base_stride = min(strides["cp"], strides["dp"])
+            world_size = getattr(strategy, 'world_size', group_size * base_stride)
+            if override is not None and group_size * base_stride > world_size:
+                stride = max(1, world_size // group_size)
+            else:
+                stride = base_stride
+            return (group_size, stride)
         return strategy.pp_size, strides["pp"]
     if group_kind == "ep":
         return strategy.ep_size, 1
     if group_kind == "etp":
         return strategy.etp_size, strategy.ep_size
     if group_kind == "edp":
-        return strategy.edp_size, strategy.ep_size * strategy.etp_size
+        override = getattr(strategy, 'oe_shard_size', None)
+        if override is not None:
+            group_size = override
+        else:
+            group_size = getattr(strategy, 'edp_size', 1)
+        base_stride = getattr(strategy, 'ep_size', 1) * getattr(strategy, 'etp_size', 1)
+        world_size = getattr(strategy, 'world_size', group_size * base_stride)
+        if override is not None and group_size * base_stride > world_size:
+            stride = max(1, world_size // group_size)
+        else:
+            stride = base_stride
+        return (group_size, stride)
     raise ValueError(f"unknown group_kind: {group_kind!r}")
 
 

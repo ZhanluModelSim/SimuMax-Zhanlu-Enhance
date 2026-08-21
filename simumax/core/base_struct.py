@@ -888,7 +888,10 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
         def compute_details(op_name, stage, flops, accessed_mem):
             #compute_details include compute time, tflops of accelerator, flops of current op, etc.
             class_key, path_key = self.get_cost_keys()
-            compute_details = self.system.compute_op_accuracy_time(op_name, flops, shape_desc= self.get_input_shapes_desc(stage), reture_detail=True, class_key=class_key, path_key=path_key)
+            compute_details = self.system.compute_op_accuracy_time(
+                op_name, flops, shape_desc=self.get_input_shapes_desc(stage),
+                reture_detail=True, class_key=class_key, path_key=path_key,
+                accessed_mem=accessed_mem, stage=stage)
 
             # io_details include io time, gbps of accelerator, io size of current op, etc.
             io_details = self.system.compute_mem_access_time(op_name,
@@ -1593,9 +1596,11 @@ class State_Thread:
 
 
 # Built-in resource lanes used when no system-level registry is supplied
-# (design doc 4.2). Must match SystemConfig.simu_resource_lanes()'s built-ins;
-# the legacy "off" lane is dropped.
-DEFAULT_RESOURCE_LANES = ("comp", "comm", "pp_fwd", "pp_bwd")
+# (design doc 4.2). Must match SystemConfig.simu_resource_lanes()'s built-ins.
+# ``offload`` is the asynchronous activation D2H/H2D lane.  It is kept
+# separate from ``comp`` and ``comm`` so host-transfer work can overlap with
+# device compute without inventing a measured overlap coefficient.
+DEFAULT_RESOURCE_LANES = ("comp", "comm", "pp_fwd", "pp_bwd", "offload")
 
 
 class SimuThread:
@@ -1898,13 +1903,14 @@ class SimuContext:
         order,
         call_stk,
         log_id,
+        meta=None,
     ):
         state = self.get_async_state(gid)
         state.cost = cost
         state.send_rank = rank
         state.send_post_t = post_t
         state.send_post_order = order
-        state.send_meta = {"call_stk": call_stk, "id": log_id}
+        state.send_meta = {"call_stk": call_stk, "id": log_id, **(meta or {})}
 
     def register_async_recv(
         self,
@@ -1916,13 +1922,14 @@ class SimuContext:
         order,
         call_stk,
         log_id,
+        meta=None,
     ):
         state = self.get_async_state(gid)
         state.cost = cost
         state.recv_rank = rank
         state.recv_post_t = post_t
         state.recv_post_order = order
-        state.recv_meta = {"call_stk": call_stk, "id": log_id}
+        state.recv_meta = {"call_stk": call_stk, "id": log_id, **(meta or {})}
 
     def post_async_send_entry(
         self,
@@ -1937,6 +1944,7 @@ class SimuContext:
         log_id,
         net=None,
         size_bytes=0,
+        meta=None,
     ):
         order = self.next_issue_seq()
         self.register_async_send(
@@ -1947,6 +1955,7 @@ class SimuContext:
             order=order,
             call_stk=call_stk,
             log_id=log_id,
+            meta=meta,
         )
         eid = self.issue_comm_entry(
             rank=rank,
@@ -1959,7 +1968,8 @@ class SimuContext:
             expected=2,
             log_call_stk=call_stk,
             log_id=log_id,
-            meta={"post_order": order, "post_ts": post_t, "net": net, "size_bytes": size_bytes},
+            meta={"post_order": order, "post_ts": post_t, "net": net,
+                  "size_bytes": size_bytes, **(meta or {})},
         )
         self.attach_async_send_eid(gid, eid)
         self._stamp_async_crossed_levels(gid)
@@ -1979,6 +1989,7 @@ class SimuContext:
         log_id,
         net=None,
         size_bytes=0,
+        meta=None,
     ):
         order = self.next_issue_seq()
         self.register_async_recv(
@@ -1989,6 +2000,7 @@ class SimuContext:
             order=order,
             call_stk=call_stk,
             log_id=log_id,
+            meta=meta,
         )
         eid = self.issue_comm_entry(
             rank=rank,
@@ -2001,7 +2013,8 @@ class SimuContext:
             expected=2,
             log_call_stk=call_stk,
             log_id=log_id,
-            meta={"post_order": order, "post_ts": post_t, "net": net, "size_bytes": size_bytes},
+            meta={"post_order": order, "post_ts": post_t, "net": net,
+                  "size_bytes": size_bytes, **(meta or {})},
         )
         self.attach_async_recv_eid(gid, eid)
         self._stamp_async_crossed_levels(gid)
@@ -2422,11 +2435,13 @@ class SimuContext:
                 send_meta['call_stk'], gid[0], send_entry.launch_t, send_entry.end_t,
                 gid=send_meta['id'], post=send_post, order=send_order,
                 stream=send_entry.stream, kind="comm", lane=None,
+                metadata=send_meta,
             )
             self.event_sink.emit_span(
                 recv_meta['call_stk'], gid[0], recv_entry.launch_t, recv_entry.end_t,
                 gid=recv_meta['id'], post=recv_post, order=recv_order,
                 stream=recv_entry.stream, kind="comm", lane=None,
+                metadata=recv_meta,
             )
             if ready_t > recv_entry.end_t + 1e-9:
                 wait_call_stk = recv_meta["call_stk"].replace("-async_recv", "-async_wait_recv")
@@ -2434,6 +2449,7 @@ class SimuContext:
                     wait_call_stk, gid[0], recv_entry.end_t, ready_t,
                     gid=recv_meta['id'], post=recv_post, order=recv_order,
                     stream="comp", kind="wait", lane=None,
+                    metadata=recv_meta,
                 )
         state.pair_logged = True
         return ready_t
@@ -2451,6 +2467,46 @@ class LeafModel():
     # scheduling, lanes, and durations are unaffected.
     simu_kind: ClassVar[str | None] = "compute"
     simu_lane: ClassVar[str | None] = None
+
+    def _event_metadata(self):
+        """Structural metadata shared by async communication leaf ops."""
+        op_id = str(getattr(self, "id", ""))
+        lowered = op_id.lower()
+        group_kind = getattr(self, "group_kind", None)
+        if group_kind is None:
+            for candidate in ("dp_cp", "edp", "etp", "cp", "ep", "tp", "pp"):
+                if f"{candidate}_group" in lowered or f"{candidate}group" in lowered:
+                    group_kind = candidate
+                    break
+        if group_kind is None and ("default_group" in lowered or "send_recv-" in lowered):
+            group_kind = "pp"
+        comm_stage = getattr(self, "comm_stage", None)
+        marker = "-stage:"
+        if comm_stage is None and marker in lowered:
+            comm_stage = op_id[lowered.index(marker) + len(marker):].split("-")[0]
+        owner = getattr(self, "comm_owner", None) or {
+            "cp": "attention_cp", "ep": "moe_ep", "dp_cp": "fsdp_dense",
+            "edp": "fsdp_moe", "tp": "tensor_parallel",
+            "etp": "expert_tensor_parallel", "pp": "pipeline",
+        }.get(group_kind)
+        stage_lower = str(comm_stage or "").lower()
+        if "dispatch" in stage_lower:
+            owner = "moe_dispatch"
+        elif "combine" in stage_lower:
+            owner = "moe_combine"
+        elif "router" in stage_lower:
+            owner = "moe_router"
+        return {
+            "group_kind": group_kind,
+            "group_size": getattr(self, "group_size", None),
+            "payload_bytes": getattr(self, "size_bytes", 0),
+            "size_bytes": getattr(self, "size_bytes", 0),
+            "net": getattr(self, "net", None),
+            "comm_stage": comm_stage,
+            "comm_owner": owner,
+            "comm_role": (getattr(self, "comm_role", None)
+                           or comm_stage or group_kind),
+        }
 
     def __init__(self, specific_name=''):
         self.st = None
@@ -2520,10 +2576,12 @@ class LeafModel():
     
 class AtomModel(LeafModel):
     #simplify LeafModel with cost information
-    def __init__(self, fwd_cost, bwd_cost, specific_name='', recompute_cost=None):
+    def __init__(self, fwd_cost, bwd_cost, specific_name='', recompute_cost=None,
+                 skip_recompute=False):
         super().__init__(specific_name)
         self.fwd_cost = fwd_cost
         self.bwd_cost = bwd_cost
+        self.skip_recompute = skip_recompute
         self.recompute_cost = fwd_cost if recompute_cost is None else recompute_cost
         # self.fwd_cost = fwd_cost*(1+random.random()*0.6)
         # self.bwd_cost = bwd_cost*(1+random.random()*0.6)
@@ -2536,7 +2594,14 @@ class AtomModel(LeafModel):
         return True
 
     def prefill_recompute_fwd(self, recompute_cost_override=None):
-        recompute_cost = self.recompute_cost if recompute_cost_override is None else recompute_cost_override
+        # A bwd-only atom (fwd_cost=0, skip_recompute=True) models a
+        # backward-only kernel that has no forward/recompute phase; its
+        # recompute clone must stay zero-cost even when a parent leaf-module
+        # recompute override would otherwise be applied.
+        if self.skip_recompute:
+            recompute_cost = 0.0
+        else:
+            recompute_cost = self.recompute_cost if recompute_cost_override is None else recompute_cost_override
         clone = AtomModel(
             fwd_cost=recompute_cost,
             bwd_cost=self.bwd_cost,
@@ -2650,7 +2715,9 @@ class Com(LeafModel):
     simu_kind = "comm"
 
     def __init__(self, id, rank, group_size, com_buff=None, fwd_cost=0, bwd_cost=0,
-                 call_stk='', global_rank=None, stream="comm", net=None, size_bytes=0):
+                 call_stk='', global_rank=None, stream="comm", net=None, size_bytes=0,
+                 group_kind=None, comm_stage=None, comm_owner=None, comm_role=None,
+                 **kwargs):
         super().__init__()
         self.call_stk = call_stk + f'{self.call_stk}'
         self.id = id
@@ -2665,6 +2732,14 @@ class Com(LeafModel):
         # op out of fabric charging (network-fabric design doc 5.2).
         self.net = net
         self.size_bytes = size_bytes
+        # Communication semantics are model/config facts.  Keep them on the
+        # op so every completion/post span can export the same ledger fields.
+        # ``kwargs`` intentionally absorbs legacy constructor extras (for
+        # example ``strategy``) without changing scheduling behaviour.
+        self.group_kind = group_kind
+        self.comm_stage = comm_stage
+        self.comm_owner = comm_owner
+        self.comm_role = comm_role
         self._completed = set()  # store completed gid for this rank/op
         self._fwd_launch_st = None
         self._bwd_launch_st = None
@@ -2677,24 +2752,55 @@ class Com(LeafModel):
         self._bwd_done_t = None
         self._batch_submit_by_gid = {}
 
-    def _dp_comm_push(self, ctx, t, end_t, launch_st):
-        """FSDP（dp_comm lane）通信对 comp lane 的推挤。
+    def _event_metadata(self):
+        """Return portable communication ownership metadata for trace spans."""
+        group_kind = self.group_kind
+        comm_stage = self.comm_stage
+        # Existing model ids already encode these structural labels.  Parsing
+        # them avoids changing every historical call site while preserving
+        # portability across rank/world-size changes.
+        lowered = str(self.id).lower()
+        if group_kind is None:
+            for candidate in ("dp_cp", "edp", "etp", "cp", "ep", "tp", "pp"):
+                if f"{candidate}_group" in lowered or f"{candidate}group" in lowered:
+                    group_kind = candidate
+                    break
+        if group_kind is None and ("default_group" in lowered or "send_recv-" in lowered):
+            group_kind = "pp"
+        if comm_stage is None:
+            marker = "-stage:"
+            if marker in lowered:
+                comm_stage = str(self.id)[lowered.index(marker) + len(marker):].split("-")[0]
+        owner = self.comm_owner
+        if owner is None:
+            owner = {
+                "cp": "attention_cp", "ep": "moe_ep", "dp_cp": "fsdp_dense",
+                "edp": "fsdp_moe", "tp": "tensor_parallel",
+                "etp": "expert_tensor_parallel", "pp": "pipeline",
+            }.get(group_kind)
+        stage_lower = str(comm_stage or "").lower()
+        if "dispatch" in stage_lower:
+            owner = "moe_dispatch"
+        elif "combine" in stage_lower:
+            owner = "moe_combine"
+        elif "router" in stage_lower:
+            owner = "moe_router"
+        return {
+            "group_kind": group_kind,
+            "group_size": self.group_size,
+            "payload_bytes": self.size_bytes,
+            "size_bytes": self.size_bytes,
+            "net": self.net,
+            "comm_stage": comm_stage,
+            "comm_owner": owner,
+            "comm_role": self.comm_role or comm_stage or group_kind,
+        }
 
-        实测 fsdp 通信与计算**部分**重叠（16p：AG 暴露 ~30%、RS ~48%，
-        墙钟增量 ~0.67s），掩盖率 ≈ 计算占墙钟比例。ctx.fsdp_exposure_ratio
-        是暴露率（1 − 掩盖率），由 simu_runner 从结构量解方程得到：
-          - 设了 ratio：通信 dur 中不与计算重叠的比例推进 comp lane
-          - 未设（None）：保持旧语义，dp_comm 完全不推 comp（全掩盖）
+    def _dp_comm_push(self, ctx, t, end_t, launch_st):
+        """Advance compute for a blocking communication completion.
+
+        FSDP overlap is represented only by async post/wait graph edges.
         """
-        if self.stream == 'dp_comm':
-            ratio = getattr(ctx, 'fsdp_exposure_ratio', None)
-            if ratio is not None:
-                launch = launch_st if launch_st is not None else t['comp']
-                # 只推通信 dur 的暴露部分（dur × ratio）：fsdp 通信 layer-wise
-                # 分布在计算中，launch 偏移（tail 串行）是调度位置而非真实
-                # 暴露，不应额外推 comp —— 否则尾部集中会过度暴露。
-                return t['comp'] + (end_t - launch) * ratio
-            return t['comp']  # 全掩盖（旧语义）
         return end_t
 
     def _prime_batch_submit(self, phase, submit_t):
@@ -2719,6 +2825,7 @@ class Com(LeafModel):
             gid=self.id, stream=self.stream,
             kind="comm", lane=self.simu_lane,
             name=self.call_stk.split("-")[-1] + "-post",
+            metadata=self._event_metadata(),
         )
 
     def step(self, t, ctx):
@@ -2732,6 +2839,7 @@ class Com(LeafModel):
                 self.call_stk, "fwd", self._fwd_launch_st, done_t,
                 gid=self.id, stream=self.stream,
                 kind=self.simu_kind, lane=self.simu_lane,
+                metadata=self._event_metadata(),
             )
             self._fwd_launch_st = None
             self._fwd_done_t = None
@@ -2749,6 +2857,7 @@ class Com(LeafModel):
                 self.call_stk, "bwd", self._bwd_launch_st, done_t,
                 gid=self.id, stream=self.stream,
                 kind=self.simu_kind, lane=self.simu_lane,
+                metadata=self._event_metadata(),
             )
             self._bwd_launch_st = None
             self._bwd_done_t = None
@@ -2769,7 +2878,7 @@ class Com(LeafModel):
         is an intra-node phase and engages nothing). Level 0 has no
         level_tail entry — its server is the ToR.
         """
-        meta = {"net": self.net, "size_bytes": self.size_bytes}
+        meta = self._event_metadata()
         levels = getattr(ctx, "levels", None)
         fabric = ctx.fabric
         if (self.net in ("inter_node", "levels") and levels
@@ -2808,7 +2917,12 @@ class Com(LeafModel):
                 rank=self.global_rank,
                 gid=gid,
                 cost=self.fwd_cost,
-                issue_t=(t["dp_comm"] if "dp_comm" in t else t["comp"]) if self.stream == "dp_comm" else t["comp"],
+                # dp_comm (FSDP) is issued no earlier than the current compute
+                # progress: a fwd AG follows its layer's fwd pipeline stage and a
+                # bwd RS/AG follows the layer's bwd, instead of firing on the
+                # stale dp_comm lane clock (which was left at the fwd-phase tail
+                # and pulled all bwd FSDP comm into the fwd phase).
+                issue_t=(max(t["dp_comm"], t["comp"]) if "dp_comm" in t else t["comp"]) if self.stream == "dp_comm" else t["comp"],
                 stream=self.stream,
                 mode="sync",
                 backend_kind=backend_kind,
@@ -2858,7 +2972,9 @@ class Com(LeafModel):
                 rank=self.global_rank,
                 gid=gid,
                 cost=self.bwd_cost,
-                issue_t=t["dp_comm"] if self.stream == "dp_comm" else t["comp"],
+                # Same as fwd: bwd FSDP comm must wait for the layer's bwd
+                # compute (comp lane), not fire on the stale dp_comm clock.
+                issue_t=(max(t["dp_comm"], t["comp"]) if "dp_comm" in t else t["comp"]) if self.stream == "dp_comm" else t["comp"],
                 stream=self.stream,
                 mode="sync",
                 backend_kind=backend_kind,
@@ -2907,7 +3023,9 @@ class Com(LeafModel):
             call_stk=self.call_stk,
             global_rank=self.global_rank,
             stream=self.stream, net=self.net,
-            size_bytes=self.size_bytes)
+            size_bytes=self.size_bytes, group_kind=self.group_kind,
+            comm_stage=self.comm_stage, comm_owner=self.comm_owner,
+            comm_role=self.comm_role)
         clone.forward_op = "recompute_fwd"
         return clone
 
@@ -2999,6 +3117,18 @@ class all_gather(Com):
         super().__init__('all_gather'+id, rank, group_size, com_buff, 
                          fwd_cost=fwd_cost, bwd_cost=bwd_cost, call_stk=call_stk, **kwargs)
         # self.call_stk = self.call_stk + '-all_gather'
+class all_gatherv(Com):
+    """Variable-count all-gather.
+
+    Scheduling semantics are identical to :class:`all_gather`; the distinct
+    type keeps the model graph/trace faithful while SystemConfig resolves the
+    operation onto the same physical network levels.
+    """
+    def __init__(self, id, rank, group_size, com_buff=None, fwd_cost=0,
+                 bwd_cost=0, call_stk='', **kwargs):
+        super().__init__('all_gatherv' + id, rank, group_size, com_buff,
+                         fwd_cost=fwd_cost, bwd_cost=bwd_cost,
+                         call_stk=call_stk, **kwargs)
 class all_gather_fwd(Com):
     def __init__(self, id, rank, group_size, com_buff=None, fwd_cost=0, bwd_cost=0, call_stk='', **kwargs):
         super().__init__('all_gather'+id, rank, group_size, com_buff, 
@@ -3022,6 +3152,13 @@ class reduce_scatter(Com):
         super().__init__('reduce_scatter'+id, rank, group_size, com_buff, 
                          fwd_cost=fwd_cost, bwd_cost=bwd_cost, call_stk=call_stk,**kwargs)
         # self.call_stk = self.call_stk + '-reduce_scatter'
+class reduce_scatterv(Com):
+    """Variable-count reduce-scatter; physically routed through levels."""
+    def __init__(self, id, rank, group_size, com_buff=None, fwd_cost=0,
+                 bwd_cost=0, call_stk='', **kwargs):
+        super().__init__('reduce_scatterv' + id, rank, group_size, com_buff,
+                         fwd_cost=fwd_cost, bwd_cost=bwd_cost,
+                         call_stk=call_stk, **kwargs)
 class all_reduce(Com):
     def __init__(self, id, rank, group_size, com_buff=None, fwd_cost=0, bwd_cost=0, call_stk='', **kwargs):
         super().__init__('all_reduce'+id, rank, group_size, com_buff, 
@@ -3031,6 +3168,15 @@ class all2all(Com):
     def __init__(self, id, rank, group_size, com_buff=None, fwd_cost=0, bwd_cost=0, call_stk='', **kwargs):
         super().__init__('all2all'+id, rank, group_size, com_buff, 
                          fwd_cost=fwd_cost, bwd_cost=bwd_cost, call_stk=call_stk,**kwargs)
+
+
+class alltoallv(Com):
+    """Variable-count all-to-all used by token and CP redistributions."""
+    def __init__(self, id, rank, group_size, com_buff=None, fwd_cost=0,
+                 bwd_cost=0, call_stk='', **kwargs):
+        super().__init__('alltoallv' + id, rank, group_size, com_buff,
+                         fwd_cost=fwd_cost, bwd_cost=bwd_cost,
+                         call_stk=call_stk, **kwargs)
 
 
 class all2all_fwd(Com):
@@ -3049,6 +3195,50 @@ class all2all_bwd(Com):
 
     def _step(self, t, ctx):
         return True
+
+
+class alltoallv_fwd(Com):
+    def __init__(self, id, rank, group_size, com_buff=None, fwd_cost=0,
+                 bwd_cost=0, call_stk='', **kwargs):
+        super().__init__('alltoallv' + id, rank, group_size, com_buff,
+                         fwd_cost=fwd_cost, bwd_cost=bwd_cost,
+                         call_stk=call_stk, **kwargs)
+
+    def _bwd(self, t, ctx):
+        return True
+
+
+class alltoallv_bwd(Com):
+    def __init__(self, id, rank, group_size, com_buff=None, fwd_cost=0,
+                 bwd_cost=0, call_stk='', **kwargs):
+        super().__init__('alltoallv' + id, rank, group_size, com_buff,
+                         fwd_cost=fwd_cost, bwd_cost=bwd_cost,
+                         call_stk=call_stk, **kwargs)
+
+    def _step(self, t, ctx):
+        return True
+
+
+class batch_send_recv(Com):
+    """One batched point-to-point exchange between two global ranks.
+
+    The batch may contain several tensors, but they share one rendezvous and
+    one levels-derived P2P cost. Callers pass the structurally summed payload.
+    """
+    def __init__(self, id, rank, peer_rank, com_buff=None, fwd_cost=0,
+                 bwd_cost=0, call_stk='', global_rank=None, **kwargs):
+        pair = sorted((int(global_rank), int(peer_rank)))
+        pair_id = f"send_recv-{pair[0]}-{pair[1]}-batch-{id}"
+        local_rank = 0 if int(global_rank) == pair[0] else 1
+        super().__init__(pair_id, local_rank, 2, com_buff,
+                         fwd_cost=fwd_cost, bwd_cost=bwd_cost,
+                         call_stk=call_stk, global_rank=global_rank, **kwargs)
+
+    def _step(self, t, ctx):
+        return self._blocking_step_impl(t, ctx, phase="fwd")
+
+    def _bwd(self, t, ctx):
+        return self._blocking_step_impl(t, ctx, phase="bwd")
 
 class send(Com):
     simu_lane = "pp_detail"
@@ -3143,7 +3333,8 @@ class async_all_gather(LeafModel):
 
     def __init__(self, id, rank, group_size, fwd_cost=0, bwd_cost=0,
                  global_rank=None, stream="comm", net=None, size_bytes=0,
-                 call_stk=''):
+                 call_stk='', group_kind=None, comm_stage=None,
+                 comm_owner=None, comm_role=None, **kwargs):
         super().__init__()
         self.call_stk = call_stk + f'-{self.__class__.__name__}'
         self.id = id
@@ -3157,12 +3348,20 @@ class async_all_gather(LeafModel):
         # entry's meta; None keeps the entry out of fabric charging.
         self.net = net
         self.size_bytes = size_bytes
+        self.group_kind = group_kind
+        self.comm_stage = comm_stage
+        self.comm_owner = comm_owner
+        self.comm_role = comm_role
         self._eid = None
         self._posted_fwd = False
         self._posted_bwd = False
 
     def _issue_meta(self):
-        return {"net": self.net, "size_bytes": self.size_bytes}
+        # Keep the communication entry metadata identical to its eventual
+        # completion span.  This matters for level routing and for async FSDP
+        # posts: a payload/domain override must not disappear at the queue
+        # boundary.
+        return self._event_metadata()
 
     def _backend_kind(self, ctx):
         expected = 2 if self.id.startswith("send_recv-") else self.group_size
@@ -3208,6 +3407,7 @@ class async_all_gather(LeafModel):
             gid=self.id, stream=self.stream,
             kind="comm", lane=self.simu_lane,
             name=self.call_stk.split("-")[-1] + "-post",
+            metadata=self._event_metadata(),
         )
         ctx.pump_comm_queue()
         setattr(self, posted_attr, True)
@@ -3243,7 +3443,8 @@ class async_reduce_scatter(LeafModel):
 
     def __init__(self, id, rank, group_size, bwd_cost=0, fwd_cost=0,
                  global_rank=None, stream="comm", net=None, size_bytes=0,
-                 call_stk=''):
+                 call_stk='', group_kind=None, comm_stage=None,
+                 comm_owner=None, comm_role=None, **kwargs):
         super().__init__()
         self.call_stk = call_stk + f'-{self.__class__.__name__}'
         self.id = id
@@ -3255,6 +3456,10 @@ class async_reduce_scatter(LeafModel):
         self.stream = stream
         self.net = net
         self.size_bytes = size_bytes
+        self.group_kind = group_kind
+        self.comm_stage = comm_stage
+        self.comm_owner = comm_owner
+        self.comm_role = comm_role
         self._eid = None
         self._posted_fwd = False
         self._posted_bwd = False
@@ -3294,6 +3499,7 @@ class async_reduce_scatter(LeafModel):
             gid=self.id, stream=self.stream,
             kind="comm", lane=self.simu_lane,
             name=self.call_stk.split("-")[-1] + "-post",
+            metadata=self._event_metadata(),
         )
         ctx.pump_comm_queue()
         setattr(self, posted_attr, True)
@@ -3370,7 +3576,8 @@ class async_wait_collective(LeafModel):
                 continue
             ctx.event_sink.emit_span(
                 op.call_stk, phase, entry.launch_t, entry.end_t,
-                gid=op.id, stream=op.stream, kind="comm", lane=op.simu_lane)
+                gid=op.id, stream=op.stream, kind="comm", lane=op.simu_lane,
+                metadata=op._event_metadata())
         if end_t > wait_start + 1e-12:
             ctx.event_sink.emit_span(
                 self.call_stk, phase, wait_start, end_t,
@@ -3434,6 +3641,7 @@ class async_send(LeafModel):
             log_id=f"{phase}:{self.id}",
             net=self.net,
             size_bytes=self.size_bytes,
+            meta=self._event_metadata(),
         )
         self._entry_by_gid[gid] = eid
         self._completed.add(gid)
@@ -3484,6 +3692,7 @@ class async_recv(LeafModel):
             log_id=f"{phase}:{self.id}",
             net=self.net,
             size_bytes=self.size_bytes,
+            meta=self._event_metadata(),
         )
         self._entry_by_gid[gid] = eid
         self._launched.add(gid)
@@ -3598,6 +3807,7 @@ class async_wait_recv(LeafModel):
                 log_id=f"fwd:{self.id}",
                 net=self.net,
                 size_bytes=self.size_bytes,
+                meta=self._event_metadata(),
             )
             return False, ("yield_keep", gid)
         ok, blk = self._step(t, ctx, phase="fwd")
@@ -3621,6 +3831,7 @@ class async_wait_recv(LeafModel):
                 log_id=f"bwd:{self.id}",
                 net=self.net,
                 size_bytes=self.size_bytes,
+                meta=self._event_metadata(),
             )
             return False, ("yield_keep", gid)
         ok, blk = self._bwd(t, ctx)
@@ -3670,6 +3881,7 @@ class sync_send(async_send):
                 log_id=f"{phase}:{self.id}",
                 net=self.net,
                 size_bytes=self.size_bytes,
+                meta=self._event_metadata(),
             )
             self._entry_by_gid[gid] = eid
         ready_t = ctx.ensure_async_ready(gid)
@@ -3718,6 +3930,7 @@ class sync_wait_recv(async_wait_recv):
                 log_id=f"{phase}:{self.id}",
                 net=self.net,
                 size_bytes=self.size_bytes,
+                meta=self._event_metadata(),
             )
         ready_t = ctx.ensure_async_ready(gid)
         if ready_t is None:

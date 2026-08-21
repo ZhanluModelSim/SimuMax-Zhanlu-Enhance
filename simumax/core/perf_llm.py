@@ -26,6 +26,7 @@ from simumax.core.trace_export import (
 from simumax.core.utils import (
     HumanReadableSize,
     human_readable_bytes,
+    human_readable_times,
     convert_final_result_to_human_format,
     get_pp_stage_representative_rank,
     get_pp_p2p_comm_size,
@@ -1573,6 +1574,244 @@ class PerfLLM(PerfBase):
         # TODO: support uneven divide && interleaving
         bubble_time = fwd_bwd_time * (self.strategy.pp_size - 1)
         return bubble_time
+
+    def _compute_mxx_orthogonal_optimizer_steps(self):
+        """Derive the unfused orthogonal-optimizer kernel graph.
+
+        The graph is the Newton-Schulz implementation structure: matrix
+        normalization, three BMMs plus polynomial vector updates per
+        iteration, then restore/cast. Every duration is derived from tensor
+        bytes, BMM shapes, HBM/runtime parameters, and kernel launch cost.
+        """
+        if getattr(self.model_config, "model_type", None) != "mxx_model":
+            return []
+        phase_num = int(getattr(
+            self.model_config, "latent_attn_phase_num", 0) or 0)
+        batches_480 = list(getattr(
+            self.model_config, "latent_attn_batches_480", None) or [])
+        dim480 = int(getattr(self.model_config, "latent_attn_dim480", 0) or 0)
+        dim128 = int(getattr(self.model_config, "latent_attn_dim128", 0) or 0)
+        if not phase_num or len(batches_480) < 2 or not dim480 or not dim128:
+            return []
+
+        layer_num = int(self.model_config.layer_num)
+        hidden = int(self.model_config.hidden_size)
+        b128_values = list(getattr(
+            self.model_config, "latent_attn_batches_128", None) or [])
+        fa_kv_values = list(getattr(
+            self.model_config, "layers_fa_kv_head_num", None) or [])
+        steps = []
+        dtype_bytes = 2
+
+        def vector_step(name, input_bytes, output_bytes, path, shape):
+            return {
+                "name": name,
+                "cost_ms": self.system.compute_layout_time(
+                    "optimizer_orthogonal_vector",
+                    input_bytes=input_bytes,
+                    output_bytes=output_bytes,
+                    stage="optimizer",
+                    path_key=path,
+                    shape_desc=shape,
+                ),
+            }
+
+        def append_unbatched_instance(
+                layer_tag, family, instance_idx, dim, inner_k):
+            """Expand one model-derived 2-D Newton-Schulz matrix."""
+            matrix_bytes = dim * inner_k * dtype_bytes
+            gram_bytes = dim * dim * dtype_bytes
+            scalar_bytes = 4
+            prefix = (
+                f"OptimizerOrthogonalMat_L{layer_tag}_{family}{instance_idx}_"
+                f"d{dim}k{inner_k}")
+            path_prefix = (
+                f"optimizer.orthogonal.layer{layer_tag}.{family}{instance_idx}."
+                f"d{dim}k{inner_k}")
+            preprocess = (
+                ("square", matrix_bytes, matrix_bytes),
+                ("reduce_sum", matrix_bytes, scalar_bytes),
+                ("sqrt", scalar_bytes, scalar_bytes),
+                ("reciprocal", scalar_bytes, scalar_bytes),
+                ("normalize", matrix_bytes + scalar_bytes, matrix_bytes),
+            )
+            for kind, read_bytes, write_bytes in preprocess:
+                steps.append(vector_step(
+                    f"{prefix}_pre_{kind}", read_bytes, write_bytes,
+                    f"{path_prefix}.pre.{kind}",
+                    (f"unbatched_newton_schulz_preprocess={kind}, dim={dim}, "
+                     f"inner_k={inner_k}"),
+                ))
+            for phase in range(phase_num):
+                bmm_specs = (
+                    ("qkt", dim, dim, inner_k,
+                     (2 * matrix_bytes + gram_bytes)),
+                    ("inner", dim, dim, dim, 3 * gram_bytes),
+                    ("pv", dim, inner_k, dim,
+                     (gram_bytes + 2 * matrix_bytes)),
+                )
+                for kind, m, n, k, memory_bytes in bmm_specs:
+                    flops = 2 * m * n * k
+                    shape = (
+                        f"m={m}, k={k}, n={n}, compute_dtype=bf16, "
+                        "out_dtype=bf16")
+                    path = f"{path_prefix}.phase{phase}.{kind}"
+                    steps.append({
+                        "name": f"{prefix}_P{phase}_{kind}",
+                        "cost_ms": self.system.compute_op_accuracy_time(
+                            "optimizer_orthogonal_matmul", flops,
+                            shape_desc=shape, accessed_mem=memory_bytes,
+                            stage="optimizer", path_key=path),
+                    })
+                vector_specs = (
+                    ("scale_gram", gram_bytes, gram_bytes),
+                    ("scale_gram2", gram_bytes, gram_bytes),
+                    ("poly_add", 2 * gram_bytes, gram_bytes),
+                    ("scale_matrix", matrix_bytes, matrix_bytes),
+                    ("update_add", 2 * matrix_bytes, matrix_bytes),
+                )
+                for kind, read_bytes, write_bytes in vector_specs:
+                    steps.append(vector_step(
+                        f"{prefix}_P{phase}_{kind}", read_bytes, write_bytes,
+                        f"{path_prefix}.phase{phase}.{kind}",
+                        (f"unbatched_newton_schulz_iteration={phase}, "
+                         f"op={kind}, dim={dim}, inner_k={inner_k}"),
+                    ))
+            postprocess = (
+                ("restore_scale", matrix_bytes + scalar_bytes, matrix_bytes),
+                ("cast", matrix_bytes, matrix_bytes),
+                ("copy", matrix_bytes, matrix_bytes),
+            )
+            for kind, read_bytes, write_bytes in postprocess:
+                steps.append(vector_step(
+                    f"{prefix}_post_{kind}", read_bytes, write_bytes,
+                    f"{path_prefix}.post.{kind}",
+                    (f"unbatched_newton_schulz_postprocess={kind}, dim={dim}, "
+                     f"inner_k={inner_k}"),
+                ))
+
+        for layer_idx in range(layer_num):
+            if layer_idx < len(b128_values):
+                batch128 = int(b128_values[layer_idx])
+            else:
+                fa_kv = int(fa_kv_values[layer_idx]) if (
+                    layer_idx < len(fa_kv_values)) else 2
+                batch128 = fa_kv + 2
+            instances = [
+                (int(batches_480[0]), dim480),
+                (int(batches_480[1]), dim480),
+                (batch128, dim128),
+            ]
+            for batch, dim in instances:
+                matrix_bytes = batch * dim * hidden * dtype_bytes
+                gram_bytes = batch * dim * dim * dtype_bytes
+                scalar_bytes = batch * 4
+                prefix = f"OptimizerOrthogonalVector_L{layer_idx}_b{batch}d{dim}"
+                path_prefix = (
+                    f"optimizer.orthogonal.layer{layer_idx}.b{batch}d{dim}")
+                preprocess = (
+                    ("square", matrix_bytes, matrix_bytes),
+                    ("reduce_sum", matrix_bytes, scalar_bytes),
+                    ("sqrt", scalar_bytes, scalar_bytes),
+                    ("reciprocal", scalar_bytes, scalar_bytes),
+                    ("normalize", matrix_bytes + scalar_bytes, matrix_bytes),
+                )
+                for kind, read_bytes, write_bytes in preprocess:
+                    steps.append(vector_step(
+                        f"{prefix}_pre_{kind}", read_bytes, write_bytes,
+                        f"{path_prefix}.pre.{kind}",
+                        (f"newton_schulz_preprocess={kind}, batch={batch}, "
+                         f"dim={dim}, hidden={hidden}"),
+                    ))
+
+                for phase in range(phase_num):
+                    bmm_specs = (
+                        ("qkt", dim, dim, hidden,
+                         batch * (2 * dim * hidden + dim * dim) * dtype_bytes),
+                        ("inner", dim, dim, dim,
+                         batch * 3 * dim * dim * dtype_bytes),
+                        ("pv", dim, hidden, dim,
+                         batch * (dim * dim + 2 * dim * hidden) * dtype_bytes),
+                    )
+                    for kind, m, n, k, memory_bytes in bmm_specs:
+                        flops = 2 * batch * m * n * k
+                        shape = (
+                            f"b={batch}, m={m}, k={k}, n={n}, "
+                            "compute_dtype=bf16, out_dtype=bf16")
+                        path = (
+                            f"optimizer.orthogonal.layer{layer_idx}.phase{phase}."
+                            f"b{batch}d{dim}.{kind}")
+                        cost = self.system.compute_op_accuracy_time(
+                            "optimizer_orthogonal_bmm", flops,
+                            shape_desc=shape, accessed_mem=memory_bytes,
+                            stage="optimizer", path_key=path)
+                        steps.append({
+                            "name": (
+                                f"OrthogonalOptimizer_L{layer_idx}_P{phase}_"
+                                f"b{batch}d{dim}_{kind}"),
+                            "cost_ms": cost,
+                        })
+                    vector_specs = (
+                        ("scale_gram", gram_bytes, gram_bytes),
+                        ("scale_gram2", gram_bytes, gram_bytes),
+                        ("poly_add", 2 * gram_bytes, gram_bytes),
+                        ("scale_matrix", matrix_bytes, matrix_bytes),
+                        ("update_add", 2 * matrix_bytes, matrix_bytes),
+                    )
+                    for kind, read_bytes, write_bytes in vector_specs:
+                        steps.append(vector_step(
+                            f"{prefix}_P{phase}_{kind}",
+                            read_bytes, write_bytes,
+                            f"{path_prefix}.phase{phase}.{kind}",
+                            (f"newton_schulz_iteration={phase}, op={kind}, "
+                             f"batch={batch}, dim={dim}, hidden={hidden}"),
+                        ))
+
+                postprocess = (
+                    ("restore_scale", matrix_bytes + scalar_bytes, matrix_bytes),
+                    ("cast", matrix_bytes, matrix_bytes),
+                    ("copy", matrix_bytes, matrix_bytes),
+                )
+                for kind, read_bytes, write_bytes in postprocess:
+                    steps.append(vector_step(
+                        f"{prefix}_post_{kind}", read_bytes, write_bytes,
+                        f"{path_prefix}.post.{kind}",
+                        (f"newton_schulz_postprocess={kind}, batch={batch}, "
+                         f"dim={dim}, hidden={hidden}"),
+                    ))
+
+            # Additional 2-D matrices come directly from the MXX architecture:
+            # router expert axis, top-k grouped MoE transforms, and their
+            # rank/gate factors. Counts and dimensions are formulas of
+            # expert_num, topk and hidden_size, not profiling constants.
+            topk = int(getattr(self.model_config, "topk", 0) or 0)
+            expert_num = int(getattr(
+                self.model_config, "expert_num", 0) or 0)
+            if topk and expert_num:
+                reduced_hidden = hidden // topk
+                families = (
+                    ("router", expert_num, hidden, 1),
+                    ("rank", 5 * topk, reduced_hidden, 2),
+                    ("group", 4 * topk, 5 * topk, 4),
+                    ("rank_gate", topk, reduced_hidden, 2),
+                    ("group_gate", topk, 4 * topk, 4),
+                )
+                for family, dim, inner_k, count in families:
+                    for instance_idx in range(count):
+                        append_unbatched_instance(
+                            layer_idx, family, instance_idx, dim, inner_k)
+
+        # SWA head transforms are global head-wise matrices rather than one
+        # batched tensor per transformer layer.
+        swa_heads = int(getattr(self.model_config, "swa_head_num", 0) or 0)
+        head_dim = int(getattr(
+            self.model_config, "swa_head_dim", 0)
+            or getattr(self.model_config, "head_size", 0) or 0)
+        for head_idx in range(swa_heads):
+            append_unbatched_instance(
+                "global", "swa_head", head_idx, head_dim, hidden)
+        return steps
+
     def _compute_optim_time(self, model_name):
         # we use the chunk weight accessed time as the optim time
         result = {"optim_time": 0, "optim_exposed_time": 0}
@@ -1585,7 +1824,7 @@ class PerfLLM(PerfBase):
             zero_grad_buffer_time = self.system.compute_mem_access_time('default', model_info.all_grad_bytes)
 
             l2_norm_before_reduce_time = self.system.compute_mem_access_time('default', model_info.all_grad_bytes) # read grads
-            mul_before_reduce_time = self.system.compute_mem_access_time('default', 2 * model_info.all_grad_bytes) if self.strategy.dp_size * self.strategy.cp_size > 1 else 0# read grads and write grads
+            mul_before_reduce_time = self.system.compute_mem_access_time('default', 2 * model_info.all_grad_bytes) if self.strategy.fsdp_dense_group_size > 1 else 0# read grads and write grads
 
             grads_chunk_after_reduce_time = state_weight_bytes / 6 if self.strategy.grad_reduce_in_bf16 else state_weight_bytes / 3
             weight_bytes = state_weight_bytes / 3 
@@ -1604,13 +1843,23 @@ class PerfLLM(PerfBase):
             result['grads_clip_after_reduce_time'] = grads_clip_after_reduce_time
             result['adam_time'] = adam_time
             result['copy_main_params_to_model_params_time'] = copy_main_params_to_model_params_time
-            # The non-adam steps (zero_grad / l2_norm / clip / copy) are real
-            # but they show up in the trace as independent kernels (ZerosLike /
-            # ReduceSum / Cast), already modeled in the per-layer elementwise
-            # leaf. Counting them here as well double-counts the weight/grad
-            # memory traffic; the measured fused_sgd kernel (~10ms/step on the
-            # 16p trace) covers the adam update only.
-            optim_time = adam_time
+            # These are optimizer-time passes over gradients and parameter
+            # shards. They are not layer forward/backward leaves, so retain
+            # their structurally derived HBM traffic in the optimizer tail.
+            orthogonal_steps = self._compute_mxx_orthogonal_optimizer_steps()
+            orthogonal_time = sum(step["cost_ms"] for step in orthogonal_steps)
+            result['orthogonal_optimizer_steps'] = orthogonal_steps
+            result['orthogonal_optimizer_time'] = orthogonal_time
+            optimizer_pass_time = (
+                zero_grad_buffer_time
+                + l2_norm_before_reduce_time
+                + mul_before_reduce_time
+                + l2_norm_after_reduce_time
+                + grads_clip_after_reduce_time
+                + copy_main_params_to_model_params_time
+            )
+            result['optimizer_pass_time'] = optimizer_pass_time
+            optim_time = adam_time + optimizer_pass_time + orthogonal_time
             result['optim_time'] = optim_time
             result['optim_exposed_time'] = optim_time
             return result
@@ -1724,8 +1973,8 @@ class PerfLLM(PerfBase):
             else self.strategy.dp_net
         moe_net = self._fsdp_moe_net_resolved if self.strategy.zero_state >= 3 \
             else self.strategy.edp_net
-        dense_dp_result = compute_dp_helper(rs_comm_size, gather_comm_size, dense_net, self.strategy.dp_size*self.strategy.cp_size, dp_group="dp_cp")
-        moe_dp_result = compute_dp_helper(moe_rs_comm_size, moe_gather_comm_size, moe_net, self.strategy.edp_size, dp_group="edp")
+        dense_dp_result = compute_dp_helper(rs_comm_size, gather_comm_size, dense_net, self.strategy.fsdp_dense_group_size, dp_group="dp_cp")
+        moe_dp_result = compute_dp_helper(moe_rs_comm_size, moe_gather_comm_size, moe_net, self.strategy.fsdp_moe_group_size, dp_group="edp")
         all_result = {
             'dp_comm_exposed_time': dense_dp_result['dp_comm_exposed_time'] + moe_dp_result['dp_comm_exposed_time'],
             'dense': dense_dp_result,
@@ -1775,8 +2024,8 @@ class PerfLLM(PerfBase):
         if layer_num <= 0:
             return {"total_exposed_time": 0.0}
 
-        dp_group_size = self.strategy.dp_size * self.strategy.cp_size
-        edp_group_size = self.strategy.edp_size
+        dp_group_size = self.strategy.fsdp_dense_group_size
+        edp_group_size = self.strategy.fsdp_moe_group_size
 
         # Per-block sharded weight/grad bytes. When the chunk is a live
         # ``LLMModel`` (the default, profile cache off) we read each block's
@@ -2094,8 +2343,8 @@ class PerfLLM(PerfBase):
             fsdp_mode = getattr(self.strategy, 'fsdp_mode', 'model-wise')
             reshard = getattr(self.strategy, 'reshard_after_forward', True)
             prefetch = getattr(self.strategy, 'fsdp_prefetch_layers', 1)
-            dp_group_size = self.strategy.dp_size * self.strategy.cp_size
-            edp_group_size = self.strategy.edp_size
+            dp_group_size = self.strategy.fsdp_dense_group_size
+            edp_group_size = self.strategy.fsdp_moe_group_size
             chunk = self.model_chunk_dict[model_name]
             chunk_layer_num = getattr(chunk, 'layer_num', 0)
 
@@ -2516,7 +2765,15 @@ class PerfLLM(PerfBase):
             batch_stat["compute_info"]["recompute_flops"] * micro_batch_num
         )
         result["bwd_flops"] = batch_stat["compute_info"]["bwd_flops"] * micro_batch_num
-        result["model_flops"] = result["fwd_flops"] + result["bwd_flops"]
+        # MFU numerator must stay symmetric with the duration denominator: the
+        # per-iteration wall clock includes the recompute pass when
+        # enable_recompute is on, so the FLOPs counted against it must include
+        # recompute FLOPs as well (they are really executed on the device).
+        # model_flops_useful (fwd+bwd only) is kept as the useful-work view.
+        result["model_flops_useful"] = result["fwd_flops"] + result["bwd_flops"]
+        result["model_flops"] = (
+            result["model_flops_useful"] + result["recompute_flops"]
+        )
         return result
 
     def _analysis_gbs_comm_time(self, batch_stat, model_name):
@@ -3282,8 +3539,8 @@ class PerfLLM(PerfBase):
         # node are assumed stable, while node-to-node runtime may fluctuate.
         # The effective sample count is capped by the number of nodes and the
         # active dense-/expert-DP replica counts.
-        dp = self.strategy.dp_size
-        edp = self.strategy.edp_size
+        dp = self.strategy.fsdp_dense_group_size
+        edp = self.strategy.fsdp_moe_group_size
         if self.strategy.enable_straggler_model:
             effective_worker_count = get_effective_straggler_sample_count(
                 world_size=self.strategy.world_size,
@@ -3302,8 +3559,10 @@ class PerfLLM(PerfBase):
 
         final_duration_time_per_iter = max(duration_times)
         all_tokens_per_iter = self.strategy.seq_len * self.strategy.global_batch_size
-        
-        # CP-adjusted SDP FLOPS (CP splits attention across GPUs)
+
+        # Generic LLM formula FLOPS — kept as a cross-model reference only.
+        # flops_per_token structurally undercounts mxx_model (dual QKV / LAT /
+        # BMMV2 / SWA / VWN), so it must NOT drive the throughput/MFU metrics.
         cp = self.strategy.cp_size if hasattr(self.strategy, 'cp_size') else 1
         fpt_full = self.model_config.flops_per_token(
             context_seq_len=self.strategy.seq_len, with_attn=True)
@@ -3313,9 +3572,32 @@ class PerfLLM(PerfBase):
         else:
             fpt = fpt_full
         theory_flops = fpt * all_tokens_per_iter // self.strategy.world_size
-        TGS = all_tokens_per_iter/(final_duration_time_per_iter/1000)/self.strategy.world_size
-        TFLOPS = theory_flops / (final_duration_time_per_iter/1000)/1e12
-        TFLOPS_PER_TOKEN = fpt / (final_duration_time_per_iter/1000)/1e12
+
+        # Throughput / MFU numerator = the model's ACTUAL per-GPU FLOPs
+        # executed in one iteration (structure-driven cost leaves). The sim is
+        # calibrated against the real trace on these, so this is the honest
+        # achieved FLOPs. It is symmetric with the duration denominator: when
+        # recompute is enabled the wall clock includes the recompute pass, so
+        # recompute FLOPs are part of the executed workload. Keep the inputs on
+        # self so simulate() can re-derive the same metrics from the
+        # DES-aligned wall-clock duration; model_flops_useful (fwd+bwd only)
+        # is reported separately as the useful-work view.
+        achieved_flops = model_flops
+        self._metric_model_flops = model_flops
+        self._metric_model_flops_useful = gbs_compute_cost_in_first_stage[
+            "model_flops_useful"]
+        self._metric_recompute_flops = gbs_compute_cost_in_first_stage[
+            "recompute_flops"]
+        self._metric_fwd_flops = gbs_compute_cost_in_first_stage["fwd_flops"]
+        self._metric_bwd_flops = gbs_compute_cost_in_first_stage["bwd_flops"]
+        self._metric_theory_flops = theory_flops
+        self._metric_tokens_per_iter = all_tokens_per_iter
+
+        duration_s = final_duration_time_per_iter / 1000
+        tokens_per_gpu = all_tokens_per_iter // self.strategy.world_size
+        TGS = all_tokens_per_iter / duration_s / self.strategy.world_size
+        TFLOPS = achieved_flops / duration_s / 1e12
+        TFLOPS_PER_TOKEN = achieved_flops / tokens_per_gpu / duration_s / 1e12
         new_mfu_6nd_with_attn = TFLOPS / self.system.accelerator.op["default"].tflops
         
         mbc = self.strategy.micro_batch_num
@@ -3350,8 +3632,14 @@ class PerfLLM(PerfBase):
         })
         all_result['flops_info'] = {
             'theory_flops': theory_flops,
-            # 'theory_flops_per_token': theory_flops_per_token,
             'model_flops': model_flops,
+            'model_flops_useful': gbs_compute_cost_in_first_stage[
+                "model_flops_useful"],
+            'recompute_flops': gbs_compute_cost_in_first_stage[
+                "recompute_flops"],
+            'fwd_flops': gbs_compute_cost_in_first_stage["fwd_flops"],
+            'bwd_flops': gbs_compute_cost_in_first_stage["bwd_flops"],
+            'achieved_flops': model_flops,
         }
 
         all_result['param_numel_info'] = {
@@ -4075,6 +4363,7 @@ class PerfLLM(PerfBase):
         
         with open(f"{save_path}/net_info.json", "w") as f:
             json.dump(self.system.real_comm_bw, f, indent=4)
+        self._dump_forward_derivation(save_path)
             
         with open(f"{save_path}/model_config.json", "w") as f:
             f.write(str(self.model_config))
@@ -4083,7 +4372,11 @@ class PerfLLM(PerfBase):
         """Analyze the performance of the model. Return a dictionary containing the results."""
         mem_result = self.analysis_mem()
         compute_result = self.analysis_cost()
-        
+        # Keep the result (+ where it is written) so simulate() can overwrite the
+        # headline duration/MFU with the DES-aligned wall clock afterwards.
+        self._analysis_result = compute_result
+        self._analysis_save_path = save_path
+
         if SIMU_CHECK:
             save_path = TMP_PATH
         if save_path is not None:
@@ -4093,32 +4386,39 @@ class PerfLLM(PerfBase):
             base_info["arch"] = str(self.model_chunk_dict)
             base_info["all_param"] = self.model_config.param_numel
             base_info["act_param"] = self.model_config.activated_param_numel
-            with open(f"{save_path}/model_arch", "w") as f:
+            # Windows default encoding is GBK; config source notes may carry
+            # non-GBK markers (e.g. ⚠). Write analysis artifacts as UTF-8 so
+            # str(config) round-trips regardless of config content.
+            with open(f"{save_path}/model_arch", "w", encoding="utf-8") as f:
                 f.write(base_info["arch"])
-            with open(f"{save_path}/base_info.json", "w") as f:
+            with open(f"{save_path}/base_info.json", "w", encoding="utf-8") as f:
                 f.write(json.dumps(base_info, indent=2, sort_keys=False, ensure_ascii=False))
 
-            with open(f"{save_path}/mem_result.json", "w") as f:
+            with open(f"{save_path}/mem_result.json", "w", encoding="utf-8") as f:
                 f.write(str(mem_result))
 
-            with open(f"{save_path}/compute_result.json", "w") as f:
+            with open(f"{save_path}/compute_result.json", "w", encoding="utf-8") as f:
                 f.write(str(compute_result))
-            
-            with open(f"{save_path}/strategy_config.json", "w") as f:
+
+            with open(f"{save_path}/strategy_config.json", "w", encoding="utf-8") as f:
                 f.write(str(self.strategy))
-                
-            with open(f"{save_path}/net_info.json", "w") as f:
+
+            with open(f"{save_path}/net_info.json", "w", encoding="utf-8") as f:
                 json.dump(self.system.real_comm_bw, f, indent=4)
-            
-            with open(f"{save_path}/system_config.json", "w") as f:
+            self._dump_forward_derivation(save_path)
+
+            with open(f"{save_path}/system_config.json", "w", encoding="utf-8") as f:
                 f.write(str(self.system))
 
-            with open(f"{save_path}/model_config.json", "w") as f:
+            with open(f"{save_path}/model_config.json", "w", encoding="utf-8") as f:
                 f.write(str(self.model_config))
             
         # print mfu/tflops/peak_mem
         peak_mem = mem_result.data["peak_mem"] if 'peak_mem' in mem_result.data else (({s:r['peak_mem'] for s, r in mem_result.data.items()}))
         peak_mem_with_reserved = mem_result.data["peak_mem_with_reserved"] if 'peak_mem_with_reserved' in mem_result.data else (({s:r['peak_mem_with_reserved'] for s, r in mem_result.data.items()}))
+        # keep for the DES-aligned summary (simulate() re-prints the full picture)
+        self._peak_mem = peak_mem
+        self._peak_mem_with_reserved = peak_mem_with_reserved
         if console_log:
             tp = self.strategy.tp_size
             ep = self.strategy.ep_size
@@ -4132,7 +4432,7 @@ class PerfLLM(PerfBase):
             print(f"- model_type = {self.model_config.model_type}")
             print(f"· \033[32mmfu = {compute_result.data['mfu_6nd_with_attn']:.2f}\033[0m")
             print(f"· \033[32mTFLOPS = {compute_result.data['throughput per GPU (TFLOP/s/GPU)']:.2f}T (tflops={compute_result.data['flops_info']['theory_flops']}, duration={compute_result.data['duration_time_per_iter']})\033[0m")
-            print(f"· \033[32mTFLOPS_PER_TOKEN = {compute_result.data['throughput per GPU per token (TFLOP/s/GPU/token)']:.2f}T, duration={compute_result.data['duration_time_per_iter']})\033[0m")
+            print(f"· \033[32mTFLOPS_PER_TOKEN = {compute_result.data['throughput per GPU per token (TFLOP/s/GPU/token)']:.4f}T, duration={compute_result.data['duration_time_per_iter']})\033[0m")
             print(f"· \033[31mpeak_alloc_mem = {peak_mem}\033[0m")
             print(f"- peak_alloc_mem_with_reserved = {peak_mem_with_reserved}")
             print(f"- TGS_per_gpu = {compute_result.data['throughput_per_accelerator']}")
@@ -4160,9 +4460,243 @@ class PerfLLM(PerfBase):
             'dtype': f"{'fp8' if self.strategy.fp8 else 'bf16'},grad_reduce in {'bf16' if self.strategy.grad_reduce_in_bf16 else 'fp32'}",
             'net': self.strategy.net,
         }
+
+    def _dump_forward_derivation(self, save_path, overall=None):
+        """Write auditable forward-only intermediate results, when enabled."""
+        if not self.system.forward_derivation_enabled or not save_path:
+            return
+        operator_rows = list(
+            self.system.forward_derivation_records["operators"].values())
+        operator_groups = {}
+        for row in operator_rows:
+            group_key = (
+                row.get("op_name"), row.get("stage"), row.get("engine"))
+            operator_groups.setdefault(group_key, []).append(row)
+        operator_summary_rows = []
+        for (op_name, stage, engine), rows in sorted(
+                operator_groups.items(), key=lambda item: tuple(
+                    "" if value is None else str(value) for value in item[0])):
+            compute_rows = [row for row in rows if row.get("flops", 0) > 0]
+            total_flops = sum(row.get("flops", 0) for row in rows)
+            total_memory = sum(row.get("memory_bytes") or 0 for row in rows)
+            total_ideal_compute = sum(
+                row.get("ideal_compute_time_ms") or 0 for row in rows)
+            total_derived = sum(row.get("derived_time_ms") or 0 for row in rows)
+
+            def flops_weighted(field):
+                if not total_flops:
+                    return None
+                return sum(
+                    row.get(field, 0) * row.get("flops", 0)
+                    for row in compute_rows) / total_flops
+
+            operator_summary_rows.append({
+                "op_name": op_name,
+                "stage": stage,
+                "engine": engine,
+                "structural_leaf_count": len(rows),
+                "total_flops": total_flops,
+                "total_memory_bytes": total_memory,
+                "theoretical_utilization_flops_weighted": flops_weighted(
+                    "theoretical_utilization"),
+                "limit_utilization_flops_weighted": flops_weighted(
+                    "limit_utilization"),
+                "actual_forward_utilization": (
+                    total_ideal_compute / total_derived
+                    if total_derived and total_flops else None),
+                "customer_override_present": any(
+                    row.get("customer_mfu_override") is not None for row in rows),
+                "implementation_facts_complete": all(
+                    row.get("implementation_facts_complete", False)
+                    for row in rows),
+                "missing_implementation_facts": json.dumps(sorted({
+                    fact for row in rows
+                    for fact in row.get("missing_implementation_facts", [])
+                })),
+                "predicted_time_ms": total_derived,
+                "performance_observations_used": False,
+            })
+        payload = {
+            "mode": "forward_derived",
+            "provenance_policy": {
+                "allowed_inputs": [
+                    "model_graph_and_shapes",
+                    "training_and_parallel_strategy",
+                    "hardware_and_library_implementation_facts",
+                ],
+                "performance_observations_used_as_parameters": False,
+                "measured_results_role": "validation_only",
+            },
+            "inputs": {
+                "forward_derivation": self.system.forward_derivation,
+                "hardware_spec": self.system.hardware_spec,
+                "topology": self.system.topology,
+            },
+            **self.system.forward_derivation_records,
+            "operator_summary": operator_summary_rows,
+        }
+        if overall is not None:
+            payload["overall"] = overall
+        os.makedirs(save_path, exist_ok=True)
+        with open(os.path.join(save_path, "forward_derivation.json"), "w",
+                  encoding="utf-8") as file:
+            json.dump(payload, file, indent=2, ensure_ascii=False)
+        communication_rows = list(
+            self.system.forward_derivation_records["communications"].values())
+        network_layer_rows = list(
+            self.system.forward_derivation_records["network_layers"].values())
+        if operator_rows:
+            pd.DataFrame(operator_rows).to_csv(
+                os.path.join(save_path, "operator_utilization_table.csv"),
+                index=False, encoding="utf-8")
+            pd.DataFrame(operator_summary_rows).to_csv(
+                os.path.join(save_path, "operator_utilization_summary.csv"),
+                index=False, encoding="utf-8")
+        if communication_rows:
+            pd.DataFrame(communication_rows).to_csv(
+                os.path.join(save_path, "communication_derivation_table.csv"),
+                index=False, encoding="utf-8")
+        if network_layer_rows:
+            pd.DataFrame(network_layer_rows).to_csv(
+                os.path.join(save_path, "network_layer_parameters.csv"),
+                index=False, encoding="utf-8")
         
     
     def simulate(self, save_path, merge_lanes=True):
-        """This function simulates operator scheduling and communication synchronization to evaluate end-to-end performance and generate execution traces. """
-        run_simulation(self, save_path, merge_lanes=merge_lanes)
- 
+        """Run the DES scheduling simulation and generate execution traces.
+
+        The DES schedules whichever cost path the system config selected. After
+        the run, its wall-clock duration is fed back into the analytical
+        compute_result (if analysis() ran first), so duration / TFLOPS / MFU
+        use the scheduled value instead of the coarse analytical overlap
+        estimate.
+        """
+        des_summary = run_simulation(self, save_path, merge_lanes=merge_lanes)
+        des_ms = des_summary.get("duration_time_per_iter_ms")
+        # The DES wall clock is always reported; the metric patch only needs
+        # analysis_cost() to have run first (sets the _metric_* inputs).
+        if des_ms and getattr(self, "_metric_model_flops", 0) and getattr(
+                self, "_metric_tokens_per_iter", 0):
+            self.des_duration_ms = des_ms
+            self._patch_compute_result_with_des(des_ms, save_path)
+        elif des_ms:
+            print(f"[DES] aligned wall-clock = {des_ms / 1e3:.4f} s "
+                  f"(metrics patch skipped: run analysis() first for MFU/TFLOPS)")
+        return des_summary
+
+    def _metrics_from_duration(self, duration_ms):
+        """Re-derive the throughput/MFU metrics from a given duration (ms).
+
+        Numerator = the model's ACTUAL per-GPU FLOPs executed in one iteration
+        (model_flops, incl. recompute when enabled), the same as the
+        analytical path and symmetric with the wall-clock denominator.
+        Requires analysis_cost() to have run first (it stores the _metric_*
+        inputs).
+        """
+        achieved = getattr(self, "_metric_model_flops", 0)
+        all_tokens = getattr(self, "_metric_tokens_per_iter", 0)
+        if not achieved or not all_tokens:
+            raise RuntimeError(
+                "_metrics_from_duration needs analysis_cost() to have run first"
+            )
+        duration_s = duration_ms / 1000
+        peak = self.system.accelerator.op["default"].tflops
+        tokens_per_gpu = all_tokens // self.strategy.world_size
+        TGS = all_tokens / duration_s / self.strategy.world_size
+        TFLOPS = achieved / duration_s / 1e12
+        TFLOPS_PER_TOKEN = achieved / tokens_per_gpu / duration_s / 1e12
+        mfu = TFLOPS / peak
+        return {
+            "duration_time_per_iter": duration_ms,
+            "throughput_per_accelerator": TGS,
+            "throughput per GPU (TFLOP/s/GPU)": TFLOPS,
+            "throughput per GPU per token (TFLOP/s/GPU/token)": TFLOPS_PER_TOKEN,
+            "mfu_6nd_with_attn": mfu,
+            "mfu": mfu,
+        }
+
+    def _patch_compute_result_with_des(self, des_ms, sim_save_path=None):
+        """Overwrite the analytical headline metrics with the DES-aligned
+        duration and print the aligned summary."""
+        metrics = self._metrics_from_duration(des_ms)
+        human = dict(metrics)
+        convert_final_result_to_human_format(human)
+        res = getattr(self, "_analysis_result", None)
+        if res is not None:
+            d = res.data
+            for k in ("duration_time_per_iter", "throughput_per_accelerator",
+                      "throughput per GPU (TFLOP/s/GPU)",
+                      "throughput per GPU per token (TFLOP/s/GPU/token)",
+                      "mfu_6nd_with_attn", "mfu"):
+                if k in d:
+                    d[k] = human[k]
+            if getattr(self, "_analysis_save_path", None):
+                try:
+                    with open(f"{self._analysis_save_path}/compute_result.json", "w") as f:
+                        f.write(str(res))
+                except Exception as exc:  # pylint: disable=broad-except
+                    print(f"[warn] failed to update compute_result.json: {exc}")
+        # write the aligned summary (standalone, machine-readable) next to the
+        # DES trace and, if different, next to compute_result.json.
+        aligned = {
+            "duration_time_per_iter_ms": des_ms,
+            "duration_time_per_iter_s": des_ms / 1e3,
+            "achieved_flops": self._metric_model_flops,
+            "model_flops_useful": getattr(self, "_metric_model_flops_useful", 0),
+            "recompute_flops": getattr(self, "_metric_recompute_flops", 0),
+            "fwd_flops": getattr(self, "_metric_fwd_flops", 0),
+            "bwd_flops": getattr(self, "_metric_bwd_flops", 0),
+            "theory_flops": self._metric_theory_flops,
+            "throughput_per_accelerator": metrics["throughput_per_accelerator"],
+            "throughput_per_gpu_tflops": metrics["throughput per GPU (TFLOP/s/GPU)"],
+            "throughput_per_gpu_token_tflops": metrics[
+                "throughput per GPU per token (TFLOP/s/GPU/token)"
+            ],
+            "mfu_6nd_with_attn": metrics["mfu_6nd_with_attn"],
+            "mfu": metrics["mfu"],
+        }
+        for base in {sim_save_path, getattr(self, "_analysis_save_path", None)}:
+            if not base:
+                continue
+            try:
+                os.makedirs(base, exist_ok=True)
+                with open(os.path.join(base, "des_summary.json"), "w") as f:
+                    json.dump(aligned, f, indent=2)
+                self._dump_forward_derivation(base, overall=aligned)
+            except Exception as exc:  # pylint: disable=broad-except
+                print(f"[warn] failed to write des_summary.json: {exc}")
+        self._print_aligned_summary(des_ms, metrics)
+
+    def _print_aligned_summary(self, des_ms, metrics):
+        model_name = self.model_config.model_name
+        tp = self.strategy.tp_size
+        ep = self.strategy.ep_size
+        pp = self.strategy.pp_size
+        res = getattr(self, "_analysis_result", None)
+        if res is not None and res.data.get('param_numel_info'):
+            pni = res.data['param_numel_info']
+            act_info = f", act={pni['activations']}" if self.model_config.model_type == 'moe' else ''
+            header = f"{model_name}({pni['all']}{act_info})"
+        else:
+            header = model_name
+        print(f"-------------SIMUMAX DES-ALIGNED SUMMARY  "
+              f"\033[33m{header} TP={tp},EP={ep},PP={pp}\033[0m -------------")
+        print(f"- parallelism = layer{self.model_config.layer_num}."
+              f"dense{self.model_config.dense_layers}.{self.strategy.parallelism}")
+        print(f"- recompute = {self.strategy.recompute_status}")
+        print(f"- \033[31mdtype = {'fp8' if self.strategy.fp8 else 'bf16'}, "
+              f"grad_reduce = {'bf16' if self.strategy.grad_reduce_in_bf16 else 'fp32'}\033[0m")
+        print(f"- system = {self.system.sys_name} | model_type = {self.model_config.model_type}")
+        print(f"- net = {self.strategy.net}")
+        print(f"· \033[32mmfu = {metrics['mfu_6nd_with_attn']:.4f}\033[0m")
+        print(f"· \033[32mTFLOPS = {metrics['throughput per GPU (TFLOP/s/GPU)']:.2f}T "
+              f"(achieved_flops={self._metric_model_flops / 1e12:.2f}T "
+              f"[useful={getattr(self, '_metric_model_flops_useful', 0) / 1e12:.2f}T + "
+              f"recompute={getattr(self, '_metric_recompute_flops', 0) / 1e12:.2f}T], "
+              f"theory_flops={self._metric_theory_flops / 1e12:.2f}T, "
+              f"duration={des_ms / 1e3:.4f}s)\033[0m")
+        print(f"- TGS_per_gpu = {metrics['throughput_per_accelerator']:.2f}")
+        print(f"- \033[31mpeak_alloc_mem = {getattr(self, '_peak_mem', 'n/a')}\033[0m "
+              f"(with_reserved={getattr(self, '_peak_mem_with_reserved', 'n/a')})")
+        print("------------------------------------------")
+

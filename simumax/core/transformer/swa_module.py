@@ -189,8 +189,8 @@ class SWACoreAttention(MetaModule):
     def _comp_leaf_mem_accessed_info(self):
         """Memory access per op_define.md MojoPagedPrefillSWAOp (L548-575).
 
-        Training (KV_LEN=0): Q is bf16, K/V are read from int8 cache,
-        output is bf16, LSE is fp32.  K/V access is limited to the sliding
+        Training (KV_LEN=0): Q/K/V and output are bf16, while LSE is fp32.
+        The quantized paged KV cache from inference is not used in training.
         window — each query only reads ~window_size K/V tokens.
 
         CP: SWA operates on full global seq (input_seq × cp_size/td) with
@@ -203,15 +203,16 @@ class SWACoreAttention(MetaModule):
         if self.strategy.cp_size > 1:
             if self.strategy.cp_comm_type == "a2a":
                 td = getattr(self, '_trunk_cp_div', 1)
+                per_rank_cp = max(1, self.strategy.cp_size // td)
                 # SWA operates on full global seq = input_seq * (cp_size // td)
-                seq_len = seq_len * (self.strategy.cp_size // td)
-                head_num = self.head_num // self.strategy.cp_size
-                kv_head_num = self.kv_head_num // self.strategy.cp_size
+                seq_len = seq_len * per_rank_cp
+                head_num = self.head_num // per_rank_cp
+                kv_head_num = self.kv_head_num // per_rank_cp
 
-        # Per op_define.md: K/V cache is int8 (1 B); Q / output are bf16 (2 B);
-        # LSE is fp32 (4 B).
+        # Training Q/K/V and output are bf16.  Only LSE is fp32; an int8 KV
+        # cache belongs to the inference path.
         q_elem = self.dtype_to_element_size['bf16']   # 2
-        kv_elem = self.dtype_to_element_size['fp8']   # 1  (int8)
+        kv_elem = self.dtype_to_element_size['bf16']  # 2
         o_elem = self.dtype_to_element_size['bf16']   # 2
         lse_elem = self.dtype_to_element_size['fp32'] # 4
 
@@ -411,6 +412,8 @@ class SWACoreAttention(MetaModule):
 
     # ───  CP network info  ───
     def _comp_leaf_intra_net_info(self):
+        if self._skip_cp_a2a:
+            return
         if self.strategy.cp_size > 1:
             batch_size = self.input_info.tensors[0].size(0)
             seq_len = self.input_info.tensors[0].size(1)

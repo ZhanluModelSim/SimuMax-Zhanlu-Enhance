@@ -50,6 +50,19 @@ kNetOp = (
     "moe_small_a2a",
 )
 
+NET_OP_FALLBACK = {
+    "alltoallv": "all2all",
+    "all_gatherv": "all_gather",
+    "reduce_scatterv": "reduce_scatter",
+    "fsdp_all_gather": "all_gather",
+    "fsdp_reduce_scatter": "reduce_scatter",
+    "model_embed_ag": "all_gather",
+    "model_moe_ag": "all_gather",
+    "model_moe_rs": "reduce_scatter",
+    "sync_all_reduce": "all_reduce",
+    "moe_small_a2a": "all2all",
+}
+
 
 def set_capture_graph_only(value: bool):
     global capture_graph_only
@@ -295,6 +308,11 @@ class StrategyConfig(Config):
     cp_a2a_mode: str = "async_cp"
     order_of_paralielism: str = "tp-cp-ep-dp-pp"
     moe_dispatcher_policy: str = "all2all"
+    # Preserve variable-count collectives in the model graph/trace. This is a
+    # framework implementation choice, not a performance calibration: AGV/RSV/
+    # A2AV still use the same topology.levels beta/latency as their fixed-count
+    # collective families.
+    moe_variable_collectives: bool = False
     num_layers_in_first_pipeline_stage: Optional[int] = None
     num_layers_in_last_pipeline_stage: Optional[int] = None
     account_for_embedding_in_pipeline_split: bool = False
@@ -337,6 +355,35 @@ class StrategyConfig(Config):
     # current compute). 2+ = explicit prefetch (multiple AGs fly simultaneously).
     # Only meaningful when zero_state >= 3 and fsdp_mode == "layer-wise".
     fsdp_prefetch_layers: int = 1
+    # Runtime queue depth for layer-wise FSDP gradient reduce-scatter. This is
+    # a framework scheduling choice (not a measured overlap coefficient): the
+    # producer waits for the oldest bucket before posting bucket N+depth.
+    fsdp_max_inflight_reduce_scatters: int = 1
+    # Override the dense FSDP shard group size. When set, the dense
+    # all-gather/reduce-scatter and ZeRO-1/2/3 memory sharding use this
+    # value instead of the default dp_size * cp_size. This models
+    # frameworks whose FSDP group spans a different set of parallelism
+    # dimensions than SimuMax's (dp, cp) plane.
+    fsdp_shard_size: Optional[int] = None
+    # Override the MoE (expert) FSDP shard group size. When set, the MoE
+    # all-gather/reduce-scatter and ZeRO-1/2/3 memory sharding use this
+    # value instead of the default edp_size.
+    oe_shard_size: Optional[int] = None
+    # Some training stacks shard embedding/lm-head and expert parameters in a
+    # model-level unit in addition to transformer-block FSDP. Keep that graph
+    # choice explicit instead of inferring it from a profiler trace.
+    fsdp_sync_non_transformer_parameters: bool = False
+    # Activation offload (training behavior, fully forward-derived cost).
+    # Mirrors the real training flags `--model.activation_offload.*`:
+    #   {"llm": "input", "single_block_mode": true, "block_size_in_gb": 20}
+    # The DES injects one D2H transfer after each layer's forward and one H2D
+    # transfer before that layer's backward/recompute. The transfer volume is
+    # min(per-layer activation cache bytes, block_size_in_gb) — both structural
+    # / configured facts, no measured fitting. The host-side transfer bandwidth
+    # and latency are declared hardware facts in SystemConfig.activation_offload.
+    # None (default) disables the behavior entirely, so configs that do not set
+    # it (e.g. the 16p regression config) are bit-for-bit unaffected.
+    activation_offload: Optional[dict] = None
     # Fraction of the forward cost replayed by gradient checkpointing
     # (recompute). The 16p trace recomputes only part of the layer forward
     # (attention/vwn kernels, ~0.65s) while a full-block replay would re-run
@@ -511,6 +558,32 @@ class StrategyConfig(Config):
     @property
     def edp_size(self):
         return self.world_size // (self.ep_size * self.etp_size * self.pp_size)
+
+    @property
+    def fsdp_dense_group_size(self):
+        """Effective dense FSDP shard group size.
+
+        Defaults to ``dp_size * cp_size`` (the dense optimizer plane).
+        When ``fsdp_shard_size`` is set, it overrides the default so the
+        FSDP all-gather/reduce-scatter and ZeRO memory sharding use the
+        framework's actual shard group.
+        """
+        if self.fsdp_shard_size is not None:
+            return self.fsdp_shard_size
+        return self.dp_size * self.cp_size
+
+    @property
+    def fsdp_moe_group_size(self):
+        """Effective MoE FSDP shard group size.
+
+        Defaults to ``edp_size``. When ``oe_shard_size`` is set, it
+        overrides the default so the MoE FSDP all-gather/reduce-scatter
+        and ZeRO memory sharding use the framework's actual expert shard
+        group.
+        """
+        if self.oe_shard_size is not None:
+            return self.oe_shard_size
+        return self.edp_size
     
     @property
     def parallelism(self):
@@ -802,6 +875,10 @@ class StrategyConfig(Config):
             assert self.fsdp_prefetch_layers >= 1, (
                 f"fsdp_prefetch_layers must be >= 1, got {self.fsdp_prefetch_layers}"
             )
+            assert self.fsdp_max_inflight_reduce_scatters >= 1, (
+                "fsdp_max_inflight_reduce_scatters must be >= 1, got "
+                f"{self.fsdp_max_inflight_reduce_scatters}"
+            )
             if self.fsdp_prefetch_layers > 1 and self.fsdp_mode != "layer-wise":
                 warnings.warn(
                     "fsdp_prefetch_layers > 1 has no effect when fsdp_mode != 'layer-wise'"
@@ -943,8 +1020,8 @@ class StrategyConfig(Config):
 @dataclass
 class BandwidthConfig:
     gbps: int
-    efficient_factor: int
-    latency_us: int
+    efficient_factor: float = 1.0
+    latency_us: float = 0
     fixed_latency: float = 0
     fixed_latency_us_by_comm_num: Dict[str, float] = None
     # Per-card-count effective bandwidth (GiB/s), keyed by str(comm_num).
@@ -958,7 +1035,7 @@ class BandwidthConfig:
 @dataclass
 class CompOpConfig:
     tflops: int
-    efficient_factor: int
+    efficient_factor: float = 1.0
     accurate_efficient_factor:dict = None
 
 
@@ -1066,6 +1143,30 @@ class SystemConfig(Config):
     # section 4). Grammar per key (class_key or path_key): a scalar in (0, 1],
     # or {"default": float, "shapes": {shape_desc: float}} ("shapes" optional).
     operator_efficiency: Optional[Dict[str, Any]] = None
+    # Optional, specification-only analytical model. When enabled, measured
+    # efficiency/bandwidth tables remain loadable for regression, but are not
+    # consulted by compute, HBM, or network timing.
+    forward_derivation: Optional[Dict[str, Any]] = None
+    # Versioned software implementation profiles.  These are deliberately
+    # separate from hardware_spec: CANN tiling/engine facts and HCCL host/task
+    # scheduling are software/runtime behavior, not physical device limits.
+    cann_runtime: Optional[Dict[str, Any]] = None
+    hccl_runtime: Optional[Dict[str, Any]] = None
+    profile_sources: Optional[Dict[str, str]] = None
+    # Activation-offload host transfer hardware facts (fully forward-derived
+    # cost basis; declared, never fitted from measured times):
+    #   {"host_bandwidth_gbps": 64.0, "latency_us": 10.0,
+    #    "dma_channels": 1, "overlap_policy": "async"}
+    # Used only when StrategyConfig.activation_offload is set. "host" here is
+    # the device->host (D2H) / host->device (H2D) link the framework uses to
+    # spill activation blocks (HCCS host port / PCIe-class link); the value is
+    # a hardware declaration like cube_peak_tflops, to be confirmed against the
+    # SKU sheet, not derived from any measured step time.
+    activation_offload: Optional[Dict[str, Any]] = None
+    # Traceable hardware identity/specification. Values may come from an
+    # official product sheet or from aclrtGetDeviceInfo; performance traces are
+    # deliberately not accepted here.
+    hardware_spec: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         # Runtime override-chain slots, populated by PerfLLM.configure()
@@ -1073,10 +1174,87 @@ class SystemConfig(Config):
         # dataclass fields: they never serialize into to_dict().
         self.efficiency_overrides_strategy = None
         self.efficiency_overrides_api = None
+        self.operator_mfu_overrides = {}
+        self.forward_derivation_records = {
+            "operators": {}, "network_layers": {}, "communications": {}}
+
+    @staticmethod
+    def _deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]):
+        """Merge nested profile dictionaries without losing sibling fields."""
+        for key, value in override.items():
+            if (isinstance(value, dict) and isinstance(base.get(key), dict)):
+                SystemConfig._deep_merge_dict(base[key], value)
+            else:
+                base[key] = copy.deepcopy(value)
+        return base
+
+    @classmethod
+    def _read_profile_ref(cls, reference: str, config_file: str):
+        """Read a profile relative to the system config or current cwd."""
+        candidates = []
+        if os.path.isabs(reference):
+            candidates.append(reference)
+        else:
+            candidates.extend([
+                os.path.join(os.path.dirname(os.path.abspath(config_file)), reference),
+                reference,
+            ])
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return cls.read_json_file(candidate), os.path.normpath(candidate)
+        raise FileNotFoundError(
+            f"profile {reference!r} referenced by {config_file!r} was not found; "
+            f"checked {candidates!r}")
+
+    @classmethod
+    def init_from_config_file(cls, config_file: str):
+        """Load a system config plus optional hardware/software profiles.
+
+        The old monolithic JSON form remains supported.  New forward configs
+        may reference ``hardware_profile``, ``cann_profile`` and
+        ``hccl_runtime_profile``; explicit values in the system file override
+        profile defaults.  Profile loading never imports calibrated alpha/beta
+        tables into a forward run.
+        """
+        config_dict = cls.read_json_file(config_file)
+        profile_sources = {}
+
+        hardware_ref = config_dict.pop("hardware_profile", None)
+        if hardware_ref:
+            profile, resolved = cls._read_profile_ref(hardware_ref, config_file)
+            cls._deep_merge_dict(profile, config_dict)
+            config_dict = profile
+            profile_sources["hardware"] = resolved
+
+        cann_ref = config_dict.pop("cann_profile", None)
+        if cann_ref:
+            profile, resolved = cls._read_profile_ref(cann_ref, config_file)
+            config_dict["cann_runtime"] = profile.get(
+                "cann_runtime", profile)
+            profile_sources["cann"] = resolved
+
+        hccl_ref = config_dict.pop("hccl_runtime_profile", None)
+        if hccl_ref:
+            profile, resolved = cls._read_profile_ref(hccl_ref, config_file)
+            config_dict["hccl_runtime"] = profile.get(
+                "hccl_runtime", profile)
+            profile_sources["hccl_runtime"] = resolved
+
+        if profile_sources:
+            existing_sources = config_dict.get("profile_sources", {})
+            config_dict["profile_sources"] = {
+                **existing_sources, **profile_sources}
+        return cls.init_from_dict(config_dict)
 
     @classmethod
     def init_from_dict(cls, config_dict: Dict[str, Any]):
         config_dict = copy.deepcopy(config_dict)
+        # Profile references are resolved by init_from_config_file. Ignore
+        # them here when callers construct a SystemConfig from an already
+        # merged dictionary.
+        config_dict.pop("hardware_profile", None)
+        config_dict.pop("cann_profile", None)
+        config_dict.pop("hccl_runtime_profile", None)
         accelerator = config_dict.pop("accelerator")
         sys_name = config_dict.pop("sys_name")
         num_per_node = config_dict.pop("num_per_node")
@@ -1113,6 +1291,12 @@ class SystemConfig(Config):
         fabric_model = config_dict.pop("fabric_model", None)
         topology = config_dict.pop("topology", None)
         operator_efficiency = config_dict.pop("operator_efficiency", None)
+        forward_derivation = config_dict.pop("forward_derivation", None)
+        cann_runtime = config_dict.pop("cann_runtime", None)
+        hccl_runtime = config_dict.pop("hccl_runtime", None)
+        profile_sources = config_dict.pop("profile_sources", None)
+        hardware_spec = config_dict.pop("hardware_spec", None)
+        activation_offload = config_dict.pop("activation_offload", None)
         fsdp_overlap_coefficient = config_dict.pop("fsdp_overlap_coefficient", 1.0)
         cp_a2a_bandwidth_gbps = config_dict.pop("cp_a2a_bandwidth_gbps", None)
         write_bandwidth_gbps = config_dict.pop("write_bandwidth_gbps", None)
@@ -1128,6 +1312,12 @@ class SystemConfig(Config):
             fabric_model=fabric_model,
             topology=topology,
             operator_efficiency=operator_efficiency,
+            forward_derivation=forward_derivation,
+            cann_runtime=cann_runtime,
+            hccl_runtime=hccl_runtime,
+            profile_sources=profile_sources,
+            hardware_spec=hardware_spec,
+            activation_offload=activation_offload,
             fsdp_overlap_coefficient=fsdp_overlap_coefficient,
             cp_a2a_bandwidth_gbps=cp_a2a_bandwidth_gbps,
             write_bandwidth_gbps=write_bandwidth_gbps,
@@ -1145,6 +1335,641 @@ class SystemConfig(Config):
         if op_name not in self.real_comm_bw:
             self.real_comm_bw[op_name] = {}
         self.real_comm_bw[op_name][comm_stage.lower()] = {"net":net, "base_bw":base_bw, "real_bw":real_bw, "eff_factor":eff_factor, "comm_num":comm_num, "comm_size":comm_size, "total_time":total_time, "latency": latency, "FC8":self.FC8} 
+
+    @property
+    def forward_derivation_enabled(self):
+        return bool((self.forward_derivation or {}).get("enabled", False))
+
+    def _cann_compute_config(self, create=False):
+        """Return the versioned CANN compute profile.
+
+        ``forward_derivation.compute`` is retained only as a compatibility
+        fallback for older monolithic system JSON files. New profiles take
+        precedence and are the only source used by forward runs.
+        """
+        if self.cann_runtime is not None:
+            if create:
+                return self.cann_runtime.setdefault("compute", {})
+            return self.cann_runtime.get("compute", {})
+        if create:
+            return (self.forward_derivation or {}).setdefault("compute", {})
+        return (self.forward_derivation or {}).get("compute", {})
+
+    def _hccl_network_config(self):
+        """Return the versioned HCCL/runtime network profile."""
+        if self.hccl_runtime is not None:
+            return self.hccl_runtime.get("network", self.hccl_runtime)
+        return (self.forward_derivation or {}).get("network", {})
+
+    def forward_profile_audit(self):
+        """Describe profile provenance and legacy calibration isolation."""
+        legacy_fields = []
+        if self.cp_a2a_bandwidth_gbps is not None:
+            legacy_fields.append("cp_a2a_bandwidth_gbps")
+        if self.write_bandwidth_gbps is not None:
+            legacy_fields.append("write_bandwidth_gbps")
+        for net_name, net_cfg in (self.networks or {}).items():
+            bandwidth = net_cfg.bandwidth
+            if bandwidth.gbps_by_comm_num:
+                legacy_fields.append(f"networks.{net_name}.bandwidth.gbps_by_comm_num")
+            if bandwidth.fixed_latency or bandwidth.fixed_latency_us_by_comm_num:
+                legacy_fields.append(f"networks.{net_name}.bandwidth.fixed_latency")
+            for op_name, op_cfg in net_cfg.op.items():
+                if op_cfg.fixed_latency_us is not None or op_cfg.fixed_latency_us_by_comm_num:
+                    legacy_fields.append(
+                        f"networks.{net_name}.op.{op_name}.fixed_latency_us")
+        required_facts = list(
+            ((self.hardware_spec or {}).get("runtime_discovered") or {})
+            .get("required", []))
+        memory_facts = (self.hardware_spec or {}).get("memory", {})
+        compute_facts = (self.hardware_spec or {}).get("compute", {})
+        missing_hardware_facts = [
+            name for name in required_facts
+            if not memory_facts.get(name) and not compute_facts.get(name)
+            and not (self.hardware_spec or {}).get(name)]
+        return {
+            "forward_derivation_enabled": self.forward_derivation_enabled,
+            "profile_sources": self.profile_sources or {},
+            "cann_version": (self.cann_runtime or {}).get("version"),
+            "hccl_runtime_version": (self.hccl_runtime or {}).get("version"),
+            "legacy_calibration_fields_present": sorted(set(legacy_fields)),
+            "legacy_calibration_fields_consumed": False
+            if self.forward_derivation_enabled else None,
+            "hardware_missing_facts": missing_hardware_facts,
+        }
+
+    @staticmethod
+    def _ceil_to(value, quantum):
+        return int(math.ceil(value / quantum) * quantum) if value else 0
+
+    def set_operator_mfu_override(self, op_name, mfu, shape_desc=None):
+        """Set a customer what-if MFU for one operator, never baseline calibration."""
+        if not 0 < mfu <= 1:
+            raise ValueError(f"operator MFU must be in (0, 1], got {mfu}")
+        self.operator_mfu_overrides[(op_name, shape_desc)] = float(mfu)
+
+    def _operator_mfu_override(self, op_name, shape_desc):
+        return self.operator_mfu_overrides.get(
+            (op_name, shape_desc), self.operator_mfu_overrides.get((op_name, None)))
+
+    def apply_hardware_probe(self, profile):
+        """Merge non-performance device facts collected through AscendCL.
+
+        The probe contains device identity, architecture, core counts, memory,
+        and cache capacity only. It must not contain observed kernel duration,
+        bandwidth, MFU, or operator efficiency.
+        """
+        forbidden = {
+            "duration", "latency", "measured_bandwidth", "mfu", "efficiency",
+            "kernel_time", "throughput",
+        }
+        bad = sorted(key for key in profile if key.lower() in forbidden)
+        if bad:
+            raise ValueError(f"hardware probe contains performance fields: {bad}")
+        self.hardware_spec = copy.deepcopy(self.hardware_spec or {})
+        runtime = self.hardware_spec.setdefault("runtime_discovered", {})
+        runtime.update(copy.deepcopy(profile))
+        mapping = {
+            "aic_core_num": "aic_core_num",
+            "aiv_core_num": "aiv_core_num",
+            "l2_cache_bytes": "l2_cache_bytes",
+            "npu_arch": "npu_arch",
+        }
+        spec_compute = self.hardware_spec.setdefault("compute", {})
+        spec_memory = self.hardware_spec.setdefault("memory", {})
+        for source, target in mapping.items():
+            value = profile.get(source)
+            if value is not None and value != 0:
+                if target == "npu_arch":
+                    self.hardware_spec[target] = value
+                elif target == "l2_cache_bytes":
+                    spec_memory[target] = value
+                else:
+                    spec_compute[target] = value
+        if not spec_compute.get("aic_core_num") and profile.get("aicore_core_num"):
+            spec_compute["aic_core_num"] = profile["aicore_core_num"]
+
+    def apply_library_tiling_profile(self, profile):
+        """Merge compiler/tiling facts, rejecting performance observations."""
+        allowed = {"base_m", "base_n", "base_k", "block_dim"}
+        result = {}
+        for op_name, entry in profile.items():
+            if op_name in {"schema", "source"}:
+                continue
+            if not isinstance(entry, dict):
+                raise ValueError(f"tiling entry for {op_name} must be an object")
+            unknown = set(entry) - allowed - {"default", "shapes"}
+            if unknown:
+                raise ValueError(
+                    f"tiling entry for {op_name} has unsupported fields: "
+                    f"{sorted(unknown)}")
+            result[op_name] = copy.deepcopy(entry)
+        compute = self._cann_compute_config(create=True)
+        compute.setdefault("library_tiling", {}).update(result)
+
+    @staticmethod
+    def _operator_engine(op_name, cfg):
+        mapping = cfg.get("operator_engines", {})
+        return mapping.get(op_name, mapping.get("default", "cube"))
+
+    @staticmethod
+    def _tiling_for_operator(op_name, shape_desc, cfg):
+        tiling = cfg.get("library_tiling", {})
+        value = tiling.get(op_name, tiling.get("default", {}))
+        if not isinstance(value, dict):
+            return {}
+        if "shapes" in value or "default" in value:
+            return copy.deepcopy(
+                (value.get("shapes") or {}).get(shape_desc, value.get("default", {})))
+        return value
+
+    def _derive_compute_efficiency(
+        self, op_name, flops, shape_desc, accessed_mem, stage=None, path_key=None,
+    ):
+        """Derive theoretical, limiting, and achievable operator utilization."""
+        cfg = self._cann_compute_config()
+        tile = cfg.get("tensor_tile", {})
+        tm = max(1, int(tile.get("m", 16)))
+        tn = max(1, int(tile.get("n", 16)))
+        tk = max(1, int(tile.get("k", 16)))
+        dims = {}
+        for name in ("b", "batch", "ng", "m", "n", "k"):
+            match = re.search(
+                rf"(?:^|[, ]){name}=([0-9]+)", shape_desc or "", re.IGNORECASE)
+            if match:
+                dims[name.lower()] = int(match.group(1))
+        dtype_sizes = {
+            "fp8": 1, "int8": 1, "bf16": 2, "fp16": 2, "fp32": 4,
+        }
+        compute_dtype_match = re.search(
+            r"(?:^|[, ])(?:compute_dtype|dtype|out_dtype)=([A-Za-z0-9_]+)",
+            shape_desc or "", re.IGNORECASE)
+        compute_dtype_name = (
+            compute_dtype_match.group(1).lower() if compute_dtype_match else "bf16")
+        compute_dtype_bytes = dtype_sizes.get(compute_dtype_name, 2)
+        output_dtype_match = re.search(
+            r"(?:^|[, ])out_dtype=([A-Za-z0-9_]+)",
+            shape_desc or "", re.IGNORECASE)
+        output_dtype_name = (
+            output_dtype_match.group(1).lower()
+            if output_dtype_match else compute_dtype_name)
+        output_dtype_bytes = dtype_sizes.get(
+            output_dtype_name, compute_dtype_bytes)
+        if "accumulate=True" in (shape_desc or ""):
+            output_dtype_bytes = max(output_dtype_bytes, 4)
+        batch = dims.get("b", dims.get("batch", dims.get("ng", 1)))
+        alignment = 1.0
+        shape_bytes = None
+        if all(name in dims for name in ("m", "n", "k")):
+            m, n, k = dims["m"], dims["n"], dims["k"]
+            padded = (self._ceil_to(m, tm) * self._ceil_to(n, tn)
+                      * self._ceil_to(k, tk))
+            alignment = (m * n * k / padded) if padded else 1.0
+            shape_bytes = (
+                batch * ((m * k + k * n) * compute_dtype_bytes
+                         + m * n * output_dtype_bytes))
+        memory_bytes = accessed_mem if accessed_mem and accessed_mem > 0 else shape_bytes
+        transaction_bytes = max(1, int(cfg.get("memory_transaction_bytes", 256)))
+        padded_memory_bytes = self._ceil_to(memory_bytes, transaction_bytes)
+        memory_transaction_utilization = (
+            memory_bytes / padded_memory_bytes if padded_memory_bytes else None)
+        reference_peak_tflops = self.accelerator.op.get(
+            op_name, self.accelerator.op["default"]).tflops
+        engine = self._operator_engine(op_name, cfg)
+        spec_compute = (self.hardware_spec or {}).get("compute", {})
+        if engine == "vector":
+            peak_tflops = spec_compute.get(
+                "vector_peak_tflops", cfg.get("vector_peak_tflops"))
+            peak_source = "hardware_spec.vector_peak_tflops"
+            if peak_tflops is None:
+                peak_tflops = reference_peak_tflops
+                peak_source = "unavailable:fallback_to_reference_peak"
+        else:
+            peak_tflops = reference_peak_tflops
+            peak_source = "accelerator.op"
+        hbm_gbps = self.accelerator.bandwidth["default"].gbps
+        if memory_bytes and peak_tflops > 0:
+            arithmetic_intensity = flops / memory_bytes
+            roofline = min(1.0, arithmetic_intensity * hbm_gbps * 1e9
+                           / (peak_tflops * 1e12))
+        else:
+            arithmetic_intensity = None
+            roofline = 1.0
+        tiling = self._tiling_for_operator(op_name, shape_desc, cfg)
+        core_key = "aiv_core_num" if engine == "vector" else "aic_core_num"
+        core_num = cfg.get(core_key) or spec_compute.get(core_key)
+        active_core_num = (
+            min(core_num, int(tiling["block_dim"]))
+            if core_num and tiling.get("block_dim") else core_num)
+        block_m = int(tiling.get("base_m", 0))
+        block_n = int(tiling.get("base_n", 0))
+        work_tiles = None
+        wave_count = None
+        wave_utilization = 1.0
+        if active_core_num and block_m and block_n and "m" in dims and "n" in dims:
+            work_tiles = (batch * math.ceil(dims["m"] / block_m)
+                          * math.ceil(dims["n"] / block_n))
+            wave_count = math.ceil(work_tiles / active_core_num)
+            wave_utilization = work_tiles / (wave_count * active_core_num)
+        limit_efficiency = max(
+            1e-12, min(1.0, roofline * alignment * wave_utilization))
+        ideal_compute_ms = flops / (peak_tflops * 1e12) * 1e3
+        ideal_memory_ms = (
+            padded_memory_bytes / (hbm_gbps * 1e9) * 1e3
+            if memory_bytes else 0.0)
+        launch_us = float(cfg.get("kernel_launch_latency_us", 0.0))
+        padded_compute_ms = ideal_compute_ms / max(alignment, 1e-12)
+        composite_batch_alignment = 1.0
+        # Flash/SWA attention executes independent head batches on the Cube
+        # pipeline.  M/N/K parsing is not available for these composite
+        # kernels, but the head batch is still scheduled in tensor-tile
+        # quanta.  Account for the final partially occupied head tile exactly
+        # as GEMM accounts for a partially occupied M/N/K tile.  This uses
+        # only the model head count and the declared hardware tensor tile.
+        if (engine == "cube" and op_name in {
+                "sdp_fwd", "sdp_bwd", "swa_fwd", "swa_bwd"}):
+            head_match = re.search(
+                r"(?:^|[, ])head_num=([0-9]+)", shape_desc or "",
+                re.IGNORECASE)
+            if head_match:
+                head_num = max(1, int(head_match.group(1)))
+                # Composite attention libraries distribute independent head
+                # work as AIC-core waves. A partial final wave leaves the
+                # remaining AICs idle even though each head's inner GEMMs use
+                # the 16x16 tensor tile. Therefore the scheduling quantum is
+                # the declared AIC count, not the inner matrix tile width.
+                # A null/absent aic_core_num (unknown hardware) falls back to
+                # the tensor-tile quantum exactly as the absent-key default did.
+                head_wave = max(1, int(
+                    cfg.get("aic_core_num")
+                    or spec_compute.get("aic_core_num") or tm))
+                padded_heads = self._ceil_to(head_num, head_wave)
+                composite_batch_alignment = head_num / padded_heads
+                padded_compute_ms /= composite_batch_alignment
+        onchip_bytes = None
+        onchip_time_ms = 0.0
+        library_extra_time_ms = 0.0
+        library_extra_detail = None
+        inferred_core_frequency_ghz = None
+        transfer_transaction_bytes = None
+        resource_policy = cfg.get("resource_overlap_policy", "serial")
+
+        # A Cube kernel must move every base tile through GM/L1/L0 before the
+        # MMAD result can leave through FixPipe.  HBM-only Roofline misses this
+        # traffic and therefore makes large GEMMs unrealistically approach the
+        # device peak.  Derive an instruction-level movement lower bound from
+        # the library base tile and architectural transfer granularity.  This
+        # is a hardware/library rule, not a fitted operator coefficient.
+        if (engine == "cube" and flops > 0 and active_core_num
+                and block_m and block_n):
+            block_k = max(1, int(tiling.get("base_k", tk)))
+            dtype_bytes = compute_dtype_bytes
+            output_bytes = output_dtype_bytes
+
+            if all(name in dims for name in ("m", "n", "k")):
+                m_tiles = math.ceil(dims["m"] / block_m)
+                n_tiles = math.ceil(dims["n"] / block_n)
+                k_tiles = math.ceil(dims["k"] / block_k)
+                output_tiles = batch * m_tiles * n_tiles
+                cube_units = output_tiles * k_tiles
+                padded_flops = (
+                    2 * output_tiles * k_tiles * block_m * block_n * block_k)
+                # Some structural leaves use one M/N/K descriptor for a
+                # multi-phase kernel (for example latent BMM).  Preserve all
+                # declared FLOPs and scale its tile traffic by the same phase
+                # multiplicity instead of accidentally making padded work
+                # smaller than useful work.
+                phase_multiplier = max(1.0, flops / max(1, padded_flops))
+                cube_units *= phase_multiplier
+                output_tiles *= phase_multiplier
+                padded_flops *= phase_multiplier
+                padded_compute_ms = padded_flops / (peak_tflops * 1e12) * 1e3
+            else:
+                # Composite Cube kernels (FA/SWA/LAT/VWN) do not expose one
+                # GEMM M/N/K triple.  Their structural FLOPs still determine
+                # the number of base-tile MMAD units without inventing a
+                # shape-specific efficiency.
+                unit_flops = 2 * block_m * block_n * block_k
+                cube_units = max(1, math.ceil(flops / unit_flops))
+                k_tiles = max(1, math.ceil(dims.get("k", tk) / block_k))
+                output_tiles = max(1, math.ceil(cube_units / k_tiles))
+                padded_flops = cube_units * unit_flops
+                padded_compute_ms = (
+                    padded_flops / (peak_tflops * 1e12) * 1e3
+                    / composite_batch_alignment)
+
+            input_tile_bytes = (block_m * block_k + block_n * block_k) * dtype_bytes
+            output_tile_bytes = block_m * block_n * output_bytes
+            read_hops = max(1, int(cfg.get("cube_operand_transfer_hops", 2)))
+            onchip_bytes = (cube_units * input_tile_bytes * read_hops
+                            + output_tiles * output_tile_bytes)
+            if composite_batch_alignment < 1.0:
+                onchip_bytes /= composite_batch_alignment
+            transfer_transaction_bytes = max(
+                1, int(cfg.get("onchip_transfer_bytes_per_cycle", 512)))
+
+            # P = cores * frequency * 2*Tm*Tn*Tk for one BF16 MMAD/cycle.
+            # This makes frequency a consequence of declared peak/core/tile
+            # hardware facts rather than another performance-fit input.
+            ops_per_core_cycle = 2 * tm * tn * tk
+            core_num_for_peak = max(
+                1, int(cfg.get("aic_core_num")
+                       or spec_compute.get("aic_core_num")
+                       or active_core_num))
+            inferred_core_frequency_hz = (
+                peak_tflops * 1e12 / (core_num_for_peak * ops_per_core_cycle))
+            inferred_core_frequency_ghz = inferred_core_frequency_hz / 1e9
+            transfer_cycles = math.ceil(onchip_bytes / transfer_transaction_bytes)
+            onchip_time_ms = (
+                transfer_cycles / (active_core_num * inferred_core_frequency_hz) * 1e3)
+
+            work_tiles = output_tiles
+            wave_count = math.ceil(work_tiles / active_core_num)
+            wave_utilization = work_tiles / (wave_count * active_core_num)
+            instruction_utilization = min(1.0, ideal_compute_ms / padded_compute_ms)
+            limit_efficiency = max(
+                1e-12,
+                min(1.0, roofline * instruction_utilization * wave_utilization),
+            )
+        else:
+            instruction_utilization = alignment
+
+        # A grouped row GEMM reduces K-split partial outputs before emitting
+        # the single hidden-state tensor. Column Gate/Up GEMMs do not have
+        # this output reduction. Model the reduction tree from K tiles,
+        # logical output bytes and group count; no measured efficiency is
+        # involved.
+        if (op_name == "group_linear_row" and engine == "cube"
+                and all(name in dims for name in ("m", "n", "k"))
+                and active_core_num and inferred_core_frequency_ghz
+                and transfer_transaction_bytes):
+            block_k = max(1, int(tiling.get("base_k", tk)))
+            split_k = max(1, math.ceil(dims["k"] / block_k))
+            reduction_steps = math.ceil(math.log2(split_k))
+            group_count = max(1, int(dims.get("ng", 1)))
+            partial_bytes = (
+                group_count * dims["m"] * dims["n"]
+                * max(4, output_dtype_bytes))
+            onchip_bandwidth_bytes_s = (
+                active_core_num * inferred_core_frequency_ghz * 1e9
+                * transfer_transaction_bytes)
+            reduction_transfer_ms = (
+                2 * partial_bytes * reduction_steps
+                / onchip_bandwidth_bytes_s * 1e3)
+            reduction_barrier_ms = (
+                group_count * reduction_steps * launch_us / 1e3)
+            library_extra_time_ms = (
+                reduction_transfer_ms + reduction_barrier_ms)
+            library_extra_detail = {
+                "kind": "grouped_row_split_k_reduction",
+                "group_count": group_count,
+                "split_k": split_k,
+                "reduction_steps": reduction_steps,
+                "partial_output_bytes": partial_bytes,
+                "reduction_transfer_ms": reduction_transfer_ms,
+                "reduction_barrier_ms": reduction_barrier_ms,
+            }
+
+        if resource_policy == "overlap":
+            resource_time_ms = max(
+                padded_compute_ms, ideal_memory_ms, onchip_time_ms)
+        elif resource_policy == "serial":
+            resource_time_ms = padded_compute_ms + ideal_memory_ms + onchip_time_ms
+        else:
+            raise ValueError(
+                "forward_derivation.compute.resource_overlap_policy must be "
+                f"'serial' or 'overlap', got {resource_policy!r}")
+        hbm_latency_us = (
+            float(self.accelerator.bandwidth["default"].latency_us)
+            if memory_bytes else 0.0)
+        derived_time_ms = (
+            resource_time_ms + library_extra_time_ms
+            + (launch_us + hbm_latency_us) / 1e3)
+        optimistic_time_ms = (max(
+            padded_compute_ms, ideal_memory_ms, onchip_time_ms)
+            + (launch_us + hbm_latency_us) / 1e3)
+        conservative_time_ms = (
+            padded_compute_ms + ideal_memory_ms + onchip_time_ms
+            + (launch_us + hbm_latency_us) / 1e3)
+        optimistic_utilization = (
+            ideal_compute_ms / optimistic_time_ms if optimistic_time_ms else None)
+        conservative_utilization = (
+            ideal_compute_ms / conservative_time_ms if conservative_time_ms else None)
+        achievable = (ideal_compute_ms / derived_time_ms
+                      if derived_time_ms > 0 else limit_efficiency)
+        achievable = max(1e-12, min(limit_efficiency, achievable))
+        # compute_op_accuracy_time uses the configured Cube reference peak.
+        # Translate an engine-relative utilization back to that reference.
+        relative_peak = peak_tflops / reference_peak_tflops
+        derived_reference_efficiency = achievable * relative_peak
+        override = self._operator_mfu_override(op_name, shape_desc)
+        used_efficiency = (
+            override if override is not None else derived_reference_efficiency)
+        stage_key = stage or "unspecified"
+        path = path_key or "path_unspecified"
+        key = f"{path}|{op_name}|{stage_key}|{shape_desc or 'shape_unspecified'}"
+        library_tiling_table = cfg.get("library_tiling", {})
+        tiling_is_operator_specific = op_name in library_tiling_table
+        generic_matmul_ops = {
+            "matmul", "group_linear_col", "group_linear_row",
+            "optimizer_orthogonal_bmm", "optimizer_orthogonal_matmul",
+            "latent_bmm",
+        }
+        missing_facts = []
+        if engine == "vector" and spec_compute.get("vector_peak_tflops") is None:
+            missing_facts.append("vector_peak_tflops")
+        if (engine == "cube" and not tiling_is_operator_specific
+                and op_name not in generic_matmul_ops):
+            missing_facts.append("operator_specific_library_tiling")
+        if engine == "cube" and not all(name in dims for name in ("m", "n", "k")):
+            missing_facts.append("composite_cube_vector_mte_stage_decomposition")
+        self.forward_derivation_records["operators"][key] = {
+            "path": path_key,
+            "stage": stage,
+            "op_name": op_name,
+            "shape": shape_desc,
+            "flops": flops,
+            "compute_utilization_applicable": flops > 0,
+            "memory_bytes": memory_bytes,
+            "compute_dtype": compute_dtype_name,
+            "compute_dtype_bytes": compute_dtype_bytes,
+            "output_dtype": output_dtype_name,
+            "output_dtype_bytes": output_dtype_bytes,
+            "engine": engine,
+            "peak_tflops": peak_tflops,
+            "peak_source": peak_source,
+            "reference_peak_tflops": reference_peak_tflops,
+            "hbm_bandwidth_gbps": hbm_gbps,
+            "memory_transaction_bytes": transaction_bytes,
+            "memory_transaction_utilization": memory_transaction_utilization,
+            "tensor_tile": {"m": tm, "n": tn, "k": tk},
+            "arithmetic_intensity_flop_per_byte": arithmetic_intensity,
+            "theoretical_utilization": roofline,
+            "shape_alignment": alignment,
+            "composite_batch_alignment": composite_batch_alignment,
+            "aic_core_num": spec_compute.get("aic_core_num"),
+            "aiv_core_num": spec_compute.get("aiv_core_num"),
+            "active_core_num": active_core_num,
+            "library_tiling": tiling or None,
+            "library_tiling_source": (
+                tiling.get("source") if isinstance(tiling, dict) else None),
+            "tiling_is_operator_specific": tiling_is_operator_specific,
+            "work_tiles": work_tiles,
+            "wave_count": wave_count,
+            "wave_utilization": wave_utilization,
+            "instruction_utilization": instruction_utilization,
+            "limit_utilization": limit_efficiency,
+            "ideal_compute_time_ms": ideal_compute_ms,
+            "padded_compute_time_ms": padded_compute_ms,
+            "ideal_memory_time_ms": ideal_memory_ms,
+            "onchip_transfer_bytes": onchip_bytes,
+            "onchip_transfer_time_ms": onchip_time_ms,
+            "onchip_transfer_bytes_per_cycle": transfer_transaction_bytes,
+            "inferred_core_frequency_ghz": inferred_core_frequency_ghz,
+            "resource_overlap_policy": resource_policy,
+            "library_extra_time_ms": library_extra_time_ms,
+            "library_extra_detail": library_extra_detail,
+            "derived_time_ms": derived_time_ms,
+            "optimistic_overlap_utilization": optimistic_utilization,
+            "conservative_serial_utilization": conservative_utilization,
+            "implementation_facts_complete": not missing_facts,
+            "missing_implementation_facts": missing_facts,
+            "kernel_launch_latency_us": launch_us,
+            "hbm_base_latency_us": hbm_latency_us,
+            "derived_achievable_utilization": achievable,
+            "derived_reference_peak_utilization": derived_reference_efficiency,
+            "customer_mfu_override": self._operator_mfu_override(op_name, shape_desc),
+            "used_utilization": used_efficiency,
+            "performance_observations_used": False,
+            "formula": (
+                "theory=roofline; limit=theory*instruction_tile*wave; "
+                "T_resource=serial_or_overlap(padded_cube,HBM,GM-L1-L0-FixPipe)"
+                "+library_structural_stage; "
+                "achievable=ideal_compute/(T_resource+launch)"
+            ),
+        }
+        return used_efficiency
+
+    @staticmethod
+    def _collective_algorithm(op_name, comm_num):
+        if op_name == "p2p":
+            return "point_to_point", 1
+        if op_name == "all_reduce":
+            return "ring", 2 * max(0, comm_num - 1)
+        if op_name in ("all2all", "alltoallv"):
+            return "pairwise_exchange", max(0, comm_num - 1)
+        return "ring", max(0, comm_num - 1)
+
+    def _collective_runtime_overhead(
+            self, op_name, comm_num, message_bytes, active_level_count=1):
+        """Derive call/runtime overhead separately from link propagation.
+
+        A topology level's ``latency_us`` is a physical per-hop property. It
+        must not absorb host dispatch, task construction, or collective
+        schedule costs. Those costs belong to one collective call and are
+        derived here from the runtime implementation specification.
+        """
+        network_cfg = self._hccl_network_config()
+        runtime_cfg = network_cfg.get("call_runtime", {})
+        compute_cfg = self._cann_compute_config()
+        default_launch_us = float(
+            compute_cfg.get("kernel_launch_latency_us", 0.0))
+        call_launch_us = float(runtime_cfg.get(
+            "call_launch_latency_us", default_launch_us))
+        task_launch_us = float(runtime_cfg.get(
+            "task_launch_latency_us", call_launch_us))
+        tasks_per_stage = max(0, int(runtime_cfg.get("tasks_per_stage", 1)))
+        chunk_bytes = max(0, int(runtime_cfg.get("descriptor_chunk_bytes", 0)))
+        tasks_per_chunk = max(0, int(runtime_cfg.get(
+            "tasks_per_additional_chunk", 0)))
+
+        algorithm, stages = self._collective_algorithm(op_name, comm_num)
+        level_count = max(1, int(active_level_count))
+        stage_tasks = stages * level_count * tasks_per_stage
+        chunks = (math.ceil(message_bytes / chunk_bytes)
+                  if chunk_bytes and message_bytes else 1)
+        descriptor_tasks = max(0, chunks - 1) * tasks_per_chunk
+        task_count = stage_tasks + descriptor_tasks
+        runtime_us = call_launch_us + task_count * task_launch_us
+        return {
+            "execution_engine": runtime_cfg.get(
+                "execution_engine", "host_cpu_ts"),
+            "algorithm": algorithm,
+            "algorithm_stages": stages,
+            "active_network_levels": level_count,
+            "payload_chunks": chunks,
+            "stage_runtime_tasks": stage_tasks,
+            "descriptor_runtime_tasks": descriptor_tasks,
+            "runtime_task_count": task_count,
+            "call_launch_latency_us": call_launch_us,
+            "task_launch_latency_us": task_launch_us,
+            "call_runtime_overhead_us": runtime_us,
+            "formula": (
+                "T_runtime=L_call+(algorithm_stages*active_levels*"
+                "tasks_per_stage+descriptor_tasks)*L_task"),
+        }
+
+    def _derive_network_time(self, op_name, actual_size, comm_num, net,
+                             comm_stage, strategy, group_kind, topology_bw,
+                             topology_latency):
+        """Return alpha+payload/beta using only topology/hardware inputs."""
+        del strategy  # topology/group decomposition has already been applied
+        cfg = self._hccl_network_config()
+        flit_bytes = max(1, int(cfg.get("flit_bytes", 256)))
+        if topology_bw is None:
+            topology_bw = self.networks[net].bandwidth.gbps
+        if topology_latency is None:
+            topology_latency = self.networks[net].bandwidth.latency_us
+        padded_bytes = self._ceil_to(actual_size, flit_bytes)
+        packet_eff = actual_size / padded_bytes if padded_bytes else 1.0
+        beta = topology_bw * packet_eff
+        algorithm, stages = self._collective_algorithm(op_name, comm_num)
+        physical_latency_us = topology_latency
+        runtime = self._collective_runtime_overhead(
+            op_name, comm_num, actual_size, active_level_count=1)
+        collective_latency_us = (
+            physical_latency_us + runtime["call_runtime_overhead_us"])
+        # Network configuration uses decimal GB/s (the hardware/link-rate
+        # convention), unlike memory capacity fields that commonly use GiB.
+        time_ms = (actual_size / (beta * 1e9) * 1e3
+                   + collective_latency_us / 1e3)
+        layer_key = f"{net}|bytes={int(actual_size)}"
+        self.forward_derivation_records["network_layers"][layer_key] = {
+            "network_level": net,
+            "message_bytes": actual_size,
+            "physical_bandwidth_gib_per_s": topology_bw,
+            "packet_efficiency": packet_eff,
+            "bandwidth_utilization": packet_eff,
+            "effective_beta_gib_per_s": beta,
+            "base_latency_us": topology_latency,
+            "algorithm_independent": True,
+            "formula": "beta=B_physical*payload/ceil(payload/flit)",
+        }
+        key = f"{op_name}|{comm_stage.lower()}|n={comm_num}|bytes={int(actual_size)}"
+        self.forward_derivation_records["communications"][key] = {
+            "op_name": op_name,
+            "stage": comm_stage.lower(),
+            "group_kind": group_kind,
+            "comm_num": comm_num,
+            "message_bytes": actual_size,
+            "topology_bandwidth_gbps": topology_bw,
+            "flit_bytes": flit_bytes,
+            "packet_efficiency": packet_eff,
+            "derived_beta_gib_per_s": beta,
+            "algorithm": algorithm,
+            "algorithm_stages": stages,
+            "network_layer_latency_us": topology_latency,
+            "physical_propagation_latency_us": physical_latency_us,
+            "call_runtime_overhead_us": runtime["call_runtime_overhead_us"],
+            "call_runtime": runtime,
+            "collective_latency_us": collective_latency_us,
+            "derived_time_ms": time_ms,
+            "formula": "T=D/beta_layer+T_physical_propagation+T_call_runtime",
+        }
+        self.record_net_bw(op_name, net, comm_num, comm_stage, topology_bw,
+                           beta, packet_eff, time_ms * 1e3, actual_size,
+                           collective_latency_us)
+        return time_ms
 
     def record_hit_efficiency(
         self, op_name: str, flops: int, shape_desc: str, eff, path_key=None, level=None
@@ -1269,6 +2094,8 @@ class SystemConfig(Config):
         self.miss_efficiency.clear()
         self.hit_efficiency.clear()
         self.real_comm_bw.clear()
+        self.forward_derivation_records = {
+            "operators": {}, "network_layers": {}, "communications": {}}
 
     @staticmethod
     def _lookup_accurate_eff(accurate_factor, shape_desc):
@@ -1277,22 +2104,58 @@ class SystemConfig(Config):
         (k / n / layout / op-kind). Efficiency is per-FLOP for a fixed shape
         structure + hardware, so reusing the 16p value across 8p/32p is the
         validation hypothesis — whether it holds is answered by cross-config
-        comparison. None when no entry matches after stripping."""
+        comparison. None when no entry matches after stripping.
+
+        Deterministic collision handling (review P0b): several entries can share
+        a stripped core (differ only in m=), e.g. the NT accumulate=True fp32
+        group (m=1536 vs 4608/5120/6144 → eff 0.398 vs 0.589, 1.48x). The old
+        code returned the first dict-iteration match — order-dependent and up to
+        ~2x wrong for a query m not in the table. Now we return the entry whose
+        m is closest to the query (best physical match for saturated GEMMs), and
+        warn so the caller knows an exact entry is missing."""
         if not accurate_factor:
             return None
 
         def _strip(k):
             return re.sub(r'\bb=\d+', '', re.sub(r'\bm=\d+', '', k))
 
+        def _extract_m(k):
+            mt = re.search(r'\bm=(\d+)', k)
+            return int(mt.group(1)) if mt else None
+
         core = _strip(shape_desc)
-        for k, v in accurate_factor.items():
-            if _strip(k) == core:
-                return v
-        return None
+        q_m = _extract_m(shape_desc)
+        matches = [(k, v, _extract_m(k))
+                   for k, v in accurate_factor.items() if _strip(k) == core]
+        if not matches:
+            return None
+        if q_m is not None:
+            # Exact m present in the table -> exact hit (overrides any stripped-
+            # core collision). 16p trained shapes always carry their exact m
+            # entry, so the current config's collection stays an exact hit here.
+            exact = [m for m in matches if m[2] == q_m]
+            if exact:
+                return exact[0][1]
+        if len(matches) == 1:
+            return matches[0][1]
+        # Collision: pick the entry with m closest to the query (deterministic)
+        # and warn so the missing exact entry / ambiguous core is surfaced.
+        vals = sorted(v for _, v, _m in matches)
+        warnings.warn(
+            f"_lookup_accurate_eff: {len(matches)} entries share stripped core "
+            f"'{core}' after removing m=/b= (eff {vals[0]:.4f}~{vals[-1]:.4f}, "
+            f"{vals[-1] / vals[0]:.2f}x spread). Query '{shape_desc}' has no "
+            f"exact match; using the m-closest entry. Add an exact entry or "
+            f"split the core for a reliable value.",
+            stacklevel=2)
+        if q_m is not None:
+            best = min(matches, key=lambda t: abs((t[2] or 0) - q_m))
+            return best[1]
+        return matches[0][1]
 
     def compute_op_accuracy_time(
         self, op_name: str, flops: int, shape_desc: str, reture_detail=False,
-        class_key=None, path_key=None,
+        class_key=None, path_key=None, accessed_mem=None, stage=None,
     ):
         """
         compute float point operation time,
@@ -1306,6 +2169,19 @@ class SystemConfig(Config):
         miss/hit records) is identical to the legacy lookup (levels 5-7).
         """
         if flops == 0:
+            if self.forward_derivation_enabled:
+                op = self.accelerator.op.get(
+                    op_name, self.accelerator.op["default"])
+                self._derive_compute_efficiency(
+                    op_name, flops, shape_desc, accessed_mem, stage, path_key)
+                detail = dict(
+                    op_name=op_name,
+                    tflops=op.tflops,
+                    efficient_factor=None,
+                    compute_only_time=0.0,
+                    efficiency_source="forward_derived",
+                )
+                return detail if reture_detail else 0
             if reture_detail:
                 return dict(op_name=op_name,
                                 tflops=None,
@@ -1316,12 +2192,25 @@ class SystemConfig(Config):
 
         op = self.accelerator.op.get(op_name, None)
         if op is None:
-            warnings.warn(
-                f"{op_name} not exist on {self.accelerator.op.keys()}, use default value"
-            )
+            if not self.forward_derivation_enabled:
+                warnings.warn(
+                    f"{op_name} not exist on {self.accelerator.op.keys()}, "
+                    "use default value"
+                )
             op = self.accelerator.op.get("default", None)
             assert op is not None, f"default not exist on {self.accelerator.op}"
-            self.record_miss_efficiency(op_name, flops, shape_desc, None)
+            if not self.forward_derivation_enabled:
+                self.record_miss_efficiency(op_name, flops, shape_desc, None)
+
+        if self.forward_derivation_enabled:
+            efficient_factor = self._derive_compute_efficiency(
+                op_name, flops, shape_desc, accessed_mem, stage, path_key)
+            time = flops / (op.tflops * 1e12 * efficient_factor) * 1e3
+            detail = dict(op_name=op_name, tflops=op.tflops,
+                          efficient_factor=efficient_factor,
+                          compute_only_time=time,
+                          efficiency_source="forward_derived")
+            return detail if reture_detail else time
 
         if class_key is not None or path_key is not None:
             override_eff, override_level = self._lookup_efficiency_override(
@@ -1395,6 +2284,27 @@ class SystemConfig(Config):
         return time in ms
         """
         
+        if self.forward_derivation_enabled:
+            # Forward derivation uses only the physical HBM bandwidth (a
+            # hardware property, identical for all operators).  Per-operator
+            # "effective" bandwidth entries that absorb fusion effects are a
+            # calibration anti-pattern and are not consulted here.
+            op = self.accelerator.bandwidth["default"]
+            cfg = self._cann_compute_config()
+            transaction = max(1, int(cfg.get("memory_transaction_bytes", 256)))
+            padded = self._ceil_to(mem_bytes, transaction)
+            efficiency = mem_bytes / padded if padded else 1.0
+            # Hardware bandwidth is declared in decimal GB/s throughout the
+            # forward model (the same convention as topology levels).
+            time = mem_bytes / (op.gbps * 1e9 * efficiency) * 1e3
+            if mem_bytes:
+                time += op.latency_us / 1e3
+            if reture_detail:
+                return dict(gbps=op.gbps, efficient_factor=efficiency,
+                            latency_us=op.latency_us, io_time=time,
+                            efficiency_source="forward_derived")
+            return time
+
         op = self.accelerator.bandwidth.get(op_name, None)
         if op is None:
             op = self.accelerator.bandwidth.get("default", None)
@@ -1420,6 +2330,120 @@ class SystemConfig(Config):
                             latency_us=op.latency_us,
                             io_time = time)
         return time
+
+    def compute_layout_time(self, op_name, input_bytes, output_bytes=None,
+                            stage=None, path_key=None, shape_desc=None,
+                            reture_detail=False):
+        """Derive one materialized layout-kernel duration from byte traffic.
+
+        ``input_bytes`` and ``output_bytes`` are structural tensor sizes. The
+        duration uses only the configured HBM bandwidth/transaction size and
+        kernel-launch parameter. This helper deliberately has no measured-time
+        or efficiency argument.
+        """
+        output_bytes = input_bytes if output_bytes is None else output_bytes
+        accessed_mem = max(0, input_bytes) + max(0, output_bytes)
+        shape_desc = shape_desc or (
+            f"input_bytes={int(input_bytes)}, output_bytes={int(output_bytes)}")
+        compute_detail = self.compute_op_accuracy_time(
+            op_name, 0, shape_desc=shape_desc, reture_detail=True,
+            accessed_mem=accessed_mem, stage=stage, path_key=path_key)
+        io_detail = self.compute_mem_access_time(
+            op_name, accessed_mem, reture_detail=True)
+        cfg = self._cann_compute_config()
+        launch_us = float(cfg.get("kernel_launch_latency_us", 0.0))
+        resource_profile = (cfg.get("layout_resource_models", {}) or {}).get(
+            op_name, {})
+        # Pure streaming kernels can overlap the first GM response with
+        # later MTE2/MTE3 transfers through DoubleBuffer.  The bandwidth term
+        # remains payable; only the non-overlapped first-response term is
+        # removed.  This is an implementation property declared by the
+        # library profile, not an operator efficiency fitted from duration.
+        hidden_hbm_latency_us = (
+            float(io_detail["latency_us"])
+            if resource_profile.get("hide_hbm_base_latency", False) else 0.0)
+        time_ms = (
+            io_detail["io_time"]
+            - hidden_hbm_latency_us / 1e3
+            + launch_us / 1e3)
+        layout_detail = None
+        if resource_profile:
+            memory_spec = (self.hardware_spec or {}).get("memory", {})
+            ub_bytes = max(1, int(memory_spec.get(
+                "ub_per_aiv_bytes", resource_profile.get("tile_bytes", 1))))
+            ub_buffers = max(1, int(resource_profile.get("ub_buffer_count", 1)))
+            transaction = max(1, int(cfg.get("memory_transaction_bytes", 256)))
+            tile_bytes = max(
+                transaction,
+                (ub_bytes // ub_buffers // transaction) * transaction)
+            hardware_compute = (self.hardware_spec or {}).get("compute", {})
+            aiv_num = max(1, int(
+                cfg.get("aiv_core_num")
+                or hardware_compute.get("aiv_core_num", 1)))
+            block_dim = min(
+                aiv_num, max(1, int(resource_profile.get("block_dim", aiv_num))))
+            work_bytes = max(0, input_bytes, output_bytes)
+            work_blocks = math.ceil(work_bytes / tile_bytes) if work_bytes else 0
+            waves = math.ceil(work_blocks / block_dim) if work_blocks else 0
+            memory_stages = max(0, int(resource_profile.get(
+                "dependent_memory_stages", 0)))
+            vector_stages = max(0, int(resource_profile.get(
+                "vector_pipeline_stages", 0)))
+            wave_startup_us = (
+                memory_stages * float(io_detail["latency_us"])
+                + vector_stages * launch_us)
+            extra_wave_time_ms = max(0, waves - 1) * wave_startup_us / 1e3
+            time_ms += extra_wave_time_ms
+            layout_detail = {
+                "ub_per_aiv_bytes": ub_bytes,
+                "ub_buffer_count": ub_buffers,
+                "tile_bytes": tile_bytes,
+                "block_dim": block_dim,
+                "work_blocks": work_blocks,
+                "wave_count": waves,
+                "dependent_memory_stages": memory_stages,
+                "vector_pipeline_stages": vector_stages,
+                "hide_hbm_base_latency": bool(
+                    resource_profile.get("hide_hbm_base_latency", False)),
+                "hidden_hbm_base_latency_us": hidden_hbm_latency_us,
+                "wave_startup_latency_us": wave_startup_us,
+                "extra_wave_time_ms": extra_wave_time_ms,
+            }
+
+        if self.forward_derivation_enabled:
+            key = (f"{path_key or 'path_unspecified'}|{op_name}|"
+                   f"{stage or 'unspecified'}|{shape_desc or 'shape_unspecified'}")
+            record = self.forward_derivation_records["operators"].get(key)
+            if record is not None:
+                record.update({
+                    "kernel_path_kind": "materialized_layout",
+                    "structure_source": "model_graph_or_library_implementation_path",
+                    "performance_observations_used": False,
+                    "input_bytes": input_bytes,
+                    "output_bytes": output_bytes,
+                    "layout_resource_profile": resource_profile or None,
+                    "layout_resource_detail": layout_detail,
+                    "derived_time_ms": time_ms,
+                    "formula": (
+                        "T_layout=T_launch+(D_read+D_write)/(HBM_bw*"
+                        "transaction_efficiency)+HBM_base_latency+"
+                        "(waves-1)*pipeline_startup-hidden_streaming_latency"
+                    ),
+                })
+        if reture_detail:
+            return {
+                "op_name": op_name,
+                "input_bytes": input_bytes,
+                "output_bytes": output_bytes,
+                "accessed_mem": accessed_mem,
+                "compute_detail": compute_detail,
+                "io_detail": io_detail,
+                "kernel_launch_latency_us": launch_us,
+                "layout_resource_profile": resource_profile or None,
+                "layout_resource_detail": layout_detail,
+                "time_ms": time_ms,
+            }
+        return time_ms
 
     @staticmethod
     def _lookup_comm_num_value(values: Dict[str, Any], comm_num: int, default=None):
@@ -1451,24 +2475,12 @@ class SystemConfig(Config):
                 op_name, size, comm_num, comm_stage, strategy, group_kind)
         net_data = self.networks.get(net, None)
         assert net_data is not None, f"{net} not exist on {self.networks.keys()}, op_name={op_name}"
-        # alltoallv falls back to all2all when the network config only defines all2all
-        if op_name == "alltoallv" and "alltoallv" not in net_data.op and "all2all" in net_data.op:
-            op_name = "all2all"
-        # fsdp_all_gather/fsdp_reduce_scatter and the 16p-calibrated
-        # model-level/sync/probs ops fall back to the base collective op when
-        # the net profile doesn't declare them (configs without 16p α/β
-        # calibration keep the plain collective cost).
-        _OP_FALLBACK = {
-            "fsdp_all_gather": "all_gather",
-            "fsdp_reduce_scatter": "reduce_scatter",
-            "model_embed_ag": "all_gather",
-            "model_moe_ag": "all_gather",
-            "model_moe_rs": "reduce_scatter",
-            "sync_all_reduce": "all_reduce",
-            "moe_small_a2a": "all2all",
-        }
-        if op_name in _OP_FALLBACK and op_name not in net_data.op:
-            op_name = _OP_FALLBACK[op_name]
+        requested_op_name = op_name
+        # Model-semantic collective names share the same physical algorithms.
+        # Preserve an explicitly configured specialized op; otherwise resolve
+        # to the generic collective. The levels path uses the same mapping.
+        if op_name in NET_OP_FALLBACK and op_name not in net_data.op:
+            op_name = NET_OP_FALLBACK[op_name]
         op:NetOpConfig = net_data.op.get(op_name, None)  # 0: scale 1: offset 2: efficient_factor
         assert op is not None, f"{op_name} not exist on {net_data}"
         scale, offset, eff_factor = op.scale, op.offset, op.efficient_factor
@@ -1499,9 +2511,16 @@ class SystemConfig(Config):
         _lv_bw = ((self.topology or {}).get('level_bandwidth_gbps') or {})
         _lv = (self.topology or {}).get('levels') or []
         _topo_bw = None
+        _topo_latency = None
         if strategy is not None and group_kind and len(_lv) >= 2:
-            _b0 = self._level_effective_bandwidth(_lv[0], _lv_bw.get(_lv[0].get('name')))
-            _b1 = self._level_effective_bandwidth(_lv[1], _lv_bw.get(_lv[1].get('name')))
+            # Forward mode must not fall back to level_bandwidth_gbps because
+            # that optional table may contain calibrated effective bandwidths.
+            _fallback0 = (None if self.forward_derivation_enabled
+                          else _lv_bw.get(_lv[0].get('name')))
+            _fallback1 = (None if self.forward_derivation_enabled
+                          else _lv_bw.get(_lv[1].get('name')))
+            _b0 = self._level_effective_bandwidth(_lv[0], _fallback0)
+            _b1 = self._level_effective_bandwidth(_lv[1], _fallback1)
             if _b0 and _b1:
                 # a2a（cp/ep）用层流量分解（all2all_level_fraction 的跨板占比）；
                 # collective（AG/RS/AR）用组跨 node 比。二者跨板流量比例不同。
@@ -1520,6 +2539,15 @@ class SystemConfig(Config):
                     _topo_bw = 1 / ((1 - _r) / _b0 + _r / _b1)
                 else:
                     _topo_bw = _b0  # 同 node：板内带宽
+                _lat0 = self.networks[_lv[0]['net']].bandwidth.latency_us
+                _lat1 = self.networks[_lv[1]['net']].bandwidth.latency_us
+                _topo_latency = (1 - _r) * _lat0 + _r * _lat1
+        if self.forward_derivation_enabled:
+            if comm_num == 1:
+                return 0
+            return self._derive_network_time(
+                requested_op_name, actual_size, comm_num, net, comm_stage, strategy,
+                group_kind, _topo_bw, _topo_latency)
         # Per-card-count bandwidth (align by comm group size, not by net/domain
         # name): when the net profile declares gbps_by_comm_num, use the value
         # for this comm_num; the op's efficient_factor below still applies
@@ -1768,6 +2796,8 @@ class SystemConfig(Config):
         """
         net_data = self.networks.get(net, None)
         assert net_data is not None, f"{net} not exist on {self.networks.keys()}, op_name={op_name}"
+        if op_name in NET_OP_FALLBACK and op_name not in net_data.op:
+            op_name = NET_OP_FALLBACK[op_name]
         op: NetOpConfig = net_data.op.get(op_name, None)
         assert op is not None, f"{op_name} not exist on {net_data}"
         scale, offset, eff_factor = op.scale, op.offset, op.efficient_factor
@@ -1847,14 +2877,33 @@ class SystemConfig(Config):
         assert levels, (
             f"net='levels' requires topology['levels'] to be declared, "
             f"op_name={op_name}, comm_stage={comm_stage}")
-        # alltoallv falls back to all2all, mirroring the single-net path
-        # (compute_net_op_time): level nets only define all2all, and an
-        # alltoallv on the ep/cp group IS an all2all (context-parallel
-        # sequence exchange / MoE dispatch). Without this mapping the
-        # levels path cannot express alltoallv at all.
-        if op_name == "alltoallv":
-            op_name = "all2all"
-        composition, spans = group_level_span(group_kind, strategy, levels)
+        requested_op_name = op_name
+        # Resolve model-semantic aliases before phase-size/algorithm logic as
+        # well as net-table lookup. Keep a specialized op only when at least
+        # one declared level explicitly supports it.
+        if op_name in NET_OP_FALLBACK and not any(
+                op_name in self.networks[level["net"]].op for level in levels):
+            op_name = NET_OP_FALLBACK[op_name]
+        route_strategy = strategy
+        # A collective may intentionally use a subgroup smaller than the
+        # strategy dimension (for example node-local CP A2A with cp_size=8 and
+        # cp_a2a_group=4). Route the declared call group, not the full logical
+        # parallel dimension.
+        dimension = {
+            "tp": "tp_size", "cp": "cp_size", "pp": "pp_size",
+            "dp": "dp_size", "ep": "ep_size", "etp": "etp_size",
+            "edp": "edp_size",
+        }.get(group_kind)
+        if dimension and getattr(strategy, dimension, comm_num) != comm_num:
+            values = {
+                name: getattr(strategy, name, 1)
+                for name in ("tp_size", "cp_size", "pp_size", "dp_size",
+                             "ep_size", "etp_size", "edp_size")
+            }
+            values["world_size"] = strategy.world_size
+            values[dimension] = comm_num
+            route_strategy = types.SimpleNamespace(**values)
+        composition, spans = group_level_span(group_kind, route_strategy, levels)
         if op_name == "p2p":
             # p2p involves two adjacent stages, not the whole group: a
             # 2-member group at the same stride would give c_i == 1 at
@@ -1867,7 +2916,8 @@ class SystemConfig(Config):
                     cp_size=strategy.cp_size, dp_size=strategy.dp_size)
             _, spans = group_level_span(group_kind, pair, levels)
         policy = self._composition_policy_for(op_name)
-        # (span, phase_size, bw, eff_factor, phase_time_ms, base_latency_us)
+        # (span, phase_size, bw, eff_factor, phase_time_ms,
+        #  physical_propagation_latency_us)
         phases = []
         for i, span in enumerate(spans):
             scale, offset, eff_factor, bw, base_latency, fixed_latency = \
@@ -1878,14 +2928,41 @@ class SystemConfig(Config):
             # convergence_ratio=1.0 preserves the current levels behavior.
             if span.kind == "clos" and span.convergence_ratio > 1.0:
                 bw /= span.convergence_ratio
+            if self.forward_derivation_enabled:
+                # Use only port-count/link-rate hardware fields.  Do not use
+                # level net efficiency or fixed-latency calibration values.
+                physical_bw = self._level_effective_bandwidth(levels[i], None)
+                if physical_bw is None:
+                    physical_bw = self.networks[span.net].bandwidth.gbps
+                # A FullMesh endpoint can use only as many physical ports as
+                # there are remote members in this topology phase. This is a
+                # route-occupancy limit from group placement, independent of
+                # the collective algorithm. CLOS uplinks remain shared at the
+                # configured convergence-limited aggregate rate.
+                port_num = max(1, int(levels[i].get("port_num", 1)))
+                if span.kind == "fullmesh":
+                    remote_members = max(1, math.ceil(composition[i]) - 1)
+                    active_ports = min(port_num, remote_members)
+                    port_utilization = active_ports / port_num
+                else:
+                    active_ports = port_num
+                    port_utilization = 1.0
+                bw = physical_bw * port_utilization
+                eff_factor = 1.0
+                base_latency = self.networks[span.net].bandwidth.latency_us
+                fixed_latency = 0.0
             if op_name == "all2all":
                 # Per-level share of each member's traffic; levels whose
                 # boundary nobody crosses (fraction == 0) are skipped
                 # entirely, latency included.
-                fraction = all2all_level_fraction(group_kind, strategy, levels, i)
+                fraction = all2all_level_fraction(
+                    group_kind, route_strategy, levels, i)
                 if fraction <= 0:
                     continue
-                phase_size = size * scale * fraction
+                # ``size`` is the logical per-rank tensor. One K-way A2A
+                # retains 1/K locally; only (K-1)/K enters network links.
+                phase_size = (size * scale * (comm_num - 1) / comm_num
+                              * fraction)
             elif op_name == "p2p":
                 # Level 0 carries the pair only when both endpoints share
                 # one node; level i >= 1 carries it when the endpoints sit
@@ -1900,14 +2977,79 @@ class SystemConfig(Config):
                     continue
                 actual_size_base = size * scale + size * scale / comm_num * offset
                 phase_size = actual_size_base * (composition[i] - 1) / composition[i]
-            base_time = phase_size / (bw * 1024**3 * eff_factor) * 1e3
-            latency_time = (base_latency + fixed_latency) / 1e3
+            if self.forward_derivation_enabled:
+                flit_bytes = max(1, int(
+                    self._hccl_network_config().get(
+                        "flit_bytes", 256)))
+                padded = self._ceil_to(phase_size, flit_bytes)
+                eff_factor = phase_size / padded if padded else 1.0
+                local_members = max(2, composition[i])
+                algorithm, stage_count = self._collective_algorithm(
+                    op_name, local_members)
+                hop_count = max(1, int(levels[i].get("hop_count", 1)))
+                physical_latency = base_latency * hop_count
+                layer_record_key = f"{span.name}|bytes={int(phase_size)}"
+                self.forward_derivation_records["network_layers"][
+                    layer_record_key] = {
+                        "network_level": span.name,
+                        "net": span.net,
+                        "message_bytes": phase_size,
+                        "physical_bandwidth_gib_per_s": physical_bw,
+                        "port_count": port_num,
+                        "active_ports": active_ports,
+                        "port_utilization": port_utilization,
+                        "routed_bandwidth_gib_per_s": bw,
+                        "packet_efficiency": eff_factor,
+                        "bandwidth_utilization": eff_factor,
+                        "effective_beta_gib_per_s": bw * eff_factor,
+                        "base_latency_us": base_latency,
+                        "hop_count": hop_count,
+                        "physical_propagation_latency_us": physical_latency,
+                        "algorithm_independent": True,
+                        "formula": (
+                            "beta=B_physical*port_utilization*"
+                            "payload/ceil(payload/flit)"),
+                    }
+                record_key = (f"{requested_op_name}|levels:{comm_stage.lower()}:{span.name}"
+                              f"|n={local_members}|bytes={int(phase_size)}")
+                self.forward_derivation_records["communications"][record_key] = {
+                    "op_name": requested_op_name,
+                    "algorithm_family": op_name,
+                    "stage": f"levels:{comm_stage.lower()}:{span.name}",
+                    "group_kind": group_kind,
+                    "comm_num": local_members,
+                    "message_bytes": phase_size,
+                    "topology_bandwidth_gbps": physical_bw,
+                    "routed_bandwidth_gbps": bw,
+                    "port_utilization": port_utilization,
+                    "flit_bytes": flit_bytes,
+                    "packet_efficiency": eff_factor,
+                    "derived_beta_gib_per_s": bw * eff_factor,
+                    "algorithm": algorithm,
+                    "algorithm_stages": stage_count,
+                    "network_layer_latency_us": base_latency,
+                    "physical_hop_count": hop_count,
+                    "physical_propagation_latency_us": physical_latency,
+                    "call_runtime_overhead_us": 0.0,
+                    "collective_latency_us": physical_latency,
+                    "formula": (
+                        "T=D/(B_topology*port_utilization*payload/"
+                        "padded_payload)+hop_count*hop_latency; call runtime "
+                        "is composed once after all physical levels"),
+                }
+                latency_time = physical_latency / 1e3
+            else:
+                latency_time = (base_latency + fixed_latency) / 1e3
+            base_time = phase_size / (bw * 1e9 * eff_factor) * 1e3
             # Layout transform overhead (e.g. dim01_transpose around all2allv)
             layout_oh = 0.0
             if op_name == "all2all":
                 layout_oh = (getattr(strategy, 'layout_transform_overhead_us', 0) or 0) / 1e3
             phase_time = base_time + latency_time + layout_oh
-            phases.append((span, phase_size, bw, eff_factor, phase_time, base_latency))
+            phases.append((
+                span, phase_size, bw, eff_factor, phase_time,
+                physical_latency if self.forward_derivation_enabled
+                else base_latency))
         if not phases:
             # Group of one (or no crossed level): no communication.
             return 0.0
@@ -1915,19 +3057,50 @@ class SystemConfig(Config):
             total_time = max(phase[4] for phase in phases)
         else:
             total_time = sum(phase[4] for phase in phases)
+        runtime = None
+        if self.forward_derivation_enabled:
+            runtime = self._collective_runtime_overhead(
+                op_name, comm_num, size, active_level_count=len(phases))
+            total_time += runtime["call_runtime_overhead_us"] / 1e3
+            record_key = (f"{requested_op_name}|levels:{comm_stage.lower()}:call"
+                          f"|n={comm_num}|bytes={int(size)}")
+            self.forward_derivation_records["communications"][record_key] = {
+                "op_name": requested_op_name,
+                "algorithm_family": op_name,
+                "stage": f"levels:{comm_stage.lower()}:call",
+                "group_kind": group_kind,
+                "comm_num": comm_num,
+                "message_bytes": size,
+                "physical_level_count": len(phases),
+                "physical_propagation_latency_us": sum(
+                    phase[5] for phase in phases),
+                "call_runtime_overhead_us": runtime["call_runtime_overhead_us"],
+                "call_runtime": runtime,
+                "collective_latency_us": (
+                    sum(phase[5] for phase in phases)
+                    + runtime["call_runtime_overhead_us"]),
+                "derived_time_ms": total_time,
+                "performance_observations_used": False,
+                "formula": (
+                    "T_call=compose_levels(D_i/beta_i+hop_i*L_i)"
+                    "+T_runtime(call,group,payload,algorithm)"),
+            }
         # net_info.json decomposition: one record per level under
         # "levels:<stage>:<level>" plus the composed total under
         # "levels:<stage>". Records keep the legacy field set.
         stage_key = comm_stage.lower()
         for span, phase_size, bw, eff_factor, phase_time, base_latency in phases:
             self.record_net_bw(
-                op_name, span.net, comm_num, f"levels:{stage_key}:{span.name}",
+                requested_op_name, span.net, comm_num,
+                f"levels:{stage_key}:{span.name}",
                 bw, bw * eff_factor, eff_factor, phase_time * 1e3,
                 phase_size, base_latency)
         self.record_net_bw(
-            op_name, self.LEVELS_NET, comm_num, f"levels:{stage_key}",
+            requested_op_name, self.LEVELS_NET, comm_num,
+            f"levels:{stage_key}",
             None, None, None, total_time * 1e3, size,
-            sum(phase[5] for phase in phases))
+            (sum(phase[5] for phase in phases)
+             + (runtime["call_runtime_overhead_us"] if runtime else 0.0)))
         return total_time
 
     def compute_end2end_time(self, compute_time, mem_time):
@@ -1950,7 +3123,8 @@ class SystemConfig(Config):
 
     # Resource lanes that never collide with user-declared engine names
     # ("off" is the idle lane of SimuThread's lane clock, see design doc 4.2).
-    RESERVED_RESOURCE_LANES = ("comp", "comm", "pp_fwd", "pp_bwd", "off")
+    RESERVED_RESOURCE_LANES = (
+        "comp", "comm", "pp_fwd", "pp_bwd", "off", "offload")
 
     # Fabric model choices (network-fabric design doc section 6); None = off.
     # "nic+levels" (hierarchical-network design doc section 8) activates
@@ -1980,10 +3154,11 @@ class SystemConfig(Config):
     def simu_resource_lanes(self) -> list[str]:
         """Pinned resource-lane contract for the simulator (design doc 4.2).
 
-        Returns the built-in lanes ["comp", "comm", "pp_fwd", "pp_bwd"] plus
+        Returns the built-in lanes ["comp", "comm", "pp_fwd", "pp_bwd",
+        "offload"] plus
         the sorted names of `engines` entries not already in that list.
         """
-        lanes = ["comp", "comm", "pp_fwd", "pp_bwd"]
+        lanes = ["comp", "comm", "pp_fwd", "pp_bwd", "offload"]
         if self.engines:
             lanes.extend(sorted(name for name in self.engines if name not in lanes))
         return lanes
@@ -2122,7 +3297,8 @@ class SystemConfig(Config):
             # port_num（每 device 端口数）、bandwidth_per_port_gbps（每端口有效带宽）、
             # latency_us（静态延迟）。层有效带宽 = port_num × per_port ÷ conv（clos）。
             optional_keys = {"kind", "convergence_ratio", "port_num",
-                             "bandwidth_per_port_gbps", "latency_us"}
+                             "bandwidth_per_port_gbps", "latency_us",
+                             "hop_count"}
             entry_keys = set(entry.keys())
             assert entry_keys.issuperset(required_keys), (
                 f"topology['levels'][{idx}] must have keys "
@@ -2159,6 +3335,15 @@ class SystemConfig(Config):
             ), (
                 f"topology['levels'][{idx}]['convergence_ratio'] must be a "
                 f"positive number, but got {conv!r}"
+            )
+            hop_count = entry.get("hop_count", 1)
+            assert (
+                isinstance(hop_count, int)
+                and not isinstance(hop_count, bool)
+                and hop_count >= 1
+            ), (
+                f"topology['levels'][{idx}]['hop_count'] must be an int >= 1, "
+                f"but got {hop_count!r}"
             )
             assert name not in names, (
                 f"topology['levels'][{idx}]['name'] {name!r} is duplicated"
@@ -2274,6 +3459,10 @@ class ModelConfig(Config):
     # cycle[layer%8] = {4099,4109,4118,4127,4136,4144,4152,4161}; m = 1024 on
     # the F5120 layers, else 512.
     layers_latent_bmm: List[List[int]] = None
+    # Portable form: m = 2*head_size*FA_KV_heads and
+    # n = ceil(seq_len/vwn_n) + offsets[layer % len(offsets)]. The legacy
+    # explicit [m,n] list remains supported for older model declarations.
+    latent_bmm_n_offsets: List[int] = None
     latent_bmm_batch: int = 0    # 0 = 未设 → 用 strategy.cp_size（LAT 对 CP 切分的 seq 块注意力，batch=cp）
     latent_bmm_hidden: int = None          # latent BMM inner dim (None = hidden_size)
     # ───  BMMV2 族（latent 内部自注意力，aclnnMatmul_BatchMatMulNd_BatchMatMulV2）  ───

@@ -300,7 +300,7 @@ class LLMBlock(MetaModule):
         rank_info = get_rank_group(args.rank, self.strategy)
         model_info = self._model_info
         ops = []
-        dense_group_size = self.strategy.dp_size * self.strategy.cp_size
+        dense_group_size = self.strategy.fsdp_dense_group_size
         dense_ag_cost = self.system.compute_net_op_time(
             "all_gather", model_info.dense_weight_bytes * dense_group_size, dense_group_size,
             net=self._fsdp_net_resolved, comm_stage="dp_cp",
@@ -315,7 +315,7 @@ class LLMBlock(MetaModule):
         ops[-1].call_stk = '-fsdp_ag'
         state.comm_order += 1
         if model_info.moe_weight_bytes > 0:
-            moe_group_size = self.strategy.edp_size
+            moe_group_size = self.strategy.fsdp_moe_group_size
             moe_ag_cost = self.system.compute_net_op_time(
                 "all_gather", model_info.moe_weight_bytes * moe_group_size, moe_group_size,
                 net=self._fsdp_moe_net_resolved, comm_stage="edp",
@@ -344,7 +344,7 @@ class LLMBlock(MetaModule):
         rank_info = get_rank_group(args.rank, self.strategy)
         model_info = self._model_info
         ops = []
-        dense_group_size = self.strategy.dp_size * self.strategy.cp_size
+        dense_group_size = self.strategy.fsdp_dense_group_size
         dense_rs_cost = self.system.compute_net_op_time(
             "reduce_scatter", model_info.dense_grad_bytes * dense_group_size, dense_group_size,
             net=self._fsdp_net_resolved, comm_stage="dp_cp",
@@ -359,7 +359,7 @@ class LLMBlock(MetaModule):
         ops[-1].call_stk = '-fsdp_rs'
         state.comm_order += 1
         if model_info.moe_grad_bytes > 0:
-            moe_group_size = self.strategy.edp_size
+            moe_group_size = self.strategy.fsdp_moe_group_size
             moe_rs_cost = self.system.compute_net_op_time(
                 "reduce_scatter", model_info.moe_grad_bytes * moe_group_size, moe_group_size,
                 net=self._fsdp_moe_net_resolved, comm_stage="edp",
@@ -392,7 +392,7 @@ class LLMBlock(MetaModule):
         rank_info = get_rank_group(args.rank, self.strategy)
         model_info = self._model_info
         ops = []
-        dense_group_size = self.strategy.dp_size * self.strategy.cp_size
+        dense_group_size = self.strategy.fsdp_dense_group_size
         dense_ag_cost = self.system.compute_net_op_time(
             "all_gather", model_info.dense_weight_bytes * dense_group_size, dense_group_size,
             net=self._fsdp_net_resolved, comm_stage="dp_cp",
@@ -407,7 +407,7 @@ class LLMBlock(MetaModule):
         ops[-1].call_stk = '-fsdp_bwd_ag'
         state.comm_order += 1
         if model_info.moe_weight_bytes > 0:
-            moe_group_size = self.strategy.edp_size
+            moe_group_size = self.strategy.fsdp_moe_group_size
             moe_ag_cost = self.system.compute_net_op_time(
                 "all_gather", model_info.moe_weight_bytes * moe_group_size, moe_group_size,
                 net=self._fsdp_moe_net_resolved, comm_stage="edp",

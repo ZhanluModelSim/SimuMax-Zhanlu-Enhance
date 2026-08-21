@@ -7,7 +7,9 @@ from simumax.core.base_struct import (
     InputOutputInfo,
     GroupLinearBase
 )
-from simumax.core.base_struct import (all_gather, reduce_scatter, all_reduce, all_gather_bwd, all2all,
+from simumax.core.base_struct import (all_gather, all_gatherv, reduce_scatter,
+                           reduce_scatterv,
+                           all_reduce, all_gather_bwd, all2all, alltoallv,
                            AtomModel, LeafModel, FwdQue,PathDebugContext,
                            COM_BUFF)
 from simumax.core.config import StrategyConfig, SystemConfig, ModelConfig, MLPRecomputeConfig
@@ -43,8 +45,9 @@ class Router(LinearBase):
         use_variance_tail_model: bool,
         strategy: StrategyConfig,
         system: SystemConfig,
+        specific_name: str = 'Router',
     ) -> None:
-        super().__init__(hidden_size, expert_num, strategy, system)
+        super().__init__(hidden_size, expert_num, strategy, system, specific_name)
         self.layer_idx = layer_idx
         self.expert_num = expert_num
         self.local_expert_num = expert_num // self.strategy.ep_size
@@ -57,6 +60,8 @@ class Router(LinearBase):
             self.set_variance_node(True)
         self.hidden_size = hidden_size
         self.moe_dispatcher_policy = moe_dispatcher_policy
+        self._gating_fwd_time = 0.0
+        self._router_local_stages = []
         # TODO: consider z-loss、aux-loss etc.
 
     def prefill(self, args, call_stk='', com_buff=None):
@@ -66,53 +71,98 @@ class Router(LinearBase):
         rank_info = get_rank_group(args.rank, self.strategy)
 
         # Gating GEMM
-        self.layers.append(AtomModel(fwd_cost=self._cost_info.fwd_compute_time,
-                                 bwd_cost=self._cost_info.bwd_grad_act_time+self._cost_info.bwd_grad_w_time,))
+        self.layers.append(AtomModel(fwd_cost=self._gating_fwd_time,
+                                  bwd_cost=self._cost_info.bwd_grad_act_time+self._cost_info.bwd_grad_w_time,
+                                  recompute_cost=(self._gating_fwd_time
+                                                  if self.enable_recompute else 0),
+                                  specific_name='MoEGating'))
 
-        # DP topk communication: allGatherv + allReduce across edp group
-        if self.strategy.edp_size > 1:
+        # The score tensor must be normalized, softmaxed and reduced to top-k
+        # route fields before its metadata collectives can launch. These are
+        # stable algorithm stages; each duration is derived from tensor bytes,
+        # HBM and launch facts rather than profiler timing.
+        for name, cost in self._router_local_stages:
+            self.layers.append(AtomModel(
+                fwd_cost=cost, bwd_cost=0,
+                recompute_cost=cost if self.enable_recompute else 0,
+                specific_name=name))
+
+        # Router metadata is synchronized in the EP domain before dispatch.
+        # IDs and weights are materialized as distinct tensors; expert counts
+        # and prefix offsets are likewise distinct int32 arrays. Keeping these
+        # four graph edges explicit preserves launch latency without inventing
+        # an aggregate empirical coefficient.
+        if self.strategy.ep_size > 1:
             batch_size = self.input_info.tensors[0].size(0)
             seq_len = self.input_info.tensors[0].size(1)
-            comm_size = (
-                batch_size * seq_len * self.topk
-                * self.dtype_to_element_size["fp32"]
-            )
-            ag_cost = self.system.compute_net_op_time(
-                "all_gather", comm_size,
-                comm_num=self.strategy.edp_size,
-                net=self._fsdp_moe_net_resolved,
+            route_field_size = (batch_size * seq_len * self.topk
+                                * self.dtype_to_element_size["fp32"])
+            expert_field_size = self.expert_num * 4  # int32
+            ag_op = ("all_gatherv" if self.strategy.moe_variable_collectives
+                     else "all_gather")
+            ag_cls = (all_gatherv if self.strategy.moe_variable_collectives
+                      else all_gather)
+            # Counts and offsets are one contiguous [2, E] header in the
+            # implementation graph. Synchronize it before gathering the two
+            # variable route fields so the dependency order is explicit.
+            expert_header_size = 2 * expert_field_size
+            ar_cost = self.system.compute_net_op_time(
+                "all_reduce", expert_header_size,
+                comm_num=self.strategy.ep_size,
+                net=self.strategy.ep_net,
                 strategy=self.strategy,
-                group_kind="edp",
-                comm_stage="Router_FWD_topk_AG",
+                group_kind="ep",
+                comm_stage="Router_FWD_expert_header_AR",
             )
-            self.layers.append(all_gather(
-                f"{state.comm_order}-{model_info}-edp_group:{rank_info['edp_group_id']}-topk_ag",
-                rank_info['edp_rank'], self.strategy.edp_size,
-                com_buff=com_buff,
-                fwd_cost=ag_cost, bwd_cost=0,
-                global_rank=args.rank,
-                net=self._fsdp_moe_net_resolved,
-                size_bytes=comm_size,
+            ar_bwd_cost = self.system.compute_net_op_time(
+                "all_reduce", expert_header_size,
+                comm_num=self.strategy.ep_size,
+                net=self.strategy.ep_net,
+                strategy=self.strategy,
+                group_kind="ep",
+                comm_stage="Router_BWD_expert_header_AR",
+            )
+            self.layers.append(all_reduce(
+                f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}-expert_header_ar",
+                rank_info['ep_rank'], self.strategy.ep_size,
+                com_buff=com_buff, fwd_cost=ar_cost, bwd_cost=ar_bwd_cost,
+                global_rank=args.rank, net=self.strategy.ep_net,
+                size_bytes=expert_header_size,
+                group_kind="ep", comm_stage="Router_expert_header_AR",
             ))
             state.comm_order += 1
 
-            ar_cost = self.system.compute_net_op_time(
-                "all_reduce", comm_size,
-                comm_num=self.strategy.edp_size,
-                net=self._fsdp_moe_net_resolved,
-                strategy=self.strategy,
-                group_kind="edp",
-                comm_stage="Router_FWD_topk_AR",
-            )
-            self.layers.append(all_reduce(
-                f"{state.comm_order}-{model_info}-edp_group:{rank_info['edp_group_id']}-topk_ar",
-                rank_info['edp_rank'], self.strategy.edp_size,
-                com_buff=com_buff,
-                fwd_cost=ar_cost, bwd_cost=0,
-                global_rank=args.rank,
-                net=self._fsdp_moe_net_resolved,
-                size_bytes=comm_size,
-            ))
+            for field in ("topk_ids", "topk_weights"):
+                ag_cost = self.system.compute_net_op_time(
+                    ag_op, route_field_size,
+                    comm_num=self.strategy.ep_size,
+                    net=self.strategy.ep_net,
+                    strategy=self.strategy,
+                    group_kind="ep",
+                    comm_stage=f"Router_FWD_{field}_AGV",
+                )
+                self.layers.append(ag_cls(
+                    f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}-{field}_agv",
+                    rank_info['ep_rank'], self.strategy.ep_size,
+                    com_buff=com_buff, fwd_cost=ag_cost, bwd_cost=0,
+                    global_rank=args.rank, net=self.strategy.ep_net,
+                    size_bytes=route_field_size,
+                    group_kind="ep", comm_stage="Router_route_fields_AGV",
+                ))
+                state.comm_order += 1
+
+            rsv_cost = self.system.compute_net_op_time(
+                "reduce_scatterv", route_field_size,
+                comm_num=self.strategy.ep_size, net=self.strategy.ep_net,
+                strategy=self.strategy, group_kind="ep",
+                comm_stage="Router_BWD_route_grad_RSV")
+            self.layers.append(reduce_scatterv(
+                f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}-route_grad_rsv",
+                rank_info['ep_rank'], self.strategy.ep_size,
+                com_buff=com_buff, fwd_cost=0, bwd_cost=rsv_cost,
+                global_rank=args.rank, net=self.strategy.ep_net,
+                size_bytes=route_field_size, group_kind="ep",
+                comm_stage="Router_route_grad_RSV"))
             state.comm_order += 1
 
         for layer in self.layers:
@@ -161,29 +211,38 @@ class Router(LinearBase):
         DP topk communication (allGatherv + allReduce across edp group) is
         modeled here for cost estimation.
         """
-        if self.strategy.edp_size > 1:
+        if self.strategy.ep_size > 1:
             batch_size = self.input_info.tensors[0].size(0)
             seq_len = self.input_info.tensors[0].size(1)
-            comm_size = (
-                batch_size * seq_len * self.topk
-                * self.dtype_to_element_size["fp32"]
-            )
+            route_field_size = (batch_size * seq_len * self.topk
+                                * self.dtype_to_element_size["fp32"])
+            expert_field_size = self.expert_num * 4  # int32
+            ag_op = ("all_gatherv" if self.strategy.moe_variable_collectives
+                     else "all_gather")
+            for field in ("topk_ids", "topk_weights"):
+                self._cost_info.fwd_net_time += self.system.compute_net_op_time(
+                    ag_op, route_field_size,
+                    comm_num=self.strategy.ep_size, net=self.strategy.ep_net,
+                    strategy=self.strategy, group_kind="ep",
+                    comm_stage=f"Router_FWD_{field}_AGV")
             self._cost_info.fwd_net_time += self.system.compute_net_op_time(
-                "all_gather", comm_size,
-                comm_num=self.strategy.edp_size,
-                net=self._fsdp_moe_net_resolved,
-                strategy=self.strategy,
-                group_kind="edp",
-                comm_stage="Router_FWD_topk_AG",
-            )
-            self._cost_info.fwd_net_time += self.system.compute_net_op_time(
-                "all_reduce", comm_size,
-                comm_num=self.strategy.edp_size,
-                net=self._fsdp_moe_net_resolved,
-                strategy=self.strategy,
-                group_kind="edp",
-                comm_stage="Router_FWD_topk_AR",
-            )
+                "all_reduce", 2 * expert_field_size,
+                comm_num=self.strategy.ep_size, net=self.strategy.ep_net,
+                strategy=self.strategy, group_kind="ep",
+                comm_stage="Router_FWD_expert_header_AR")
+            self._cost_info.bwd_grad_act_net_time += \
+                self.system.compute_net_op_time(
+                    "all_reduce", 2 * expert_field_size,
+                    comm_num=self.strategy.ep_size,
+                    net=self.strategy.ep_net,
+                    strategy=self.strategy, group_kind="ep",
+                    comm_stage="Router_BWD_expert_header_AR")
+            self._cost_info.bwd_grad_act_net_time += \
+                self.system.compute_net_op_time(
+                    "reduce_scatterv", route_field_size,
+                    comm_num=self.strategy.ep_size, net=self.strategy.ep_net,
+                    strategy=self.strategy, group_kind="ep",
+                    comm_stage="Router_BWD_route_grad_RSV")
 
     def _comp_leaf_act_info_impl(self):
         """
@@ -220,7 +279,7 @@ class Router(LinearBase):
         self._model_info.dense_state_bytes = (
             3 * self.dtype_to_element_size["fp32"] * weight_numel
         )
-        optimizer_group_size = self.strategy.dp_size * self.strategy.cp_size
+        optimizer_group_size = self.strategy.fsdp_dense_group_size
         if self.strategy.zero_state >= 1:
             self._model_info.dense_state_bytes /= optimizer_group_size
         if self.strategy.zero_state >= 2:
@@ -285,6 +344,45 @@ class Router(LinearBase):
             bwd_grad_w_op="router",
             enable_recompute=self.enable_recompute,
         )
+        batch = self.input_info.tensors[0].size(0)
+        seq = self.input_info.tensors[0].size(1)
+        hidden = self.input_info.tensors[0].size(2)
+        logits = batch * seq * self.expert_num
+        routes = batch * seq * self.topk
+        logits_bytes = logits * self.element_size
+        route_bytes = routes * (4 + 4)  # int32 expert id + fp32 weight
+        weight_bytes = self.hidden_size * self.expert_num * self.element_size
+        input_bytes = batch * seq * hidden * self.element_size
+        linear_mem = input_bytes + weight_bytes + logits_bytes
+        linear_flops = 2 * batch * seq * hidden * self.expert_num
+        class_key, path_key = self.get_cost_keys()
+        self._gating_fwd_time = self.system.compute_op_accuracy_time(
+            "router", linear_flops,
+            shape_desc=(f"m={batch * seq}, n={self.expert_num}, k={hidden}, "
+                        f"dtype={self.strategy.dtype}, stage=gating_gemm"),
+            accessed_mem=linear_mem, stage="fwd",
+            class_key=class_key, path_key=path_key)
+
+        local_specs = (
+            ("RouterLogitNorm", 2 * logits_bytes, logits_bytes),
+            ("RouterSoftmax", 2 * logits_bytes, logits_bytes),
+            ("RouterTopK", logits_bytes, route_bytes),
+            ("RouterAuxReduce", logits_bytes + route_bytes,
+             self.expert_num * 4),
+        )
+        self._router_local_stages = []
+        for name, read_bytes, write_bytes in local_specs:
+            cost = self.system.compute_layout_time(
+                name, read_bytes, write_bytes, stage="fwd",
+                path_key=path_key,
+                shape_desc=(f"batch={batch},seq={seq},experts={self.expert_num},"
+                            f"topk={self.topk},read={read_bytes},write={write_bytes}"))
+            self._router_local_stages.append((name, cost))
+        self._cost_info.fwd_compute_time = (
+            self._gating_fwd_time
+            + sum(cost for _, cost in self._router_local_stages))
+        self._cost_info.recompute_compute_time = (
+            self._cost_info.fwd_compute_time if self.enable_recompute else 0)
 
 class Permutation(MetaModule):
     """
@@ -309,6 +407,7 @@ class Permutation(MetaModule):
         enable_recompute: bool,
         strategy: StrategyConfig,
         system: SystemConfig,
+        stage_partition: str = 'all',
     ) -> None:
         super().__init__(strategy, system)
         self.layer_idx = layer_idx
@@ -320,6 +419,11 @@ class Permutation(MetaModule):
         self.moe_dispatcher_policy = moe_dispatcher_policy
         self.moe_pad_expert_input_to_capacity = moe_pad_expert_input_to_capacity
         self.capacity = capacity
+        if stage_partition not in ('all', 'pre_metadata', 'post_metadata'):
+            raise ValueError(
+                "stage_partition must be all, pre_metadata, or post_metadata"
+            )
+        self.stage_partition = stage_partition
 
     def prefill(self, args, call_stk='', com_buff=None):
         self.call_stk = call_stk + self.call_stk
@@ -329,7 +433,11 @@ class Permutation(MetaModule):
         
 
     
-        #permutate1 for ep all2all
+        include_pre = self.stage_partition in ('all', 'pre_metadata')
+        include_post = self.stage_partition in ('all', 'post_metadata')
+
+        # permutate1 creates the metadata/activation buffers consumed by the
+        # first EP exchange. It belongs to the pre-metadata partition.
         # concat (sort_by_expert chunks) writes the permuted buffer once more
         # than the plain permute read+write above (real ConcatD kernel at
         # 2087/step9 on the 16p trace).
@@ -349,37 +457,71 @@ class Permutation(MetaModule):
         bwd_grad_act_accessed_mem = bwd_mem_time
         bwd_grad_act_time = self.system.compute_end2end_time(0, bwd_grad_act_accessed_mem)
         bwd_grad_w_time = self.system.compute_end2end_time(0, bwd_grad_w_accessed_mem)
-        self.layers.append(AtomModel(fwd_cost=fwd_compute_time,
-                                 bwd_cost=bwd_grad_act_time+bwd_grad_w_time,
-                                 specific_name='permute1'))
+        if include_pre:
+            self.layers.append(AtomModel(fwd_cost=fwd_compute_time,
+                                     bwd_cost=bwd_grad_act_time+bwd_grad_w_time,
+                                     specific_name='permute1'))
         
 
 
         if self.strategy.ep_size > 1:
             comm_size = self.dispatch_comm_size
+            main_a2a_op = ("alltoallv" if self.strategy.moe_variable_collectives
+                           else "all2all")
+            main_a2a_cls = (alltoallv if self.strategy.moe_variable_collectives
+                            else all2all)
+            # Fixed expert metadata is exchanged first. The activation buffer
+            # is then dispatched before its variable route-field sidecar; the
+            # receiver consumes the pair only after both collectives complete.
+            # This is a framework dependency, independent of their durations.
+            metadata_size = self.expert_num * 4  # int32 expert counts
+            metadata_cost = self.system.compute_net_op_time(
+                "moe_small_a2a", metadata_size, self.strategy.ep_size,
+                net=self.strategy.ep_net, strategy=self.strategy, group_kind="ep",
+            )
+            if include_pre:
+                self.layers.append(all2all(f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}-prob",
+                                             rank_info['ep_rank'], self.strategy.ep_size, com_buff=com_buff,
+                                             fwd_cost=metadata_cost, bwd_cost=0,
+                                             global_rank=args.rank, net=self.strategy.ep_net,
+                                             size_bytes=metadata_size, group_kind="ep",
+                                             comm_stage="Dispatch_expert_counts_A2A"))
+                state.comm_order += 1
             cost = self.system.compute_net_op_time(
-                "all2all",
+                main_a2a_op,
                 comm_size,
                 comm_num=self.strategy.ep_size,
                 net=self.strategy.ep_net,
                 strategy=self.strategy,
                 group_kind="ep",
+                comm_stage="Dispatch_activation_A2AV",
             )
-            self.layers.append(all2all(f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}",
-                                         rank_info['ep_rank'], self.strategy.ep_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank, net=self.strategy.ep_net, size_bytes=comm_size))
-            state.comm_order += 1
-            # router-probs small a2a (measured 26×0.4MB fwd @ step9, 1/layer)
-            prob_size = self.topk * self._per_rank_seq() * self.dtype_to_element_size[self.strategy.dtype]
-            prob_cost = self.system.compute_net_op_time(
-                "moe_small_a2a", prob_size, self.strategy.ep_size,
-                net=self.strategy.ep_net, strategy=self.strategy, group_kind="ep",
-            )
-            self.layers.append(all2all(f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}-prob",
-                                         rank_info['ep_rank'], self.strategy.ep_size, com_buff=com_buff,
-                                         fwd_cost=prob_cost, bwd_cost=0, global_rank=args.rank, net=self.strategy.ep_net, size_bytes=prob_size))
-            state.comm_order += 1
-        if self.strategy.etp_size > 1:
+            if include_post:
+                self.layers.append(main_a2a_cls(
+                    f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}",
+                    rank_info['ep_rank'], self.strategy.ep_size,
+                    com_buff=com_buff, fwd_cost=cost, bwd_cost=cost,
+                    global_rank=args.rank, net=self.strategy.ep_net,
+                    size_bytes=comm_size, group_kind="ep",
+                    comm_stage="Dispatch_activation_A2AV"))
+                state.comm_order += 1
+            batch_size = self.input_info.tensors[0].size(0)
+            route_size = (batch_size * self.topk * self._per_rank_seq()
+                          * (4 + 4 + 4))
+            route_cost = self.system.compute_net_op_time(
+                "alltoallv", route_size, self.strategy.ep_size,
+                net=self.strategy.ep_net, strategy=self.strategy,
+                group_kind="ep", comm_stage="Dispatch_route_fields_A2AV")
+            if include_post:
+                self.layers.append(alltoallv(
+                    f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}-route_fields",
+                    rank_info['ep_rank'], self.strategy.ep_size,
+                    com_buff=com_buff, fwd_cost=route_cost, bwd_cost=0,
+                    global_rank=args.rank, net=self.strategy.ep_net,
+                    size_bytes=route_size, group_kind="ep",
+                    comm_stage="Dispatch_route_fields_A2AV"))
+                state.comm_order += 1
+        if include_post and self.strategy.etp_size > 1:
             comm_size = (
                 self.permuted_act_size
                 * self.dtype_to_element_size[self.strategy.dtype]
@@ -399,8 +541,9 @@ class Permutation(MetaModule):
             state.comm_order += 1
 
         #permutate2 after ep all2all and tp
+        concat_depth = math.ceil(math.log2(max(1, self.local_expert_num)))
         permutate2_mem_accessed = (
-            self.permuted_act_size + self.permuted_act_size
+            2 * self.permuted_act_size * (1 + concat_depth)
         ) * self.dtype_to_element_size[self.strategy.dtype]
         fwd_mem_time = self.system.compute_mem_access_time(
             "permute_fwd",
@@ -415,9 +558,10 @@ class Permutation(MetaModule):
         bwd_grad_act_accessed_mem = bwd_mem_time
         bwd_grad_act_time = self.system.compute_end2end_time(0, bwd_grad_act_accessed_mem)
         bwd_grad_w_time = self.system.compute_end2end_time(0, bwd_grad_w_accessed_mem)
-        self.layers.append(AtomModel(fwd_cost=fwd_compute_time,
-                                 bwd_cost=bwd_grad_act_time+bwd_grad_w_time,
-                                 specific_name='permute2'))
+        if include_post:
+            self.layers.append(AtomModel(fwd_cost=fwd_compute_time,
+                                     bwd_cost=bwd_grad_act_time+bwd_grad_w_time,
+                                     specific_name='permute2'))
         
         for layer in self.layers:
             layer.prefill(args, self.call_stk, com_buff)
@@ -463,19 +607,25 @@ class Permutation(MetaModule):
     def dispatch_comm_size(self):
         """MoE dispatch payload (external all-to-all transfers only).
 
-        communication_matrix.json 的 8-pair alltoall 实测显示 MoE dispatch 是
-        全 8-rank alltoall：本卡 permute 后的 token 分成 (n-1)/n 外发到 peer +
-        1/n LOCAL 自留。通信只传输外发部分（实测 @558 top1 外发 746MB vs
-        LOCAL 805MB），LOCAL 是本地拷贝不占 HCCS 带宽。故 comm_size 取
-        permuted payload 的 (ep-1)/ep，不把 LOCAL 计入传输量。
+        Without dispatch quantization, every route carries the configured
+        activation dtype. With fused FP8 dispatch enabled, it instead carries
+        one FP8 hidden vector, one fp32 scale per 128 hidden elements, and
+        three 4-byte metadata fields. The mode is a model/runtime setting.
+
+        This property returns the logical per-rank tensor size. The levels
+        router applies the balanced EP peer fraction (ep-1)/ep exactly once;
+        local retention is a memory operation rather than network traffic.
         """
-        ep = max(1, self.strategy.ep_size)
-        local_share = (ep - 1) / ep if ep > 1 else 1
-        return (
-            self.permuted_act_size
-            * self.dtype_to_element_size[self.strategy.dtype]
-            * local_share
-        )
+        batch_size = self.input_info.tensors[0].size(0)
+        route_count = batch_size * self._per_rank_seq() * self.topk
+        hidden_size = self.input_info.tensors[0].size(2)
+        if getattr(self.strategy, 'mxx_moe_dispatch_quant', False):
+            scale_count = math.ceil(hidden_size / 128)
+            record_bytes = hidden_size + scale_count * 4 + 3 * 4
+        else:
+            record_bytes = (hidden_size
+                            * self.dtype_to_element_size[self.strategy.dtype])
+        return route_count * record_bytes
 
     def _pre_op(self):
         super()._pre_op()
@@ -507,32 +657,37 @@ class Permutation(MetaModule):
         return output_info
 
     def _comp_leaf_intra_net_info(self):
+        include_pre = self.stage_partition in ('all', 'pre_metadata')
+        include_post = self.stage_partition in ('all', 'post_metadata')
         if self.strategy.ep_size > 1:
             comm_size = self.dispatch_comm_size
-            # fwd
-            self._cost_info.fwd_net_time += self.system.compute_net_op_time(
-                "all2all",
-                comm_size,
-                comm_num=self.strategy.ep_size,
-                net=self.strategy.ep_net,
-                strategy=self.strategy,
-                group_kind="ep",
-                comm_stage="Dispatch_FWD_EP"
-            )
-        
-            # bwd
-            self._cost_info.bwd_grad_act_net_time += self.system.compute_net_op_time(
-                "all2all",
-                comm_size,
-                comm_num=self.strategy.ep_size,
-                net=self.strategy.ep_net,
-                strategy=self.strategy,
-                group_kind="ep",
-                comm_stage="Dispatch_BWD_EP"
-            )
+            main_a2a_op = ("alltoallv" if self.strategy.moe_variable_collectives
+                           else "all2all")
+            if include_post:
+                # fwd
+                self._cost_info.fwd_net_time += self.system.compute_net_op_time(
+                    main_a2a_op,
+                    comm_size,
+                    comm_num=self.strategy.ep_size,
+                    net=self.strategy.ep_net,
+                    strategy=self.strategy,
+                    group_kind="ep",
+                    comm_stage="Dispatch_FWD_EP"
+                )
+
+                # bwd
+                self._cost_info.bwd_grad_act_net_time += self.system.compute_net_op_time(
+                    main_a2a_op,
+                    comm_size,
+                    comm_num=self.strategy.ep_size,
+                    net=self.strategy.ep_net,
+                    strategy=self.strategy,
+                    group_kind="ep",
+                    comm_stage="Dispatch_BWD_EP"
+                )
 
             # HACK(sherry): all2all the router probs to expert, and fused combined probs to SiluOp in ExpertMLP, to avoid the activation_mem_cache in Unpermutaion
-            if self.strategy.dispatch_probs:
+            if include_post and self.strategy.dispatch_probs:
                 prob_comm_size = self.input_info.tensors[1].numel() * self.dtype_to_element_size[self.strategy.dtype]
                 self._cost_info.fwd_net_time += self.system.compute_net_op_time(
                     "all2all",
@@ -554,7 +709,25 @@ class Permutation(MetaModule):
                 )
             # HACK(sherry)
 
-        if self.strategy.etp_size > 1:
+            metadata_size = self.expert_num * 4
+            if include_pre:
+                self._cost_info.fwd_net_time += self.system.compute_net_op_time(
+                    "moe_small_a2a", metadata_size,
+                    comm_num=self.strategy.ep_size, net=self.strategy.ep_net,
+                    strategy=self.strategy, group_kind="ep",
+                    comm_stage="Dispatch_expert_counts_A2A")
+            # Each routed token carries expert id, destination offset and
+            # combine weight (two int32 fields + one fp32 field).
+            batch_size = self.input_info.tensors[0].size(0)
+            route_size = batch_size * self.topk * self._per_rank_seq() * (4 + 4 + 4)
+            if include_post:
+                self._cost_info.fwd_net_time += self.system.compute_net_op_time(
+                    "alltoallv", route_size,
+                    comm_num=self.strategy.ep_size, net=self.strategy.ep_net,
+                    strategy=self.strategy, group_kind="ep",
+                    comm_stage="Dispatch_route_fields_A2AV")
+
+        if include_post and self.strategy.etp_size > 1:
             comm_size = (
                 self.permuted_act_size
                 * self.dtype_to_element_size[self.strategy.dtype]
@@ -613,15 +786,16 @@ class Permutation(MetaModule):
             self.input_act_size + self.permuted_act_size
         ) * self.dtype_to_element_size[self.strategy.dtype] # fused: scatter
         permutate2_mem_accessed = (
-            self.permuted_act_size + self.permuted_act_size # drop_and_pad=True:transpose + contiuous memory(drop_and_pad), drop_and_pad=False:sort_chunks_by_idx
+            2 * self.permuted_act_size
+            * (1 + math.ceil(math.log2(max(1, self.local_expert_num))))
         ) * self.dtype_to_element_size[self.strategy.dtype]
 
-        self._compute_info.fwd_accessed_mem = (
-            permutate1_mem_accessed + permutate2_mem_accessed
-        )
-        self._compute_info.bwd_grad_act_accessed_mem = (
-            permutate1_mem_accessed + permutate2_mem_accessed
-        )
+        include_pre = self.stage_partition in ('all', 'pre_metadata')
+        include_post = self.stage_partition in ('all', 'post_metadata')
+        selected_mem = ((permutate1_mem_accessed if include_pre else 0)
+                        + (permutate2_mem_accessed if include_post else 0))
+        self._compute_info.fwd_accessed_mem = selected_mem
+        self._compute_info.bwd_grad_act_accessed_mem = selected_mem
         self._compute_info.bwd_grad_w_accessed_mem = 0
 
         self._compute_info.recompute_accessed_mem = (
@@ -638,7 +812,8 @@ class Permutation(MetaModule):
             self.input_act_size + self.permuted_act_size
         ) * self.dtype_to_element_size[self.strategy.dtype]
         permutate2_mem_accessed = (
-            self.permuted_act_size + self.permuted_act_size
+            2 * self.permuted_act_size
+            * (1 + math.ceil(math.log2(max(1, self.local_expert_num))))
         ) * self.dtype_to_element_size[self.strategy.dtype]
 
         def split_stage_time(op_name, mem_chunks):
@@ -652,17 +827,20 @@ class Permutation(MetaModule):
                 for mem_bytes in mem_chunks
             )
 
+        include_pre = self.stage_partition in ('all', 'pre_metadata')
+        include_post = self.stage_partition in ('all', 'post_metadata')
+        selected_chunks = []
+        if include_pre:
+            selected_chunks.append(permutate1_mem_accessed)
+        if include_post:
+            selected_chunks.append(permutate2_mem_accessed)
         self._cost_info.fwd_compute_time = split_stage_time(
-            "permute_fwd",
-            [permutate1_mem_accessed, permutate2_mem_accessed],
-        )
+            "permute_fwd", selected_chunks)
         self._cost_info.bwd_grad_act_time = split_stage_time(
-            "permute_bwd",
-            [permutate1_mem_accessed, permutate2_mem_accessed],
-        )
+            "permute_bwd", selected_chunks)
         self._cost_info.bwd_grad_w_time = 0
         self._cost_info.recompute_compute_time = (
-            self._cost_info.fwd_time if self.enable_recompute else 0
+            self._cost_info.fwd_compute_time if self.enable_recompute else 0
         )
 
 
@@ -717,6 +895,7 @@ class UnPermutation(MetaModule):
         #unpermutate1 before tp and ep all2all
         unpermutate1_mem_accessed = ( # none-fused: contiguous memory(drop_and_pad) or sort_chunks_by_idxs
             2 * self.act_size_before_combined
+            * (1 + math.ceil(math.log2(max(1, self.local_expert_num))))
         ) * self.dtype_to_element_size[self.strategy.dtype]
 
         fwd_mem_time = self.system.compute_mem_access_time(
@@ -760,31 +939,38 @@ class UnPermutation(MetaModule):
             comm_size = (
                 self.act_size_before_combined
                 * self.dtype_to_element_size[self.strategy.dtype]
-                * ((self.strategy.ep_size - 1) / self.strategy.ep_size)
             )
+            main_a2a_op = ("alltoallv" if self.strategy.moe_variable_collectives
+                           else "all2all")
+            main_a2a_cls = (alltoallv if self.strategy.moe_variable_collectives
+                            else all2all)
             cost = self.system.compute_net_op_time(
-                "all2all",
+                main_a2a_op,
                 comm_size,
                 comm_num=self.strategy.ep_size,
                 net=self.strategy.ep_net,
                 strategy=self.strategy,
                 group_kind="ep",
             )
-            self.layers.append(all2all(f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}",
+            self.layers.append(main_a2a_cls(f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}",
                                          rank_info['ep_rank'], self.strategy.ep_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank, net=self.strategy.ep_net, size_bytes=comm_size))
+                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank,
+                                         net=self.strategy.ep_net, size_bytes=comm_size,
+                                         group_kind="ep", comm_stage="Combine_EP"))
             state.comm_order += 1
-            # router-probs small a2a (measured 49×0.4MB bwd @ step9, 2/layer)
-            prob_size = self.topk * self._per_rank_seq() * self.dtype_to_element_size[self.strategy.dtype]
-            for pi in range(2):
-                prob_cost = self.system.compute_net_op_time(
-                    "moe_small_a2a", prob_size, self.strategy.ep_size,
-                    net=self.strategy.ep_net, strategy=self.strategy, group_kind="ep",
-                )
-                self.layers.append(all2all(f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}-prob{pi}",
-                                             rank_info['ep_rank'], self.strategy.ep_size, com_buff=com_buff,
-                                             fwd_cost=0, bwd_cost=prob_cost, global_rank=args.rank, net=self.strategy.ep_net, size_bytes=prob_size))
-                state.comm_order += 1
+            route_size = self.topk * self._per_rank_seq() * (4 + 4 + 4)
+            route_cost = self.system.compute_net_op_time(
+                "alltoallv", route_size, self.strategy.ep_size,
+                net=self.strategy.ep_net, strategy=self.strategy,
+                group_kind="ep", comm_stage="Combine_route_grad_A2AV")
+            self.layers.append(alltoallv(
+                f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}-route_grad",
+                rank_info['ep_rank'], self.strategy.ep_size,
+                com_buff=com_buff, fwd_cost=0, bwd_cost=route_cost,
+                global_rank=args.rank, net=self.strategy.ep_net,
+                size_bytes=route_size, group_kind="ep",
+                comm_stage="Combine_route_grad_A2AV"))
+            state.comm_order += 1
 
         #permutate2 and combine
         unpermutate2_and_combine_mem_accessed = (
@@ -889,11 +1075,12 @@ class UnPermutation(MetaModule):
             comm_size = (
                 self.act_size_before_combined
                 * self.dtype_to_element_size[self.strategy.dtype]
-                * ((self.strategy.ep_size - 1) / self.strategy.ep_size)
             )
+            main_a2a_op = ("alltoallv" if self.strategy.moe_variable_collectives
+                           else "all2all")
             # fwd
             self._cost_info.fwd_net_time += self.system.compute_net_op_time(
-                "all2all",
+                main_a2a_op,
                 comm_size,
                 comm_num=self.strategy.ep_size,
                 net=self.strategy.ep_net,
@@ -903,7 +1090,7 @@ class UnPermutation(MetaModule):
             )
             # bwd
             self._cost_info.bwd_grad_act_net_time += self.system.compute_net_op_time(
-                "all2all",
+                main_a2a_op,
                 comm_size,
                 comm_num=self.strategy.ep_size,
                 net=self.strategy.ep_net,
@@ -911,6 +1098,13 @@ class UnPermutation(MetaModule):
                 group_kind="ep",
                 comm_stage="Combine_BWD_EP"
             )
+            route_size = self.topk * self._per_rank_seq() * (4 + 4 + 4)
+            self._cost_info.bwd_grad_act_net_time += \
+                self.system.compute_net_op_time(
+                    "alltoallv", route_size,
+                    comm_num=self.strategy.ep_size, net=self.strategy.ep_net,
+                    strategy=self.strategy, group_kind="ep",
+                    comm_stage="Combine_route_grad_A2AV")
         if self.enable_recompute:
             self._cost_info.recompute_net_time = self._cost_info.fwd_net_time
 
@@ -961,6 +1155,7 @@ class UnPermutation(MetaModule):
         # pylint: disable=invalid-name
         permutate1_mem_accessed = ( # none-fused: contiguous memory(drop_and_pad) or sort_chunks_by_idxs
             2 * self.act_size_before_combined
+            * (1 + math.ceil(math.log2(max(1, self.local_expert_num))))
         ) * self.dtype_to_element_size[self.strategy.dtype]
         
         permutate2_and_combine_mem_accessed = ( # fused-op: combine permuted_features by probs and scatter_add
@@ -989,6 +1184,7 @@ class UnPermutation(MetaModule):
         # model includes a fixed launch latency per kernel.
         unpermutate1_mem_accessed = (
             2 * self.act_size_before_combined
+            * (1 + math.ceil(math.log2(max(1, self.local_expert_num))))
         ) * self.dtype_to_element_size[self.strategy.dtype]
         unpermutate2_and_combine_mem_accessed = (
             self.act_size_before_combined + self.act_size_after_combined
@@ -1036,8 +1232,10 @@ class GroupLinearCol(GroupLinearBase):
         system: SystemConfig,
         is_last_recompute: bool = False,
         use_variance_tail_model: bool = False,
+        specific_name: str = 'GroupLinearCol',
     ) -> None:
-        super().__init__(local_expert_num, input_size, output_size, strategy, system)
+        super().__init__(local_expert_num, input_size, output_size, strategy, system,
+                         specific_name)
         assert mode in ['parallel', 'serial']
         assert output_size % self.strategy.etp_size == 0
         self.layer_idx = layer_idx
@@ -1091,10 +1289,27 @@ class GroupLinearCol(GroupLinearBase):
     def prefill(self, args, call_stk='', com_buff=None):
         # tp comm is in Permuation
         self.call_stk = call_stk + self.call_stk
-        #linear
-        self.layers.append(AtomModel(fwd_cost=self._cost_info.fwd_compute_time,
-                                 bwd_cost=self._cost_info.bwd_grad_act_time+self._cost_info.bwd_grad_w_time,
-                                 specific_name='Linear'))
+        # SwiGLU gate/up projections are separate grouped GEMM launches, and
+        # the measured kernel stream splits each projection's backward into
+        # separate bwd_grad_act and bwd_grad_w kernels (bwd_act ~3.5x fwd,
+        # bwd_w ~1x fwd on the reference device). Emit them as distinct
+        # AtomModels so event count, per-kernel cost, and the serial chain
+        # match the measured kernel structure.
+        fwd = self._cost_info.fwd_compute_time / 2
+        bwd_act = self._cost_info.bwd_grad_act_time / 2
+        bwd_w = self._cost_info.bwd_grad_w_time / 2
+        for projection in ('Gate', 'Up'):
+            self.layers.append(AtomModel(
+                fwd_cost=fwd, bwd_cost=0.0,
+                specific_name=f'GroupGemmTraining_{projection}'))
+            self.layers.append(AtomModel(
+                fwd_cost=0.0, bwd_cost=bwd_act,
+                specific_name=f'GroupGemmTraining_{projection}_bwd_act',
+                skip_recompute=True))
+            self.layers.append(AtomModel(
+                fwd_cost=0.0, bwd_cost=bwd_w,
+                specific_name=f'GroupGemmTraining_{projection}_bwd_w',
+                skip_recompute=True))
         for layer in self.layers:
             layer.prefill(args, self.call_stk, com_buff)
 
@@ -1174,7 +1389,7 @@ class GroupLinearCol(GroupLinearBase):
             3 * self.dtype_to_element_size["fp32"] * weight_numel
         )
         
-        optimizer_group_size = self.strategy.edp_size
+        optimizer_group_size = self.strategy.fsdp_moe_group_size
         if self.strategy.zero_state >= 1:
             self._model_info.moe_state_bytes /= optimizer_group_size
         if self.strategy.zero_state >= 2:
@@ -1216,6 +1431,17 @@ class GroupLinearCol(GroupLinearBase):
             self._compute_info.fwd_accessed_mem if self.enable_recompute else 0
         )
 
+        # SwiGLU gate and up projections are two independent grouped GEMMs.
+        # They share the logical concatenated output but each reads the input;
+        # dX likewise materializes two partial gradients before accumulation.
+        # Account for that compulsory second input pass without using a
+        # profiler-derived efficiency multiplier.
+        self._compute_info.fwd_accessed_mem += input_size
+        self._compute_info.bwd_grad_act_accessed_mem += input_size
+        self._compute_info.bwd_grad_w_accessed_mem += input_size
+        if self.enable_recompute:
+            self._compute_info.recompute_accessed_mem += input_size
+
     def _comp_cost_info(self):
         if self.strategy.fp8:
             self._comp_cost_info_impl(
@@ -1225,12 +1451,46 @@ class GroupLinearCol(GroupLinearBase):
                 enable_recompute=self.enable_recompute,
             )
         else:
-            self._comp_cost_info_impl(
-                fwd_op="group_linear_col",
-                bwd_grad_act_op="group_linear_col",
-                bwd_grad_w_op="group_linear_col",
-                enable_recompute=self.enable_recompute,
-            )
+            token_num = int(self.input_info.tensors[0].size(0))
+            half_output = self.output_size // 2
+            assert self.output_size % 2 == 0, (
+                "SwiGLU grouped column output must split into gate/up halves")
+            avg_m = max(1, math.ceil(token_num / self.local_expert_num))
+            desc_base = (
+                f"ng={self.local_expert_num}, M={avg_m}, N={half_output}, "
+                f"K={self.input_size}, dtype={self.a_dtype}, "
+                f"out_dtype={self.strategy.dtype}")
+            half_flops = self._compute_info.fwd_flops / 2
+
+            input_bytes = token_num * self.input_size * self.a_element_size
+            weight_bytes = (self.local_expert_num * self.input_size
+                            * half_output * self.w_element_size)
+            output_bytes = token_num * half_output * self.element_size
+            fwd_mem = input_bytes + weight_bytes + output_bytes
+            bwd_act_mem = weight_bytes + output_bytes + input_bytes
+            bwd_w_mem = input_bytes + output_bytes + weight_bytes
+
+            def two_kernel_time(stage, mem_bytes, suffix):
+                class_key, path_key = self.get_cost_keys()
+                return sum(
+                    self.system.compute_op_accuracy_time(
+                        "group_linear_col", half_flops,
+                        shape_desc=(f"{desc_base}, stage={stage}, "
+                                    f"projection={projection}{suffix}"),
+                        accessed_mem=mem_bytes, stage=stage,
+                        class_key=class_key, path_key=path_key)
+                    for projection in ("gate", "up")
+                )
+
+            self._cost_info.fwd_compute_time = two_kernel_time(
+                "fwd", fwd_mem, ", accumulate=False")
+            self._cost_info.bwd_grad_act_time = two_kernel_time(
+                "bwd_grad_act", bwd_act_mem, ", accumulate=True")
+            self._cost_info.bwd_grad_w_time = two_kernel_time(
+                "bwd_grad_w", bwd_w_mem, ", accumulate=True")
+            self._cost_info.recompute_compute_time = (
+                self._cost_info.fwd_compute_time
+                if self.enable_recompute else 0)
 
 
     def extra_repr(self) -> str:
@@ -1260,8 +1520,10 @@ class GroupLinearRow(GroupLinearBase):
         system: SystemConfig,
         is_last_recompute: bool = False,
         use_variance_tail_model: bool = False,
+        specific_name: str = 'GroupLinearRow',
     ) -> None:
-        super().__init__(local_expert_num, input_size, output_size, strategy, system)
+        super().__init__(local_expert_num, input_size, output_size, strategy, system,
+                         specific_name)
         assert mode in ['parallel', 'serial']
         assert input_size % self.strategy.etp_size == 0
         self.layer_idx = layer_idx
@@ -1324,10 +1586,21 @@ class GroupLinearRow(GroupLinearBase):
     def prefill(self, args, call_stk='', com_buff=None):
         # tp comm is in UnPermuation
         self.call_stk = call_stk + self.call_stk
-        #linear
-        self.layers.append(AtomModel(fwd_cost=self._cost_info.fwd_compute_time,
-                                 bwd_cost=self._cost_info.bwd_grad_act_time+self._cost_info.bwd_grad_w_time,
-                                 specific_name='Linear'))
+        # The measured kernel stream splits the row backward into separate
+        # bwd_grad_act and bwd_grad_w kernels; emit them as distinct
+        # AtomModels (bwd_act ~3.5x fwd, bwd_w ~1x fwd on the reference
+        # device) so event count and per-kernel cost match the target.
+        self.layers.append(AtomModel(
+            fwd_cost=self._cost_info.fwd_compute_time, bwd_cost=0.0,
+            specific_name='GroupGemmTraining_Down'))
+        self.layers.append(AtomModel(
+            fwd_cost=0.0, bwd_cost=self._cost_info.bwd_grad_act_time,
+            specific_name='GroupGemmTraining_Down_bwd_act',
+            skip_recompute=True))
+        self.layers.append(AtomModel(
+            fwd_cost=0.0, bwd_cost=self._cost_info.bwd_grad_w_time,
+            specific_name='GroupGemmTraining_Down_bwd_w',
+            skip_recompute=True))
         for layer in self.layers:
             layer.prefill(args, self.call_stk, com_buff)
 
@@ -1405,7 +1678,7 @@ class GroupLinearRow(GroupLinearBase):
             3 * self.dtype_to_element_size["fp32"] * weight_numel
         )
         
-        optimizer_group_size = self.strategy.edp_size
+        optimizer_group_size = self.strategy.fsdp_moe_group_size
         if self.strategy.zero_state >= 1:
             self._model_info.moe_state_bytes /= optimizer_group_size
         if self.strategy.zero_state >= 2:
@@ -1564,6 +1837,7 @@ class ExpertMLP(MetaModule):
                  mlp_recompute:MLPRecomputeConfig,
                  strategy:StrategyConfig, 
                  system:SystemConfig, 
+                 router_preparation=None,
                  specific_name='') -> None:
         super().__init__(strategy, system, specific_name)
         self.layer_idx = layer_idx
@@ -1613,8 +1887,30 @@ class ExpertMLP(MetaModule):
                 use_variance_tail_model=mlp_recompute.megatron_layernorm,
                 strategy=strategy,
                 system=system,
+                specific_name='MoERouter',
             )
-        self.permutation = Permutation(
+        # Optional model-specific implementation stages for the router path.
+        #
+        # The implementation has a real dependency edge at the metadata
+        # exchange: local histogram/prefix work produces the metadata payload,
+        # ``Permutation`` exchanges that payload, and only then can the
+        # inverse/gate and route-index stages consume the received metadata.
+        # Keep the two partitions as separate children so the DES preserves
+        # that edge in its event order. ``router_preparation`` remains an
+        # accepted single-module input for callers that do not need the split.
+        if isinstance(router_preparation, (tuple, list)):
+            if len(router_preparation) != 2:
+                raise ValueError(
+                    "router_preparation tuple must contain (pre_metadata, post_metadata)"
+                )
+            self.router_preparation_pre = router_preparation[0]
+            self.router_preparation_post = router_preparation[1]
+        else:
+            self.router_preparation_pre = router_preparation
+            self.router_preparation_post = None
+        # Backward-compatible alias for code that introspects the old field.
+        self.router_preparation = self.router_preparation_pre
+        permutation_kwargs = dict(
                 layer_idx=layer_idx,
                 expert_num=self.expert_num,
                 local_expert_num=self.local_expert_num,
@@ -1627,6 +1923,15 @@ class ExpertMLP(MetaModule):
                 strategy=strategy,
                 system=system,
             )
+        # Keep the metadata exchange and activation dispatch as separate
+        # children. This lets the router post-metadata stages sit between the
+        # fixed metadata all-to-all and the variable activation all-to-all-v.
+        self.permutation_pre = Permutation(
+            **permutation_kwargs, stage_partition='pre_metadata')
+        self.permutation_post = Permutation(
+            **permutation_kwargs, stage_partition='post_metadata')
+        # Backward-compatible alias for callers that inspect ``permutation``.
+        self.permutation = self.permutation_pre
         self.group_linear1 = GroupLinearCol_(
                 layer_idx=layer_idx,
                 input_size=self.config.hidden_size,
@@ -1638,6 +1943,7 @@ class ExpertMLP(MetaModule):
                 mode=self.config.group_linear_mode,
                 strategy=strategy,
                 system=system,
+                specific_name='MoEGroupGemmGateUp',
             )
         if self.strategy.fp8:
             # fp8
@@ -1678,6 +1984,7 @@ class ExpertMLP(MetaModule):
                 use_bias=False,
                 strategy=strategy,
                 system=system,
+                specific_name='MoEGroupGemmDown',
             )
         self.unpermutation = UnPermutation(
                 layer_idx=layer_idx,
@@ -1727,19 +2034,42 @@ class ExpertMLP(MetaModule):
         if self.shared_expert:
             shared_out = self.shared_expert(input_info, path_debug_context)
         probs = self.router(input_info, path_debug_context) # add router scores
+        if self.router_preparation_pre is not None:
+            self.router_preparation_pre(
+                Input(tensors=[input_info.tensors[0], probs.tensors[0]]),
+                path_debug_context)
 
         if self.strategy.dispatch_probs:
-            permute_hidden_states = self.permutation(Input(tensors=[input_info.tensors[0], 
-                                                                              probs.tensors[0]]),
-                                                    path_debug_context) 
+            self.permutation_pre(
+                Input(tensors=[input_info.tensors[0], probs.tensors[0]]),
+                path_debug_context)
+            if self.router_preparation_post is not None:
+                self.router_preparation_post(
+                    Input(tensors=[input_info.tensors[0], probs.tensors[0]]),
+                    path_debug_context)
+            # The pre-partition's materialized buffer is an internal 2-D
+            # route layout.  The post-partition models the remaining route
+            # stages and returns the expert-shaped logical tensor, so keep the
+            # public shape carrier at the original [B, S, H] boundary.
+            permute_hidden_states = self.permutation_post(
+                Input(tensors=[input_info.tensors[0], probs.tensors[0]]),
+                path_debug_context)
             grou1_out = self.group_linear1(permute_hidden_states, path_debug_context)
             act_out = self.expert_activation_layer(Input(tensors=[grou1_out.tensors[0], probs.tensors[0]]), path_debug_context)
             group2_out = self.group_linear2(act_out, path_debug_context)
             out = self.unpermutation(group2_out, path_debug_context)
 
         else:
-            permute_hidden_states = self.permutation(Input(tensors=[input_info.tensors[0], 
-                                                                probs.tensors[0]]),path_debug_context) # pass probs to Permutation to cache.
+            self.permutation_pre(
+                Input(tensors=[input_info.tensors[0], probs.tensors[0]]),
+                path_debug_context)
+            if self.router_preparation_post is not None:
+                self.router_preparation_post(
+                    Input(tensors=[input_info.tensors[0], probs.tensors[0]]),
+                    path_debug_context)
+            permute_hidden_states = self.permutation_post(
+                Input(tensors=[input_info.tensors[0], probs.tensors[0]]),
+                path_debug_context)
             grou1_out = self.group_linear1(permute_hidden_states, path_debug_context)
             act_out = self.expert_activation_layer(grou1_out, path_debug_context)
             group2_out = self.group_linear2(act_out, path_debug_context)

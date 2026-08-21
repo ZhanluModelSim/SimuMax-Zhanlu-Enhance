@@ -6,6 +6,7 @@ import math
 import os
 import time
 import pickle
+import json
 from types import SimpleNamespace
 
 from simumax.core.base_struct import (
@@ -249,8 +250,8 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
                     fsdp_mode = getattr(perf_model.strategy, 'fsdp_mode', 'model-wise')
                     reshard = getattr(perf_model.strategy, 'reshard_after_forward', True)
                     prefetch = getattr(perf_model.strategy, 'fsdp_prefetch_layers', 1)
-                    dp_gs = perf_model.strategy.dp_size * perf_model.strategy.cp_size
-                    edp_gs = perf_model.strategy.edp_size
+                    dp_gs = perf_model.strategy.fsdp_dense_group_size
+                    edp_gs = perf_model.strategy.fsdp_moe_group_size
                     mi = stage_models[0].get_model_info()
                     if fsdp_mode == 'layer-wise' and reshard:
                         layer_num = getattr(stage_models[0], 'layer_num', 1)
@@ -301,21 +302,9 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
                 print(f"[DES] { {k:round(v,3) for k,v in th.t.items()} }", flush=True)
         return simu, ctx
 
-    # ── 第一遍：无暴露率（全掩盖）跑一遍，从 lane 时钟读 C/S/F ──
-    # comp lane = 计算 + a2a + sync（fsdp 不推 comp，单位 ms）；
-    # F = fsdp 通信 dur 累计（从事件聚合，单位 s）。
-    simu1, ctx1 = _run_des(None)
-    comp_end = max(th.t["comp"] for th in simu1.threads) / 1e3  # ms -> s
-    s_serial = _serial_comm_dur(ctx1.event_sink.events)
-    F = _fsdp_dur(ctx1.event_sink.events)
-    C = comp_end - s_serial
-    alpha_cover = getattr(perf_model.system, "fsdp_overlap_coefficient", 1.0)
-    exposure = _solve_fsdp_exposure(C, s_serial, F, alpha_cover)
-    print(f"[fsdp exposure] C={C:.3f}s S(serial)={s_serial:.3f}s F={F:.3f}s "
-          f"exposure={exposure:.3f} (T≈{C + s_serial + F * exposure:.2f}s)")
-
-    # ── 第二遍：应用暴露率，输出最终 trace ──
-    simu, ctx = _run_des(exposure)
+    # One structural DES pass. Explicit async post/wait edges, prefetch
+    # distance, and max-inflight limits determine communication exposure.
+    simu, ctx = _run_des(None)
 
     print("wall time", time.time() - t0)
 
@@ -334,3 +323,14 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
         print(f"FSDP summary: comm={t['total_comm_time']:.1f}us "
               f"exposed={t['exposed_time']:.1f}us "
               f"overlap={t['overlap_percentage']:.1f}%")
+
+    # DES wall-clock duration = max clock over every thread and resource lane.
+    # Communication exposure comes from graph dependencies in the single pass.
+    des_wall_ms = max(max(th.t.values()) for th in simu.threads)
+    des_summary = {"duration_time_per_iter_ms": des_wall_ms}
+    des_summary_path = os.path.join(save_path, "des_summary.json")
+    with open(des_summary_path, "w", encoding="utf-8") as f:
+        json.dump(des_summary, f, indent=2)
+    print(f"[DES] aligned wall-clock = {des_wall_ms / 1e3:.4f} s "
+          f"-> {des_summary_path}")
+    return des_summary

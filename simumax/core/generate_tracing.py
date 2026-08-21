@@ -1,6 +1,7 @@
 import json
 import re
 import heapq
+import os
 
 from simumax.core.simu_events import event_to_record
 
@@ -261,11 +262,16 @@ def convert_to_tracing_format(parsed_logs):
         elif stream_type == "fused":
             # Each fused slice renders on the resource lane it occupies.
             lane = log.get("stream") or "comp"
+        elif stream_type == "runtime":
+            # Runtime transfers (currently activation offload) carry an
+            # explicit resource lane.  Keep it visible in Chrome trace rather
+            # than collapsing every runtime event into a generic compute lane.
+            lane = log.get("lane") or log.get("stream") or "runtime"
         else:
             lane = stream_type
         if stream_type == "wait":
             tid = "wait"
-        elif stream_type in ("comm", "fused"):
+        elif stream_type in ("comm", "fused", "runtime"):
             tid = lane
         elif stream_type == "scope" and base_name.startswith("batch_pp"):
             tid = "pp_batch_scope"
@@ -313,6 +319,24 @@ def convert_to_tracing_format(parsed_logs):
                     "gid": gid,
                     "correlation_id": corr_id,
                     "base_name": base_name,
+                    "owner_path": log.get("owner_path"),
+                    "semantic_id": log.get("semantic_id"),
+                    "phase_id": log.get("phase_id"),
+                    "scope": log.get("scope"),
+                    # Portable semantic ledger fields.  These are derived
+                    # from the model call stack and communication object
+                    # metadata; they do not contain measured timings or
+                    # fitted alpha/beta values.
+                    "semantic_stage": log.get("semantic_stage"),
+                    "layer_idx": log.get("layer_idx"),
+                    "stage_role": log.get("stage_role"),
+                    "comm_owner": log.get("comm_owner"),
+                    "comm_role": log.get("comm_role"),
+                    "group_kind": log.get("group_kind"),
+                    "group_size": log.get("group_size"),
+                    "payload_bytes": log.get("payload_bytes", log.get("size_bytes")),
+                    "net": log.get("net"),
+                    "comm_stage": log.get("comm_stage"),
                     "post_ts": (log.get("post") * 1e3) if log.get("post") is not None else None,
                     "post_order": log.get("order"),
                 },
@@ -560,6 +584,46 @@ def write_trace_file(events, output_json_path):
     tracing_events = convert_to_tracing_format(records)
     with open(output_json_path, "w", encoding="utf-8") as f:
         json.dump(tracing_events, f, indent=4)
+    # Keep a machine-readable semantic ledger next to the Chrome trace.  The
+    # ledger is intentionally derived from the model event stream only; it is
+    # not a calibration table and contains no measured trace values.
+    ledger_path = os.path.join(
+        os.path.dirname(os.fspath(output_json_path)),
+        "semantic_event_ledger.json",
+    )
+    ledger_events = []
+    for index, record in enumerate(records):
+        ledger_events.append({
+            "event_index": index,
+            "rank": record.get("rank"),
+            "name": record.get("name"),
+            "call_stack": record.get("call_stack"),
+            "operation": record.get("operation"),
+            "kind": record.get("kind"),
+            "lane": record.get("lane"),
+            "st_ms": record.get("st"),
+            "ed_ms": record.get("ed"),
+            "cost_ms": record.get("cost"),
+            "gid": record.get("gid"),
+            "semantic_stage": record.get("semantic_stage"),
+            "layer_idx": record.get("layer_idx"),
+            "stage_role": record.get("stage_role"),
+            "scope": record.get("scope"),
+            "comm_owner": record.get("comm_owner"),
+            "comm_role": record.get("comm_role"),
+            "group_kind": record.get("group_kind"),
+            "group_size": record.get("group_size"),
+            "payload_bytes": record.get("payload_bytes"),
+            "net": record.get("net"),
+            "comm_stage": record.get("comm_stage"),
+        })
+    with open(ledger_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "schema": "simumax_semantic_event_ledger_v1",
+            "source": "model_structure_and_configuration",
+            "measured_data_used_as_parameters": False,
+            "events": ledger_events,
+        }, f, indent=2)
     print(f"Processed {len(records)} logs. Saved to {output_json_path}.")
 
 

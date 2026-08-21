@@ -13,7 +13,7 @@ from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig, Atten
 from simumax.core.utils import format_model_info_microbatch_tag, get_rank_group
 import simumax.core.transformer.simu_ops as simu_ops
 from simumax.core.transformer.function import ConcatFunction,SplitFunction
-from simumax.core.transformer.swa_module import SWACoreAttention
+from simumax.core.transformer.swa_module import SWACoreAttention, swa_causal_mask_area
 from simumax.core.transformer.quant_module import (
     AttnGateQuantModule, RMSNormQuantModule,
     FusedNormRoPEQuantStoreModule,
@@ -162,7 +162,7 @@ class Embedding(MetaModule):
             3 * self.dtype_to_element_size["fp32"] * weight_numel
         )
         
-        optimizer_group_size = self.strategy.dp_size * self.strategy.cp_size
+        optimizer_group_size = self.strategy.fsdp_dense_group_size
         if self.strategy.zero_state >= 1:
             self._model_info.dense_state_bytes /= optimizer_group_size
         if self.strategy.zero_state >= 2:
@@ -308,10 +308,18 @@ class LinearCol(LinearBase):
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
                                          fwd_cost=0, bwd_cost=cost, global_rank=args.rank, net=self.strategy.tp_net, size_bytes=comm_size))
             state.comm_order += 1
-        #linear
+        # Keep the default public event name ``Linear`` for generic modules,
+        # but preserve an explicit graph role (QKVProjection, LMHeadProjection,
+        # etc.) when the MXX model supplies one.  The role is structural
+        # metadata; the cost and scheduling formulas are unchanged.
+        linear_event_name = (
+            self.specific_name
+            if self.specific_name not in ('', 'ColumnParallelLinear')
+            else 'Linear'
+        )
         self.layers.append(AtomModel(fwd_cost=self._cost_info.fwd_compute_time,
                                  bwd_cost=self._cost_info.bwd_grad_act_time+self._cost_info.bwd_grad_w_time,
-                                 specific_name='Linear'))
+                                 specific_name=linear_event_name))
         
         if self.strategy.enable_sequence_parallel and self.strategy.tp_size > 1:
             comm_size = comm_size = (
@@ -493,7 +501,7 @@ class LinearCol(LinearBase):
         self._model_info.dense_state_bytes = (
             3 * self.dtype_to_element_size["fp32"] * weight_numel # w/m/v
         )
-        optimizer_group_size = self.strategy.dp_size * self.strategy.cp_size
+        optimizer_group_size = self.strategy.fsdp_dense_group_size
         if self.strategy.zero_state >= 1:
             self._model_info.dense_state_bytes /= optimizer_group_size
         if self.strategy.zero_state >= 2:
@@ -603,9 +611,14 @@ class LinearRow(LinearBase):
         model_info = f"{format_model_info_microbatch_tag(args)}-layer:{self.layer_idx}-name:{self.__class__.__name__}"
         state = args.thread_state
         rank_info = get_rank_group(args.rank, self.strategy)
+        linear_event_name = (
+            self.specific_name
+            if self.specific_name not in ('', 'RowParallelLinear')
+            else 'Linear'
+        )
         self.layers.append(AtomModel(fwd_cost=self._cost_info.fwd_compute_time,
                             bwd_cost=self._cost_info.bwd_grad_act_time+self._cost_info.bwd_grad_w_time,
-                            specific_name='Linear'))
+                            specific_name=linear_event_name))
 
         if self.strategy.enable_sequence_parallel and self.strategy.tp_size > 1:
             comm_size = (
@@ -781,7 +794,7 @@ class LinearRow(LinearBase):
         self._model_info.dense_state_bytes = (
             3 * self.dtype_to_element_size["fp32"] * weight_numel
         )
-        optimizer_group_size = self.strategy.dp_size * self.strategy.cp_size
+        optimizer_group_size = self.strategy.fsdp_dense_group_size
         if self.strategy.zero_state >= 1:
             self._model_info.dense_state_bytes /= optimizer_group_size
         if self.strategy.zero_state >= 2:
@@ -853,8 +866,9 @@ class LayerNorm(MetaModule):
         enable_recompute: bool,
         strategy: StrategyConfig,
         system: SystemConfig,
+        specific_name: str = "LayerNorm",
     ) -> None:
-        super().__init__(strategy, system)
+        super().__init__(strategy, system, specific_name)
         assert norm_type in ["rms_norm"]
         self.norm_size = norm_size
         self.norm_type = norm_type
@@ -864,8 +878,11 @@ class LayerNorm(MetaModule):
 
     def prefill(self, args, call_stk='', com_buff=None):
         self.call_stk = call_stk + self.call_stk
-        self.layers.append(AtomModel(fwd_cost=self._cost_info.fwd_compute_time,
-                                 bwd_cost=self._cost_info.bwd_grad_act_time+self._cost_info.bwd_grad_w_time))
+        self.layers.append(AtomModel(
+            fwd_cost=self._cost_info.fwd_compute_time,
+            bwd_cost=self._cost_info.bwd_grad_act_time + self._cost_info.bwd_grad_w_time,
+            specific_name=self.specific_name,
+        ))
         for layer in self.layers:
             layer.prefill(args, self.call_stk, com_buff=com_buff)
 
@@ -977,7 +994,7 @@ class LayerNorm(MetaModule):
         self._model_info.dense_state_bytes = (
             3 * self.dtype_to_element_size["fp32"] * weight_numel
         )
-        optimizer_group_size = self.strategy.dp_size * self.strategy.cp_size
+        optimizer_group_size = self.strategy.fsdp_dense_group_size
         if self.strategy.zero_state >= 1:
             self._model_info.dense_state_bytes /= optimizer_group_size
         if self.strategy.zero_state >= 2:
@@ -1000,8 +1017,18 @@ class LayerNorm(MetaModule):
         output_size = self.micro_output_grad_size * self.element_size
         rstd_size = self.micro_hidden_state_size / self.norm_size * self.element_size
         if self.use_fused_norm:
-            # FWD
-            self._compute_info.fwd_accessed_mem = input_size + weight_size + output_size
+            # Fused RMSNorm still has two logical passes over x: reduction,
+            # then normalize/scale. The per-row inverse-RMS is FP32. Its
+            # physical store is rounded to one hardware memory transaction per
+            # row because each row is produced independently by the reduction
+            # path. These are algorithm/transaction facts, not fitted traffic.
+            rows = self.micro_hidden_state_size // self.norm_size
+            transaction = max(1, int(
+                ((self.system.forward_derivation or {}).get("compute", {})
+                 .get("memory_transaction_bytes", 256))))
+            rstd_physical = rows * transaction
+            self._compute_info.fwd_accessed_mem = (
+                2 * input_size + weight_size + output_size + rstd_physical)
             # 3 kernels (dx grad, dw partial grad, dw reduce-sum)
             # BWD gamma
             self._compute_info.bwd_grad_w_accessed_mem = (
@@ -1009,7 +1036,7 @@ class LayerNorm(MetaModule):
             )
             # BWD act
             self._compute_info.bwd_grad_act_accessed_mem = (
-                input_size + weight_size + output_size + rstd_size
+                2 * input_size + weight_size + output_size + rstd_physical
             )
         else:
             weight_size = self.norm_size * self.element_size
@@ -1422,6 +1449,8 @@ class CoreAttention(MetaModule):
 
 
     def _comp_leaf_intra_net_info(self):
+        if self._skip_cp_a2a:
+            return
         if self.strategy.cp_size > 1:
             batch_size = self.input_info.tensors[0].size(0)
             seq_len = self.input_info.tensors[0].size(1)
@@ -1625,9 +1654,12 @@ class CoreAttention(MetaModule):
         # only global_tokens positions instead of the full sequence.
         attn_tokens = getattr(self, '_fa_global_tokens', None)
         if attn_tokens is not None:
+            # op_define GQA causal=True: use causal mask area, not rectangular S*g.
+            # Consistent with SWA (swa_module.py:173). Source: op_define L460-470.
+            causal_area = swa_causal_mask_area(int(seq_len), 0, int(attn_tokens))
             base_flops = (
-                2 * batch_size * head_num * self.head_size * seq_len * attn_tokens
-            )  # sparse: S * g
+                2 * batch_size * head_num * self.head_size * causal_area
+            )  # sparse causal: swa_causal_mask_area(S, 0, g)
         else:
             base_flops = (
                 2 * batch_size * head_num * self.head_size * seq_len * seq_len
@@ -1647,9 +1679,10 @@ class CoreAttention(MetaModule):
     def _comp_leaf_mem_accessed_info(self):
         """Memory access per op_define.md MojoPagedPrefillGQAOp (L522-535).
 
-        Training (KV_LEN=0): Q is bf16, K/V are read from int8 cache,
-        output is bf16, LSE is fp32.  FA attends to _fa_global_tokens (window)
-        K/V positions; SWA (CoreAttention sub-class) is handled in swa_module.py.
+        Training: Q/K/V and output are bf16; LSE/reductions are fp32. FA
+        attends to _fa_global_tokens K/V positions. Quantized paged KV cache
+        belongs to the inference MojoPagedPrefill contract and is deliberately
+        excluded from this training cost path.
 
         CP: applies trunk_cp_divisor to seq_len (same as _comp_leaf_flops_info),
         so FA operates on attn_seq = input_seq // td per rank.
@@ -1664,9 +1697,9 @@ class CoreAttention(MetaModule):
         # FA window: each query token attends to only attn_tokens positions.
         attn_tokens = getattr(self, '_fa_global_tokens', seq_len)
 
-        # Q / output: bf16 (2 B)   K / V: int8 cache (1 B)   LSE: fp32 (4 B)
+        # Training tensors Q/K/V/output are bf16; LSE is fp32.
         q_elem = self.dtype_to_element_size['bf16']   # 2
-        kv_elem = self.dtype_to_element_size['fp8']   # 1  (int8)
+        kv_elem = self.dtype_to_element_size['bf16']  # 2
         o_elem = self.dtype_to_element_size['bf16']   # 2
         lse_elem = self.dtype_to_element_size['fp32'] # 4
 
@@ -2022,8 +2055,20 @@ class Swiglu(MetaModule):
 
     def prefill(self, args, call_stk='', com_buff=None):
         self.call_stk = call_stk + self.call_stk
-        self.layers.append(AtomModel(fwd_cost=self._cost_info.fwd_compute_time,
-                                 bwd_cost=self._cost_info.bwd_grad_act_time+self._cost_info.bwd_grad_w_time))
+        weighted_fwd = getattr(self, "_weighted_mul_fwd_time", 0.0)
+        self.layers.append(AtomModel(
+                                 fwd_cost=self._cost_info.fwd_compute_time - weighted_fwd,
+                                 bwd_cost=self._cost_info.bwd_grad_act_time+self._cost_info.bwd_grad_w_time,
+                                 recompute_cost=(
+                                     self._cost_info.recompute_compute_time - weighted_fwd
+                                     if self.enable_recompute else 0),
+                                 specific_name='SwishGluForward'))
+        if weighted_fwd:
+            self.layers.append(AtomModel(
+                fwd_cost=weighted_fwd,
+                bwd_cost=0,
+                recompute_cost=weighted_fwd if self.enable_recompute else 0,
+                specific_name='SwigluWeightMul'))
         for layer in self.layers:
             layer.prefill(args, self.call_stk, com_buff=com_buff)
 
@@ -2139,6 +2184,25 @@ class Swiglu(MetaModule):
             bwd_grad_w_op="swiglu",
             enable_recompute=self.enable_recompute,
         )
+        self._weighted_mul_fwd_time = 0.0
+        if self.is_weighted_silu:
+            output_bytes = self.micro_output_grad_size * self.element_size
+            probability_bytes = (
+                self.input_info.tensors[1].numel()
+                * self.dtype_to_element_size[self.strategy.dtype])
+            _, path_key = self.get_cost_keys()
+            self._weighted_mul_fwd_time = self.system.compute_layout_time(
+                "swiglu_weight_mul",
+                input_bytes=output_bytes + probability_bytes,
+                output_bytes=output_bytes,
+                stage="fwd",
+                path_key=path_key,
+                shape_desc=(f"output_bytes={output_bytes}, "
+                            f"probability_bytes={probability_bytes}"),
+            )
+            self._cost_info.fwd_compute_time += self._weighted_mul_fwd_time
+            if self.enable_recompute:
+                self._cost_info.recompute_compute_time += self._weighted_mul_fwd_time
 
     def extra_repr(self) -> str:
         repr_info = f"is_fused={self.is_fused},enable_recompute={self.enable_recompute}"

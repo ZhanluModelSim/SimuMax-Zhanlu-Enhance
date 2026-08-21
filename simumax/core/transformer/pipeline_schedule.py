@@ -45,6 +45,20 @@ class OptimizerSimulator(MetaModule):
         comm_info = self.perf_model._compute_dp_time(self.model_name)
         opt_info = self.perf_model._compute_optim_time(self.model_name)
 
+        def optimizer_atoms():
+            atoms = [
+                AtomModel(
+                    fwd_cost=step['cost_ms'], bwd_cost=0,
+                    specific_name=step['name'])
+                for step in opt_info.get('orthogonal_optimizer_steps', [])
+            ]
+            atoms.append(AtomModel(
+                fwd_cost=(
+                    opt_info.get('adam_time', 0)
+                    + opt_info.get('optimizer_pass_time', 0)),
+                bwd_cost=0, specific_name='optimizer_step'))
+            return atoms
+
         # Model-wise FSDP (zero_state >= 3 and fsdp_mode == "model-wise"):
         # the unshard (all-gather params) block runs BEFORE the PP forward, and
         # the reshard (reduce-scatter grads) + optim_step block runs AFTER the
@@ -61,14 +75,14 @@ class OptimizerSimulator(MetaModule):
             cost_dense_ag = cost_dense['details']['all_gather_time']
             ag_dense = all_gather(
                 f"{state.comm_order}-dp_cp_group:{rank_info['dp_cp_group_id']}",
-                rank_info['dp_cp_rank'], self.strategy.dp_size * self.strategy.cp_size,
+                rank_info['dp_cp_rank'], self.strategy.fsdp_dense_group_size,
                 com_buff=com_buff, fwd_cost=cost_dense_ag, global_rank=args.rank,
                 net=self._fsdp_net_resolved, size_bytes=cost_dense['dp_comm_ag_size'])
             state.comm_order += 1
             cost_moe_ag = cost_moe['details']['all_gather_time']
             ag_moe = all_gather(
                 f"{state.comm_order}-edp_group:{rank_info['edp_group_id']}",
-                rank_info['edp_rank'], self.strategy.edp_size, com_buff=com_buff,
+                rank_info['edp_rank'], self.strategy.fsdp_moe_group_size, com_buff=com_buff,
                 fwd_cost=cost_moe_ag, global_rank=args.rank, net=self._fsdp_moe_net_resolved,
                 size_bytes=cost_moe['dp_comm_ag_size'])
             state.comm_order += 1
@@ -79,24 +93,22 @@ class OptimizerSimulator(MetaModule):
             cost_dense_rs = cost_dense['details']['reduce_scatter_time']
             rs_dense = reduce_scatter(
                 f"{state.comm_order}-dp_cp_group:{rank_info['dp_cp_group_id']}",
-                rank_info['dp_cp_rank'], self.strategy.dp_size * self.strategy.cp_size,
+                rank_info['dp_cp_rank'], self.strategy.fsdp_dense_group_size,
                 com_buff=com_buff, fwd_cost=cost_dense_rs, global_rank=args.rank,
                 net=self._fsdp_net_resolved)
             state.comm_order += 1
             cost_moe_rs = cost_moe['details']['reduce_scatter_time']
             rs_moe = reduce_scatter(
                 f"{state.comm_order}-edp_group:{rank_info['edp_group_id']}",
-                rank_info['edp_rank'], self.strategy.edp_size, com_buff=com_buff,
+                rank_info['edp_rank'], self.strategy.fsdp_moe_group_size, com_buff=com_buff,
                 fwd_cost=cost_moe_rs, global_rank=args.rank, net=self._fsdp_moe_net_resolved)
             state.comm_order += 1
             barrier = all_reduce(
                 f"default_group-pp_size:{self.strategy.pp_size}",
                 args.rank, self.strategy.world_size, com_buff=com_buff,
                 fwd_cost=1, global_rank=args.rank)
-            optim_step = AtomModel(
-                fwd_cost=opt_info['optim_time'], bwd_cost=0,
-                specific_name='optimizer_step')
-            self._reshard_step_layers = [rs_dense, rs_moe, barrier, optim_step]
+            self._reshard_step_layers = [
+                rs_dense, rs_moe, barrier, *optimizer_atoms()]
             for layer in self._unshard_layers + self._reshard_step_layers:
                 layer.prefill(args, self.call_stk, com_buff=com_buff)
             return
@@ -119,10 +131,7 @@ class OptimizerSimulator(MetaModule):
             rs_ops = state.fsdp_rs_ops
             rs_wait = async_wait_collective(
                 rs_ops, call_stk=f"{self.call_stk}-fsdp_rs_complete")
-            optim_step = AtomModel(
-                fwd_cost=opt_info['optim_time'], bwd_cost=0,
-                specific_name='optimizer_step')
-            self._step_only_layers = [rs_wait, optim_step]
+            self._step_only_layers = [rs_wait, *optimizer_atoms()]
             for layer in self._step_only_layers:
                 layer.prefill(args, self.call_stk, com_buff=com_buff)
             return
@@ -133,13 +142,13 @@ class OptimizerSimulator(MetaModule):
             
             cost_dense_rs =  cost_dense['details']['reduce_scatter_time']
             self.layers.append(reduce_scatter(f"{state.comm_order}-dp_cp_group:{rank_info['dp_cp_group_id']}", 
-                                rank_info['dp_cp_rank'], self.strategy.dp_size * self.strategy.cp_size,  com_buff=com_buff,
+                                rank_info['dp_cp_rank'], self.strategy.fsdp_dense_group_size,  com_buff=com_buff,
                                 fwd_cost=cost_dense_rs, global_rank=args.rank, net=self.strategy.dp_net))
             state.comm_order += 1
             
             cost_moe_rs =  cost_moe['details']['reduce_scatter_time']
             self.layers.append(reduce_scatter(f"{state.comm_order}-edp_group:{rank_info['edp_group_id']}", 
-                                rank_info['edp_rank'], self.strategy.edp_size,  com_buff=com_buff,
+                                rank_info['edp_rank'], self.strategy.fsdp_moe_group_size,  com_buff=com_buff,
                                 fwd_cost=cost_moe_rs, global_rank=args.rank, net=self.strategy.edp_net))
             state.comm_order += 1            
             
@@ -149,17 +158,17 @@ class OptimizerSimulator(MetaModule):
                                 args.rank, self.strategy.world_size,  com_buff=com_buff,
                                 fwd_cost=1, global_rank=args.rank))                  
 
-            self.layers.append(AtomModel(fwd_cost=opt_info['optim_time'], bwd_cost=0, specific_name='optimizer_step'))
+            self.layers.extend(optimizer_atoms())
 
             cost_dense_ag =  cost_dense['details']['all_gather_time']
             self.layers.append(all_gather(f"{state.comm_order}-dp_cp_group:{rank_info['dp_cp_group_id']}", 
-                                rank_info['dp_cp_rank'], self.strategy.dp_size * self.strategy.cp_size,  com_buff=com_buff,
+                                rank_info['dp_cp_rank'], self.strategy.fsdp_dense_group_size,  com_buff=com_buff,
                                 fwd_cost=cost_dense_ag, global_rank=args.rank, net=self.strategy.dp_net))
             state.comm_order += 1
 
             cost_moe_ag =  cost_moe['details']['all_gather_time']
             self.layers.append(all_gather(f"{state.comm_order}-edp_group:{rank_info['edp_group_id']}", 
-                                rank_info['edp_rank'], self.strategy.edp_size,  com_buff=com_buff,
+                                rank_info['edp_rank'], self.strategy.fsdp_moe_group_size,  com_buff=com_buff,
                                 fwd_cost=cost_moe_ag, global_rank=args.rank, net=self.strategy.edp_net))
             state.comm_order += 1
 
