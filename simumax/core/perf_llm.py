@@ -1507,10 +1507,54 @@ class PerfLLM(PerfBase):
         assert (
             self.model_config.head_num % self.strategy.tp_size == 0
         ), f"head_num {self.model_config.head_num} should be divisible by tp_size {self.strategy.tp_size}"
+        if getattr(self.model_config, "model_type", None) == "mxx_model":
+            # MXX has an explicit hybrid-attention layout.  With TP>1 its
+            # FA branch uses MQA-per-rank KV replication; the Q head plane
+            # still must be divisible across TP and the CP A2A head plane.
+            if self.strategy.tp_size > 1:
+                assert getattr(self.model_config, "mqa_per_rank", False), (
+                    "MXX tp_size>1 requires model.mqa_per_rank=true so the "
+                    "one-head FA KV projection is replicated per TP rank"
+                )
+                if self.strategy.cp_size > 1 and self.strategy.cp_comm_type == "a2a":
+                    q_heads_per_tp = (
+                        self.model_config.head_num // self.strategy.tp_size)
+                    assert q_heads_per_tp % self.strategy.cp_size == 0, (
+                        "MXX Q heads must be divisible by tp_size*cp_size "
+                        f"for CP A2A (head_num={self.model_config.head_num}, "
+                        f"tp_size={self.strategy.tp_size}, "
+                        f"cp_size={self.strategy.cp_size})"
+                    )
+                swa_heads = getattr(self.model_config, "swa_head_num", 0) or 0
+                if swa_heads:
+                    assert swa_heads % self.strategy.tp_size == 0, (
+                        "MXX SWA query heads must be divisible by tp_size "
+                        f"(swa_head_num={swa_heads}, "
+                        f"tp_size={self.strategy.tp_size})"
+                    )
+                    td = max(1, int(getattr(
+                        self.model_config, "trunk_cp_divisor", 1) or 1))
+                    effective_cp = max(1, self.strategy.cp_size // td)
+                    local_swa = swa_heads // self.strategy.tp_size
+                    assert local_swa % effective_cp == 0, (
+                        "MXX SWA query heads must be divisible by the effective "
+                        f"CP plane (local_swa={local_swa}, "
+                        f"cp_size={self.strategy.cp_size}, trunk_cp_divisor={td})"
+                    )
         if self.model_config.kv_head_num is not None:
-            assert (
-                self.model_config.kv_head_num % self.strategy.tp_size == 0
-            ), f"kv_head_num {self.model_config.kv_head_num} should be divisible by tp_size {self.strategy.tp_size}"
+            # MXX's FA branch is MQA-per-rank: a compact KV head is replicated
+            # on each TP rank while query heads are partitioned.  Do not
+            # reject that structural layout with the generic divisible-KV
+            # rule; CoreAttention receives the same explicit replication flag.
+            mqa_tp_replication = (
+                self.strategy.tp_size > 1
+                and getattr(self.model_config, "mqa_per_rank", False)
+                and getattr(self.model_config, "model_type", None) == "mxx_model"
+            )
+            if not mqa_tp_replication:
+                assert (
+                    self.model_config.kv_head_num % self.strategy.tp_size == 0
+                ), f"kv_head_num {self.model_config.kv_head_num} should be divisible by tp_size {self.strategy.tp_size}"
         assert (
             self.model_config.expert_num % self.strategy.ep_size == 0
         ), f"expert num {self.model_config.expert_num} should be divisible by ep_size {self.strategy.ep_size}"  # pylint: disable=line-too-long
@@ -4482,6 +4526,10 @@ class PerfLLM(PerfBase):
             total_ideal_compute = sum(
                 row.get("ideal_compute_time_ms") or 0 for row in rows)
             total_derived = sum(row.get("derived_time_ms") or 0 for row in rows)
+            peak_tflops = max(
+                (float(row.get("peak_tflops") or 0) for row in compute_rows),
+                default=float(self.system.accelerator.op["default"].tflops),
+            )
 
             def flops_weighted(field):
                 if not total_flops:
@@ -4504,6 +4552,26 @@ class PerfLLM(PerfBase):
                 "actual_forward_utilization": (
                     total_ideal_compute / total_derived
                     if total_derived and total_flops else None),
+                "attainable_efficiency": (
+                    total_flops / ((total_derived / 1e3)
+                                   * peak_tflops * 1e12)
+                    if total_derived and total_flops and peak_tflops else None),
+                "attainable_efficiency_flops_weighted": flops_weighted(
+                    "attainable_efficiency"),
+                "attainable_efficiency_bound_flops_weighted": flops_weighted(
+                    "attainable_efficiency_bound"),
+                "attainable_efficiency_formula": (
+                    "min(structural_bound,"
+                    "semantic_flops/(simulated_duration_s*peak_tflops*1e12))"),
+                # A semantic, end-to-end model metric.  It uses the same
+                # numerator/denominator definition as the post-hoc measured
+                # metric, but the duration here is SimuMax's derived time.
+                # It is not a profiler Cube/AIV occupancy counter.
+                "semantic_effective_utilization": (
+                    total_flops / ((total_derived / 1e3)
+                                   * peak_tflops * 1e12)
+                    if total_derived and total_flops and peak_tflops else None),
+                "peak_tflops": peak_tflops,
                 "customer_override_present": any(
                     row.get("customer_mfu_override") is not None for row in rows),
                 "implementation_facts_complete": all(
@@ -4535,6 +4603,15 @@ class PerfLLM(PerfBase):
             **self.system.forward_derivation_records,
             "operator_summary": operator_summary_rows,
         }
+        existing_plan = getattr(self.system, "communication_plan_document", None)
+        if existing_plan and existing_plan.get("summary", {}).get("des_event_plan_count", 0):
+            plan_document = existing_plan
+        else:
+            plan_document = self.system.build_communication_plan_document(
+                events=None, strategy=self.strategy)
+        payload["communication_plan"] = plan_document["plans"]
+        payload["communication_plan_summary"] = plan_document["summary"]
+        payload["communication_plan_provenance"] = plan_document["provenance"]
         if overall is not None:
             payload["overall"] = overall
         os.makedirs(save_path, exist_ok=True)
@@ -4559,6 +4636,83 @@ class PerfLLM(PerfBase):
         if network_layer_rows:
             pd.DataFrame(network_layer_rows).to_csv(
                 os.path.join(save_path, "network_layer_parameters.csv"),
+                index=False, encoding="utf-8")
+        with open(os.path.join(save_path, "communication_plan.json"), "w",
+                  encoding="utf-8") as file:
+            json.dump(plan_document, file, indent=2, ensure_ascii=False)
+        communication_efficiency_rows = []
+        for plan in plan_document["plans"]:
+            runtime = plan.get("runtime") or {}
+            level_rows = plan.get("topology_levels") or []
+            payload_bytes = plan.get("payload_bytes")
+            ideal_phase_times = []
+            for level in level_rows:
+                beta = level.get("beta_gb_per_s")
+                level_payload = level.get("payload_bytes") or payload_bytes
+                if beta and level_payload:
+                    ideal_phase_times.append(
+                        float(level_payload) / (float(beta) * 1e9) * 1e3)
+            known_level = bool(ideal_phase_times)
+            ideal_transfer_ms = (
+                max(ideal_phase_times)
+                if plan.get("composition_policy") == "max" and known_level
+                else sum(ideal_phase_times) if known_level else None)
+            derived_time_ms = None
+            for row in self.system.forward_derivation_records["communications"].values():
+                if (row.get("message_bytes") == payload_bytes
+                        and row.get("group_kind") == plan.get("group_kind")
+                        and row.get("comm_num") == plan.get("group_size")):
+                    derived_time_ms = row.get("derived_time_ms")
+                    if derived_time_ms is not None:
+                        break
+            communication_efficiency_rows.append({
+                "plan_id": plan.get("plan_id"),
+                "op_name": plan.get("comm_role"),
+                "operation": plan.get("operation"),
+                "group_kind": plan.get("group_kind"),
+                "group_size": plan.get("group_size"),
+                "payload_bytes": payload_bytes,
+                "ideal_link_transfer_time_ms": ideal_transfer_ms if known_level else None,
+                "derived_time_ms": plan.get("derived_time_ms") or derived_time_ms,
+                "structural_execution_efficiency": plan.get(
+                    "structural_execution_efficiency") if plan.get(
+                    "structural_execution_efficiency") is not None else (
+                    ideal_transfer_ms / derived_time_ms
+                    if known_level and derived_time_ms and derived_time_ms > 0 else None),
+                "attainable_efficiency": plan.get(
+                    "attainable_efficiency") if plan.get(
+                    "attainable_efficiency") is not None else (
+                    ideal_transfer_ms / derived_time_ms
+                    if known_level and derived_time_ms and derived_time_ms > 0 else None),
+                "min_reachable_beta_gb_per_s": plan.get(
+                    "min_reachable_beta_gb_per_s"),
+                "max_reachable_beta_gb_per_s": plan.get(
+                    "max_reachable_beta_gb_per_s"),
+                "simulated_raw_duration_ms": (plan.get("lifecycle") or {}).get(
+                    "raw_duration_ms"),
+                "simulated_raw_duration_definition": (plan.get("lifecycle") or {}).get(
+                    "raw_duration_definition"),
+                "simulated_event_duration_sum_ms": (plan.get("lifecycle") or {}).get(
+                    "event_duration_sum_ms"),
+                "simulated_rank_union_duration_ms": (plan.get("lifecycle") or {}).get(
+                    "rank_union_duration_ms"),
+                "simulated_overlap_with_compute_ms": (plan.get("lifecycle") or {}).get(
+                    "overlap_with_compute_ms"),
+                "simulated_exposed_duration_ms": (plan.get("lifecycle") or {}).get(
+                    "exposed_duration_ms"),
+                "simulated_event_exposed_duration_sum_ms": (plan.get("lifecycle") or {}).get(
+                    "event_exposed_duration_sum_ms"),
+                "simulated_overlap_ratio": (plan.get("lifecycle") or {}).get(
+                    "overlap_ratio"),
+                "call_mapping_status": plan.get("call_mapping_status"),
+                "identity_scope": plan.get("identity_scope"),
+                "dependency_status": (plan.get("dependencies") or {}).get("status"),
+                "runtime_status": runtime.get("status"),
+                "performance_observations_used": False,
+            })
+        if communication_efficiency_rows:
+            pd.DataFrame(communication_efficiency_rows).to_csv(
+                os.path.join(save_path, "communication_efficiency_table.csv"),
                 index=False, encoding="utf-8")
         
     

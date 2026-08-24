@@ -19,6 +19,7 @@ from simumax.core.utils import (
 )
 from simumax.core.fusion import FUSION_POLICIES, build_fusion_policy
 from simumax.core.cost_specs import get_block_template
+from simumax.core.communication_plan import collective_algorithm as portable_collective_algorithm
 
 capture_graph_only = False
 ENABLE_SIMU_GRAPH = int(os.environ.get("ENABLE_SIMU_GRAPH", "0"))
@@ -1177,6 +1178,11 @@ class SystemConfig(Config):
         self.operator_mfu_overrides = {}
         self.forward_derivation_records = {
             "operators": {}, "network_layers": {}, "communications": {}}
+        # The plan is a derived output, not a configuration input.  It is
+        # rebuilt for each estimate/DES run and deliberately excluded from
+        # dataclass serialization so no profiler artifact can become a model
+        # parameter.
+        self.communication_plan_document = None
 
     @staticmethod
     def _deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]):
@@ -1208,37 +1214,69 @@ class SystemConfig(Config):
 
     @classmethod
     def init_from_config_file(cls, config_file: str):
-        """Load a system config plus optional hardware/software profiles.
+        """Load a system config and its separated hardware/software profiles.
 
-        The old monolithic JSON form remains supported.  New forward configs
-        may reference ``hardware_profile``, ``cann_profile`` and
-        ``hccl_runtime_profile``; explicit values in the system file override
-        profile defaults.  Profile loading never imports calibrated alpha/beta
-        tables into a forward run.
+        Forward-derived MXX configurations must declare hardware and topology
+        profile references. CANN/HCCL references are optional; when omitted,
+        portable default software profiles are loaded and marked in the audit.
+        The former monolithic forward configuration path is intentionally
+        removed; profile loading never imports calibrated alpha/beta tables
+        into a forward run.
         """
         config_dict = cls.read_json_file(config_file)
-        profile_sources = {}
-
+        # Keep the system-file values separate from profile references.  The
+        # merge order is deliberately explicit:
+        #   hardware profile < topology profile < system-file overrides.
+        # This keeps the profile precedence explicit and prevents a topology
+        # profile from being silently mixed with an obsolete monolithic file.
+        forward_requested = bool(
+            (config_dict.get("forward_derivation") or {}).get("enabled", False))
         hardware_ref = config_dict.pop("hardware_profile", None)
+        topology_ref = config_dict.pop("topology_profile", None)
+        cann_ref = config_dict.pop("cann_profile", None)
+        hccl_ref = config_dict.pop("hccl_runtime_profile", None)
+        cann_defaulted = False
+        hccl_defaulted = False
+        profile_sources = {}
+        if forward_requested and not all((hardware_ref, topology_ref)):
+            raise ValueError(
+                "forward-derived system configs must declare hardware_profile, "
+                "topology_profile")
+        if forward_requested and not cann_ref:
+            cann_ref = "../software/cann/default_cann_runtime.json"
+            cann_defaulted = True
+        if forward_requested and not hccl_ref:
+            hccl_ref = "../software/hccl/default_hccl_runtime.json"
+            hccl_defaulted = True
+        system_overrides = config_dict
+        merged_config = {}
+
         if hardware_ref:
             profile, resolved = cls._read_profile_ref(hardware_ref, config_file)
-            cls._deep_merge_dict(profile, config_dict)
-            config_dict = profile
+            cls._deep_merge_dict(merged_config, profile)
             profile_sources["hardware"] = resolved
 
-        cann_ref = config_dict.pop("cann_profile", None)
+        if topology_ref:
+            profile, resolved = cls._read_profile_ref(topology_ref, config_file)
+            cls._deep_merge_dict(merged_config, profile)
+            profile_sources["topology"] = resolved
+
+        cls._deep_merge_dict(merged_config, system_overrides)
+        config_dict = merged_config
+
         if cann_ref:
             profile, resolved = cls._read_profile_ref(cann_ref, config_file)
             config_dict["cann_runtime"] = profile.get(
                 "cann_runtime", profile)
-            profile_sources["cann"] = resolved
+            profile_sources["cann"] = (
+                "default:portable_cann_runtime" if cann_defaulted else resolved)
 
-        hccl_ref = config_dict.pop("hccl_runtime_profile", None)
         if hccl_ref:
             profile, resolved = cls._read_profile_ref(hccl_ref, config_file)
             config_dict["hccl_runtime"] = profile.get(
                 "hccl_runtime", profile)
-            profile_sources["hccl_runtime"] = resolved
+            profile_sources["hccl_runtime"] = (
+                "default:portable_hccl_runtime" if hccl_defaulted else resolved)
 
         if profile_sources:
             existing_sources = config_dict.get("profile_sources", {})
@@ -1253,6 +1291,7 @@ class SystemConfig(Config):
         # them here when callers construct a SystemConfig from an already
         # merged dictionary.
         config_dict.pop("hardware_profile", None)
+        config_dict.pop("topology_profile", None)
         config_dict.pop("cann_profile", None)
         config_dict.pop("hccl_runtime_profile", None)
         accelerator = config_dict.pop("accelerator")
@@ -1295,6 +1334,23 @@ class SystemConfig(Config):
         cann_runtime = config_dict.pop("cann_runtime", None)
         hccl_runtime = config_dict.pop("hccl_runtime", None)
         profile_sources = config_dict.pop("profile_sources", None)
+        if (forward_derivation or {}).get("enabled", False):
+            if cann_runtime is None:
+                cann_runtime = {
+                    "schema": "simumax_cann_runtime_v1",
+                    "profile_kind": "portable_default",
+                    "compute": {},
+                }
+            if hccl_runtime is None:
+                hccl_runtime = {
+                    "schema": "simumax_hccl_runtime_v1",
+                    "profile_kind": "portable_default",
+                    "network": {},
+                }
+            profile_sources = dict(profile_sources or {})
+            profile_sources.setdefault("cann", "built_in:portable_cann_runtime")
+            profile_sources.setdefault(
+                "hccl_runtime", "built_in:portable_hccl_runtime")
         hardware_spec = config_dict.pop("hardware_spec", None)
         activation_offload = config_dict.pop("activation_offload", None)
         fsdp_overlap_coefficient = config_dict.pop("fsdp_overlap_coefficient", 1.0)
@@ -1341,25 +1397,20 @@ class SystemConfig(Config):
         return bool((self.forward_derivation or {}).get("enabled", False))
 
     def _cann_compute_config(self, create=False):
-        """Return the versioned CANN compute profile.
-
-        ``forward_derivation.compute`` is retained only as a compatibility
-        fallback for older monolithic system JSON files. New profiles take
-        precedence and are the only source used by forward runs.
-        """
+        """Return the versioned CANN compute profile."""
         if self.cann_runtime is not None:
             if create:
                 return self.cann_runtime.setdefault("compute", {})
             return self.cann_runtime.get("compute", {})
-        if create:
-            return (self.forward_derivation or {}).setdefault("compute", {})
-        return (self.forward_derivation or {}).get("compute", {})
+        # Direct dataclass construction can omit the optional software
+        # profile. Keep the same portable-default semantics as init_from_dict.
+        return {}
 
     def _hccl_network_config(self):
         """Return the versioned HCCL/runtime network profile."""
         if self.hccl_runtime is not None:
             return self.hccl_runtime.get("network", self.hccl_runtime)
-        return (self.forward_derivation or {}).get("network", {})
+        return {}
 
     def forward_profile_audit(self):
         """Describe profile provenance and legacy calibration isolation."""
@@ -1387,9 +1438,14 @@ class SystemConfig(Config):
             name for name in required_facts
             if not memory_facts.get(name) and not compute_facts.get(name)
             and not (self.hardware_spec or {}).get(name)]
+        profile_sources = self.profile_sources or {}
+        defaulted_profiles = sorted(
+            name for name, source in profile_sources.items()
+            if str(source).startswith(("default:", "built_in:")))
         return {
             "forward_derivation_enabled": self.forward_derivation_enabled,
-            "profile_sources": self.profile_sources or {},
+            "profile_sources": profile_sources,
+            "defaulted_software_profiles": defaulted_profiles,
             "cann_version": (self.cann_runtime or {}).get("version"),
             "hccl_runtime_version": (self.hccl_runtime or {}).get("version"),
             "legacy_calibration_fields_present": sorted(set(legacy_fields)),
@@ -1758,6 +1814,20 @@ class SystemConfig(Config):
         achievable = (ideal_compute_ms / derived_time_ms
                       if derived_time_ms > 0 else limit_efficiency)
         achievable = max(1e-12, min(limit_efficiency, achievable))
+        # ``attainable_efficiency`` is the explicit Roofline-to-runtime
+        # metric.  It is intentionally bounded by the structural limit and
+        # uses only forward-derived time: shape/tile padding, wave occupancy,
+        # memory traffic, on-chip movement, library stages and declared
+        # launch latency.  It is not a profiler counter and never consumes a
+        # measured duration.
+        resource_efficiency = (
+            ideal_compute_ms / resource_time_ms
+            if ideal_compute_ms > 0 and resource_time_ms > 0 else None)
+        library_runtime_efficiency = (
+            (resource_time_ms + (launch_us + hbm_latency_us) / 1e3)
+            / derived_time_ms
+            if derived_time_ms > 0 else None)
+        attainable_efficiency = achievable if flops > 0 else None
         # compute_op_accuracy_time uses the configured Cube reference peak.
         # Translate an engine-relative utilization back to that reference.
         relative_peak = peak_tflops / reference_peak_tflops
@@ -1830,6 +1900,29 @@ class SystemConfig(Config):
             "library_extra_time_ms": library_extra_time_ms,
             "library_extra_detail": library_extra_detail,
             "derived_time_ms": derived_time_ms,
+            "attainable_efficiency": attainable_efficiency,
+            "attainable_efficiency_bound": (
+                limit_efficiency if flops > 0 else None),
+            "attainable_efficiency_factors": {
+                "roofline_bound": roofline,
+                "shape_tile_alignment": alignment,
+                "composite_batch_alignment": composite_batch_alignment,
+                "instruction_utilization": instruction_utilization,
+                "wave_utilization": wave_utilization,
+                "memory_transaction_utilization": memory_transaction_utilization,
+                "resource_schedule_efficiency": resource_efficiency,
+                "library_runtime_efficiency": library_runtime_efficiency,
+                "formula": (
+                    "U_attainable=min(U_bound,"
+                    "ideal_compute_time/derived_time)"
+                ),
+                "source": "hardware_spec+cann_runtime+model_shape",
+            },
+            "semantic_effective_utilization": (
+                flops / ((derived_time_ms / 1e3) * peak_tflops * 1e12)
+                if flops > 0 and derived_time_ms > 0 and peak_tflops > 0 else None),
+            "semantic_utilization_formula": (
+                "semantic_flops/(simulated_duration_s*peak_tflops*1e12)"),
             "optimistic_overlap_utilization": optimistic_utilization,
             "conservative_serial_utilization": conservative_utilization,
             "implementation_facts_complete": not missing_facts,
@@ -1852,13 +1945,8 @@ class SystemConfig(Config):
 
     @staticmethod
     def _collective_algorithm(op_name, comm_num):
-        if op_name == "p2p":
-            return "point_to_point", 1
-        if op_name == "all_reduce":
-            return "ring", 2 * max(0, comm_num - 1)
-        if op_name in ("all2all", "alltoallv"):
-            return "pairwise_exchange", max(0, comm_num - 1)
-        return "ring", max(0, comm_num - 1)
+        """Use the single portable collective definition for all outputs."""
+        return portable_collective_algorithm(op_name, comm_num)
 
     def _collective_runtime_overhead(
             self, op_name, comm_num, message_bytes, active_level_count=1):
@@ -1884,6 +1972,26 @@ class SystemConfig(Config):
             "tasks_per_additional_chunk", 0)))
 
         algorithm, stages = self._collective_algorithm(op_name, comm_num)
+        if stages is None:
+            return {
+                "execution_engine": runtime_cfg.get(
+                    "execution_engine", "host_cpu_ts"),
+                "algorithm": algorithm,
+                "algorithm_stages": None,
+                "active_network_levels": max(1, int(active_level_count)),
+                "payload_chunks": None,
+                "stage_runtime_tasks": None,
+                "descriptor_runtime_tasks": None,
+                "runtime_task_count": None,
+                "call_launch_latency_us": call_launch_us,
+                "task_launch_latency_us": task_launch_us,
+                "call_runtime_overhead_us": None,
+                "status": "unknown",
+                "unknown_reason": "unsupported_collective_algorithm",
+                "formula": (
+                    "runtime unavailable until a generic collective algorithm "
+                    "is declared"),
+            }
         level_count = max(1, int(active_level_count))
         stage_tasks = stages * level_count * tasks_per_stage
         chunks = (math.ceil(message_bytes / chunk_bytes)
@@ -1941,6 +2049,9 @@ class SystemConfig(Config):
             "packet_efficiency": packet_eff,
             "bandwidth_utilization": packet_eff,
             "effective_beta_gib_per_s": beta,
+            # Canonical network-rate field.  Network profiles use decimal
+            # GB/s; keep the historical *_gib_* alias for compatibility.
+            "effective_beta_gb_per_s": beta,
             "base_latency_us": topology_latency,
             "algorithm_independent": True,
             "formula": "beta=B_physical*payload/ceil(payload/flit)",
@@ -1956,6 +2067,7 @@ class SystemConfig(Config):
             "flit_bytes": flit_bytes,
             "packet_efficiency": packet_eff,
             "derived_beta_gib_per_s": beta,
+            "derived_beta_gb_per_s": beta,
             "algorithm": algorithm,
             "algorithm_stages": stages,
             "network_layer_latency_us": topology_latency,
@@ -2096,6 +2208,27 @@ class SystemConfig(Config):
         self.real_comm_bw.clear()
         self.forward_derivation_records = {
             "operators": {}, "network_layers": {}, "communications": {}}
+        self.communication_plan_document = None
+
+    def build_communication_plan_document(self, events=None, strategy=None):
+        """Build the portable communication-plan output for this run.
+
+        The import is local to keep the config module usable by the base
+        package during its own import cycle.  ``events`` are SimuMax-generated
+        DES events; measured profiler data is never accepted here.
+        """
+        from simumax.core.communication_plan import (
+            build_communication_plan_document,
+        )
+
+        document = build_communication_plan_document(
+            events=events,
+            system=self,
+            strategy=strategy,
+            derivation_records=self.forward_derivation_records,
+        )
+        self.communication_plan_document = document
+        return document
 
     @staticmethod
     def _lookup_accurate_eff(accurate_factor, shape_desc):
@@ -2919,6 +3052,7 @@ class SystemConfig(Config):
         # (span, phase_size, bw, eff_factor, phase_time_ms,
         #  physical_propagation_latency_us)
         phases = []
+        phase_facts = []
         for i, span in enumerate(spans):
             scale, offset, eff_factor, bw, base_latency, fixed_latency = \
                 self._level_net_params(span.net, op_name, comm_num)
@@ -2988,27 +3122,42 @@ class SystemConfig(Config):
                     op_name, local_members)
                 hop_count = max(1, int(levels[i].get("hop_count", 1)))
                 physical_latency = base_latency * hop_count
+                attainable_bandwidth_efficiency = max(
+                    0.0, min(1.0, port_utilization * eff_factor))
                 layer_record_key = f"{span.name}|bytes={int(phase_size)}"
                 self.forward_derivation_records["network_layers"][
                     layer_record_key] = {
-                        "network_level": span.name,
-                        "net": span.net,
-                        "message_bytes": phase_size,
-                        "physical_bandwidth_gib_per_s": physical_bw,
+                    "network_level": span.name,
+                    "net": span.net,
+                    "op_name": requested_op_name,
+                    "algorithm_family": op_name,
+                    "comm_num": local_members,
+                    "group_kind": group_kind,
+                    "topology_kind": span.kind,
+                    "units_touched": span.units_touched,
+                    "message_bytes": phase_size,
+                    "physical_bandwidth_gib_per_s": physical_bw,
+                    "bandwidth_unit": "GB/s",
                         "port_count": port_num,
                         "active_ports": active_ports,
                         "port_utilization": port_utilization,
                         "routed_bandwidth_gib_per_s": bw,
                         "packet_efficiency": eff_factor,
                         "bandwidth_utilization": eff_factor,
+                        "attainable_bandwidth_efficiency": (
+                            attainable_bandwidth_efficiency),
                         "effective_beta_gib_per_s": bw * eff_factor,
+                        "effective_beta_gb_per_s": bw * eff_factor,
+                        "reachable_beta_gb_per_s": bw * eff_factor,
                         "base_latency_us": base_latency,
                         "hop_count": hop_count,
                         "physical_propagation_latency_us": physical_latency,
+                        "latency_formula": "hop_count*per_hop_latency_us",
                         "algorithm_independent": True,
                         "formula": (
                             "beta=B_physical*port_utilization*"
-                            "payload/ceil(payload/flit)"),
+                            "payload/ceil(payload/flit); "
+                            "U_beta=port_utilization*packet_efficiency"),
                     }
                 record_key = (f"{requested_op_name}|levels:{comm_stage.lower()}:{span.name}"
                               f"|n={local_members}|bytes={int(phase_size)}")
@@ -3020,16 +3169,24 @@ class SystemConfig(Config):
                     "comm_num": local_members,
                     "message_bytes": phase_size,
                     "topology_bandwidth_gbps": physical_bw,
+                    "bandwidth_unit": "GB/s",
                     "routed_bandwidth_gbps": bw,
                     "port_utilization": port_utilization,
                     "flit_bytes": flit_bytes,
                     "packet_efficiency": eff_factor,
+                    "attainable_bandwidth_efficiency": (
+                        attainable_bandwidth_efficiency),
                     "derived_beta_gib_per_s": bw * eff_factor,
+                    "derived_beta_gb_per_s": bw * eff_factor,
+                    "reachable_beta_gb_per_s": bw * eff_factor,
                     "algorithm": algorithm,
                     "algorithm_stages": stage_count,
                     "network_layer_latency_us": base_latency,
                     "physical_hop_count": hop_count,
                     "physical_propagation_latency_us": physical_latency,
+                    "latency_formula": "hop_count*per_hop_latency_us",
+                    "topology_kind": span.kind,
+                    "units_touched": span.units_touched,
                     "call_runtime_overhead_us": 0.0,
                     "collective_latency_us": physical_latency,
                     "formula": (
@@ -3046,6 +3203,29 @@ class SystemConfig(Config):
             if op_name == "all2all":
                 layout_oh = (getattr(strategy, 'layout_transform_overhead_us', 0) or 0) / 1e3
             phase_time = base_time + latency_time + layout_oh
+            if self.forward_derivation_enabled:
+                phase_facts.append({
+                    "level": span.name,
+                    "net": span.net,
+                    "topology_kind": span.kind,
+                    "units_touched": span.units_touched,
+                    "payload_bytes": phase_size,
+                    "physical_bandwidth_gb_per_s": physical_bw,
+                    "routed_bandwidth_gb_per_s": bw,
+                    "beta_gb_per_s": bw * eff_factor,
+                    "bandwidth_unit": "GB/s",
+                    "port_count": port_num,
+                    "active_ports": active_ports,
+                    "port_utilization": port_utilization,
+                    "packet_efficiency": eff_factor,
+                    "attainable_bandwidth_efficiency": (
+                        max(0.0, min(1.0, port_utilization * eff_factor))),
+                    "hop_count": hop_count,
+                    "physical_latency_us": physical_latency,
+                    "latency_formula": "hop_count*per_hop_latency_us",
+                    "derived_phase_time_ms": phase_time,
+                    "source": "forward_formula",
+                })
             phases.append((
                 span, phase_size, bw, eff_factor, phase_time,
                 physical_latency if self.forward_derivation_enabled
@@ -3062,6 +3242,25 @@ class SystemConfig(Config):
             runtime = self._collective_runtime_overhead(
                 op_name, comm_num, size, active_level_count=len(phases))
             total_time += runtime["call_runtime_overhead_us"] / 1e3
+            ideal_level_transfer_ms = [
+                phase_size / (bw * 1e9 * eff_factor) * 1e3
+                for _span, phase_size, bw, eff_factor, _phase_time, _latency
+                in phases
+                if bw > 0 and eff_factor > 0
+            ]
+            ideal_transfer_ms = (
+                max(ideal_level_transfer_ms)
+                if policy == "max" and ideal_level_transfer_ms
+                else sum(ideal_level_transfer_ms)
+                if ideal_level_transfer_ms else None
+            )
+            communication_attainable_efficiency = (
+                ideal_transfer_ms / total_time
+                if ideal_transfer_ms is not None and total_time > 0 else None)
+            reachable_betas = [
+                bw * eff_factor for _span, _phase_size, bw, eff_factor,
+                _phase_time, _latency in phases if bw > 0 and eff_factor > 0
+            ]
             record_key = (f"{requested_op_name}|levels:{comm_stage.lower()}:call"
                           f"|n={comm_num}|bytes={int(size)}")
             self.forward_derivation_records["communications"][record_key] = {
@@ -3072,6 +3271,15 @@ class SystemConfig(Config):
                 "comm_num": comm_num,
                 "message_bytes": size,
                 "physical_level_count": len(phases),
+                "physical_levels": phase_facts,
+                "composition_policy": policy,
+                "ideal_link_transfer_time_ms": ideal_transfer_ms,
+                "communication_attainable_efficiency": (
+                    communication_attainable_efficiency),
+                "min_reachable_beta_gb_per_s": (
+                    min(reachable_betas) if reachable_betas else None),
+                "max_reachable_beta_gb_per_s": (
+                    max(reachable_betas) if reachable_betas else None),
                 "physical_propagation_latency_us": sum(
                     phase[5] for phase in phases),
                 "call_runtime_overhead_us": runtime["call_runtime_overhead_us"],

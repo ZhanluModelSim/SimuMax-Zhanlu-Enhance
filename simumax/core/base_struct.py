@@ -475,6 +475,8 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
             mem_profile=self.build_simu_mem_profile(phase="fwd") if self.is_leaf_module else None,
         )
         for layer in self.layers:
+            if isinstance(layer, LeafModel):
+                layer.set_event_metadata(self._event_metadata_for_leaf(layer))
             fwd.append(layer.prefill_fwd())
         return fwd
 
@@ -549,8 +551,58 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
             mem_profile=self.build_simu_mem_profile(phase="bwd") if self.is_leaf_module else None,
         )
         for layer in self.layers:
+            if isinstance(layer, LeafModel):
+                layer.set_event_metadata(self._event_metadata_for_leaf(layer))
             bwd.append(layer.prefill_bwd())
         return bwd
+
+    @staticmethod
+    def _tensor_shape_metadata(value):
+        """Return JSON-safe shapes/dtypes from a TensorSize or IO container."""
+        if value is None:
+            return [], []
+        tensors = getattr(value, "tensors", None)
+        if tensors is None:
+            tensors = [value]
+        shapes = [list(getattr(tensor, "shape", [])) for tensor in tensors]
+        dtypes = [getattr(tensor, "dtype", None) for tensor in tensors]
+        return shapes, dtypes
+
+    def _event_metadata_for_leaf(self, leaf):
+        """Build structural event metadata from this module's model tensors.
+
+        This is deliberately attached during DES prefill, after the model
+        graph has propagated ``input_info``/``output_info``.  It therefore
+        remains portable when batch, sequence length, expert count, or
+        parallelism changes, and it does not consult a profiler trace.
+        """
+        input_shapes, input_dtypes = self._tensor_shape_metadata(self.input_info)
+        output_shapes, output_dtypes = self._tensor_shape_metadata(self.output_info)
+        shape_desc_by_stage = {}
+        for stage in ("fwd", "bwd_grad_act", "bwd_grad_w"):
+            try:
+                desc = self.get_input_shapes_desc(stage)
+            except (AttributeError, AssertionError, IndexError, TypeError, ValueError):
+                desc = ""
+            if desc:
+                shape_desc_by_stage[stage] = desc
+        if not shape_desc_by_stage:
+            shape_desc_by_stage["fwd"] = (
+                f"inputs={input_shapes}, outputs={output_shapes}"
+            )
+        # The output dtype is useful for fused casts (e.g. VWN out); retain
+        # both sides so a consumer never has to guess from the operator name.
+        dtype = next((d for d in output_dtypes if d), None)
+        if dtype is None:
+            dtype = next((d for d in input_dtypes if d), None)
+        return {
+            "shape_desc_by_stage": shape_desc_by_stage,
+            "input_shapes": input_shapes,
+            "output_shapes": output_shapes,
+            "input_dtypes": input_dtypes,
+            "output_dtypes": output_dtypes,
+            "dtype": dtype,
+        }
         
     def get_all_leaf_modules(self):
         assert self.status_ready, f"{self.__class__.__name__} is not ready yet, please run set_first_last_recompute_status() first"
@@ -2469,7 +2521,8 @@ class LeafModel():
     simu_lane: ClassVar[str | None] = None
 
     def _event_metadata(self):
-        """Structural metadata shared by async communication leaf ops."""
+        """Return portable metadata shared by all leaf event kinds."""
+        structural = dict(getattr(self, "event_metadata", {}) or {})
         op_id = str(getattr(self, "id", ""))
         lowered = op_id.lower()
         group_kind = getattr(self, "group_kind", None)
@@ -2496,7 +2549,7 @@ class LeafModel():
             owner = "moe_combine"
         elif "router" in stage_lower:
             owner = "moe_router"
-        return {
+        defaults = {
             "group_kind": group_kind,
             "group_size": getattr(self, "group_size", None),
             "payload_bytes": getattr(self, "size_bytes", 0),
@@ -2507,14 +2560,25 @@ class LeafModel():
             "comm_role": (getattr(self, "comm_role", None)
                            or comm_stage or group_kind),
         }
+        # Explicit model metadata wins over communication defaults.  This is
+        # what allows compute atoms and communication atoms to share one event
+        # schema without changing their scheduling behavior.
+        defaults.update(structural)
+        return defaults
 
-    def __init__(self, specific_name=''):
+    def __init__(self, specific_name='', event_metadata=None):
         self.st = None
         self.st_bwd = None
         self.call_stk =f'-{self.__class__.__name__}'
         self.forward_op = "fwd"
         if specific_name:
             self.call_stk =f'-{specific_name}'
+        self.event_metadata = dict(event_metadata or {})
+
+    def set_event_metadata(self, metadata):
+        """Attach model/config-derived metadata without affecting DES cost."""
+        if metadata:
+            self.event_metadata.update(metadata)
 
     # def step(self, t, ctx):
     #     # Default behavior is to call _step; subclasses can override it.
@@ -2533,7 +2597,8 @@ class LeafModel():
             if t['comp'] == self.st:
                 return True, None
             ctx.event_sink.emit_span(self.call_stk, self.forward_op, self.st, t['comp'],
-                                     kind=self.simu_kind, lane=self.simu_lane)
+                                     kind=self.simu_kind, lane=self.simu_lane,
+                                     metadata=self._event_metadata())
             return True, None
         return False, blk
     
@@ -2550,7 +2615,8 @@ class LeafModel():
             if t['comp'] == self.st_bwd:
                 return True, None
             ctx.event_sink.emit_span(self.call_stk, "bwd", self.st_bwd, t['comp'],
-                                     kind=self.simu_kind, lane=self.simu_lane)
+                                     kind=self.simu_kind, lane=self.simu_lane,
+                                     metadata=self._event_metadata())
             return True, None
         return False, blk
     
@@ -2577,8 +2643,8 @@ class LeafModel():
 class AtomModel(LeafModel):
     #simplify LeafModel with cost information
     def __init__(self, fwd_cost, bwd_cost, specific_name='', recompute_cost=None,
-                 skip_recompute=False):
-        super().__init__(specific_name)
+                 skip_recompute=False, metadata=None):
+        super().__init__(specific_name, event_metadata=metadata)
         self.fwd_cost = fwd_cost
         self.bwd_cost = bwd_cost
         self.skip_recompute = skip_recompute
@@ -2606,6 +2672,7 @@ class AtomModel(LeafModel):
             fwd_cost=recompute_cost,
             bwd_cost=self.bwd_cost,
             recompute_cost=recompute_cost,
+            metadata=self.event_metadata,
         )
         clone.call_stk = self.call_stk
         clone.forward_op = "recompute_fwd"
@@ -2650,10 +2717,11 @@ class FusedOp(LeafModel):
     simu_kind = "fused"
 
     def __init__(self, costs: Dict[str, float], policy: FusionPolicy,
-                 specific_name='', bwd_costs: Dict[str, float] = None, op_id=None):
+                 specific_name='', bwd_costs: Dict[str, float] = None, op_id=None,
+                 metadata=None):
         # costs: dict lane_name -> busy ms, e.g. {"comp": 10.0, "comm": 8.0}.
         # bwd_costs defaults to costs.
-        super().__init__(specific_name)
+        super().__init__(specific_name, event_metadata=metadata)
         assert costs, "FusedOp requires a non-empty costs dict"
         assert all(c >= 0 for c in costs.values()), f"negative lane cost in {costs}"
         self.costs = dict(costs)
@@ -2708,6 +2776,7 @@ class FusedOp(LeafModel):
             ctx.event_sink.emit_span(
                 self.call_stk, phase, start, start + dur,
                 gid=gid, kind="fused", stream=lane, lane=lane,
+                metadata=self._event_metadata(),
             )
         return True
 
@@ -2718,7 +2787,7 @@ class Com(LeafModel):
                  call_stk='', global_rank=None, stream="comm", net=None, size_bytes=0,
                  group_kind=None, comm_stage=None, comm_owner=None, comm_role=None,
                  **kwargs):
-        super().__init__()
+        super().__init__(event_metadata=kwargs.pop("metadata", None))
         self.call_stk = call_stk + f'{self.call_stk}'
         self.id = id
         self.rank = rank
@@ -2785,7 +2854,8 @@ class Com(LeafModel):
             owner = "moe_combine"
         elif "router" in stage_lower:
             owner = "moe_router"
-        return {
+        metadata = {
+            "comm_id": str(self.id),
             "group_kind": group_kind,
             "group_size": self.group_size,
             "payload_bytes": self.size_bytes,
@@ -2795,6 +2865,8 @@ class Com(LeafModel):
             "comm_owner": owner,
             "comm_role": self.comm_role or comm_stage or group_kind,
         }
+        metadata.update(getattr(self, "event_metadata", {}) or {})
+        return metadata
 
     def _dp_comm_push(self, ctx, t, end_t, launch_st):
         """Advance compute for a blocking communication completion.
@@ -3025,7 +3097,7 @@ class Com(LeafModel):
             stream=self.stream, net=self.net,
             size_bytes=self.size_bytes, group_kind=self.group_kind,
             comm_stage=self.comm_stage, comm_owner=self.comm_owner,
-            comm_role=self.comm_role)
+            comm_role=self.comm_role, metadata=self.event_metadata)
         clone.forward_op = "recompute_fwd"
         return clone
 

@@ -23,6 +23,65 @@ def _normalise_token(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
+def _group_gemm_projection(name: str) -> Optional[str]:
+    """Return Gate/Up/Down when a GroupGemm semantic name exposes it."""
+    token = _normalise_token(name)
+    if "groupgemm" not in token:
+        return None
+    projection_token = token.split("groupgemm", 1)[-1]
+    if "down" in projection_token:
+        return "down"
+    if "gate" in projection_token:
+        return "gate"
+    if "up" in projection_token:
+        return "up"
+    return None
+
+
+def _kernel_role(name: str, semantic_stage: Optional[str] = None) -> Optional[str]:
+    """Derive a portable kernel role from model-generated names.
+
+    The role is intentionally semantic (for example ``gate`` or
+    ``bwd_grad_w``), not a CANN kernel name.  It lets a consumer distinguish
+    the three GroupGemm projections and backward phases even when the real
+    profiler exposes only a generic kernel family.
+    """
+    token = _normalise_token(name)
+    if "groupgemm" in token or "groupgemm" in _normalise_token(semantic_stage):
+        if "bwdact" in token or "gradact" in token:
+            return "bwd_grad_act"
+        if "bwdw" in token or "gradw" in token:
+            return "bwd_grad_w"
+        # Strip the fixed GroupGemm prefix before checking projections;
+        # otherwise the ``up`` substring in ``group`` mislabels Down/unknown
+        # projections as Up.
+        projection = _group_gemm_projection(name)
+        if projection:
+            return projection
+        return "group_gemm"
+    if "router" in token or "routing" in token:
+        return "router"
+    if "vwnwidth" in token:
+        return "vwn_width"
+    if "vwn_depth" in name.lower() or "vwndepth" in token:
+        return "vwn_depth_prenorm" if "prenorm" in token else "vwn_depth"
+    if "vwnout" in token:
+        return "vwn_out"
+    if "vwnin" in token:
+        return "vwn_in"
+    if "transpose" in token or "layout" in token:
+        return "layout"
+    if "rmsnorm" in token or token.endswith("norm") or "norm" in token:
+        return "normalization"
+    if "rope" in token:
+        return "rope"
+    if "swa" in token:
+        return "swa"
+    if "matmul" in token or "linear" in token or token.endswith("bmm"):
+        return "matmul"
+    return None
+
+
 def _layer_index(segments: List[str], text: str) -> Optional[int]:
     """Extract a model layer index from generated model names when present."""
     match = _LAYER_RE.search(text)
@@ -176,6 +235,22 @@ def _derive_semantic_metadata(segments: List[str], name: str,
         text, name, kind, comm_stage or group_kind)
     comm_owner = supplied.get("comm_owner")
     comm_role = supplied.get("comm_role") or comm_stage
+    supplied.setdefault("kernel_role", _kernel_role(name, stage))
+    supplied.setdefault("projection", _group_gemm_projection(name))
+    # Shape descriptors are kept as a per-stage map on the model object.  Pick
+    # the most specific entry available for this emitted event without making
+    # the DES depend on profiler output.
+    shape_by_stage = supplied.get("shape_desc_by_stage") or {}
+    if supplied.get("shape_desc") is None and shape_by_stage:
+        role = supplied.get("kernel_role")
+        shape_key = (
+            "bwd_grad_act" if role == "bwd_grad_act" else
+            "bwd_grad_w" if role == "bwd_grad_w" else
+            "fwd" if operation == "fwd" else
+            "fwd" if operation == "recompute_fwd" else
+            "bwd_grad_act"
+        )
+        supplied["shape_desc"] = shape_by_stage.get(shape_key)
     if kind in ("comm", "wait") or comm_stage:
         if comm_owner is None:
             owner_by_group = {
@@ -248,6 +323,30 @@ class SimuEvent:
     payload_bytes: Optional[int] = None
     net: Optional[str] = None
     comm_stage: Optional[str] = None
+    # Structural fields used by portable trace consumers.  They are derived
+    # from model tensors/configuration and communication construction order;
+    # no measured timings or fitted alpha/beta values are stored here.
+    shape_desc: Optional[str] = None
+    shape_desc_by_stage: Optional[Dict[str, str]] = None
+    input_shapes: Optional[List[List[int]]] = None
+    output_shapes: Optional[List[List[int]]] = None
+    input_dtypes: Optional[List[str]] = None
+    output_dtypes: Optional[List[str]] = None
+    dtype: Optional[str] = None
+    kernel_role: Optional[str] = None
+    projection: Optional[str] = None
+    comm_sequence: Optional[int] = None
+    comm_segment_index: Optional[int] = None
+    comm_id: Optional[str] = None
+    # Stable semantic communication-plan identity.  It is generated from the
+    # model call stack/phase and structural sequence, never from profiler gid
+    # values or measured timings.
+    plan_id: Optional[str] = None
+    # Optional model-declared consumer dependency.  Empty means the current
+    # event stream proves only lifecycle ordering, not the downstream tensor
+    # consumer that determines communication masking.
+    consumer_id: Optional[str] = None
+    depends_on: Optional[List[str]] = None
 
 
 class EventSink:
@@ -255,6 +354,12 @@ class EventSink:
 
     def __init__(self) -> None:
         self.events: List[SimuEvent] = []
+        # Per-rank structural communication sequence.  A sequence is assigned
+        # to a model-generated communication id on first emission and reused
+        # by its post/completion/wait spans.  This replaces duration sorting as
+        # the primary simulation-side ordering key.
+        self._comm_sequence_next: Dict[tuple, int] = {}
+        self._comm_sequence_by_id: Dict[tuple, int] = {}
         # Spans whose call_stk lacks a 'rank<N>-' prefix are dropped here,
         # counted but otherwise ignored. This mirrors the legacy behavior
         # where such log lines were written to log.log but silently dropped
@@ -289,6 +394,43 @@ class EventSink:
                 scope = "model"
         semantic_meta = _derive_semantic_metadata(
             segments, name or segments[-1], operation, kind, metadata)
+        if kind in ("comm", "wait"):
+            comm_id = semantic_meta.get("comm_id") or gid
+            comm_key = (
+                int(match.group(1)), operation,
+                semantic_meta.get("semantic_stage"),
+                semantic_meta.get("group_kind"),
+                semantic_meta.get("comm_stage"),
+                semantic_meta.get("comm_owner"),
+                # A repeated microbatch has the same model-generated comm id
+                # but a different semantic call-stack identity.  Keeping the
+                # semantic id in the sequence key prevents cross-microbatch
+                # plan aliases while post/completion/wait spans still reuse
+                # the same sequence within one call.
+                semantic_id,
+            )
+            id_key = (comm_key, str(comm_id), phase_id)
+            if id_key not in self._comm_sequence_by_id:
+                sequence = self._comm_sequence_next.get(comm_key, 0)
+                self._comm_sequence_next[comm_key] = sequence + 1
+                self._comm_sequence_by_id[id_key] = sequence
+            semantic_meta.setdefault(
+                "comm_sequence", self._comm_sequence_by_id[id_key])
+            semantic_meta.setdefault(
+                "comm_segment_index", self._comm_sequence_by_id[id_key])
+            # A call-level id is deliberately separate from gid because gid can
+            # be a tuple in the DES backend and is not always JSON-friendly.
+            semantic_meta.setdefault("comm_id", str(comm_id) if comm_id is not None else None)
+            # Do not include rank in plan_id.  The same semantic call emitted
+            # on several ranks should be consumable as one abstract plan.
+            plan_id = semantic_meta.get("plan_id")
+            if plan_id is None:
+                plan_id = (
+                    f"derived/{semantic_id}/{operation}/"
+                    f"s{semantic_meta.get('comm_sequence', 'u')}/"
+                    f"{comm_id if comm_id is not None else 'unknown'}"
+                )
+                semantic_meta["plan_id"] = plan_id
         self.events.append(SimuEvent(
             rank=int(match.group(1)),
             name=name or segments[-1],
@@ -317,6 +459,22 @@ class EventSink:
             payload_bytes=semantic_meta.get("payload_bytes", semantic_meta.get("size_bytes")),
             net=semantic_meta.get("net"),
             comm_stage=semantic_meta.get("comm_stage"),
+            shape_desc=semantic_meta.get("shape_desc"),
+            shape_desc_by_stage=semantic_meta.get("shape_desc_by_stage"),
+            input_shapes=semantic_meta.get("input_shapes"),
+            output_shapes=semantic_meta.get("output_shapes"),
+            input_dtypes=semantic_meta.get("input_dtypes"),
+            output_dtypes=semantic_meta.get("output_dtypes"),
+            dtype=semantic_meta.get("dtype"),
+            kernel_role=semantic_meta.get("kernel_role"),
+            projection=semantic_meta.get("projection"),
+            comm_sequence=semantic_meta.get("comm_sequence"),
+            comm_segment_index=semantic_meta.get("comm_segment_index"),
+            comm_id=semantic_meta.get("comm_id"),
+            plan_id=semantic_meta.get("plan_id"),
+            consumer_id=semantic_meta.get("consumer_id"),
+            depends_on=semantic_meta.get("depends_on")
+            or semantic_meta.get("dependency_ids"),
         ))
 
 
@@ -354,6 +512,21 @@ def event_to_record(event: SimuEvent) -> dict:
         "payload_bytes": event.payload_bytes,
         "net": event.net,
         "comm_stage": event.comm_stage,
+        "shape_desc": event.shape_desc,
+        "shape_desc_by_stage": event.shape_desc_by_stage,
+        "input_shapes": event.input_shapes,
+        "output_shapes": event.output_shapes,
+        "input_dtypes": event.input_dtypes,
+        "output_dtypes": event.output_dtypes,
+        "dtype": event.dtype,
+        "kernel_role": event.kernel_role,
+        "projection": event.projection,
+        "comm_sequence": event.comm_sequence,
+        "comm_segment_index": event.comm_segment_index,
+        "comm_id": event.comm_id,
+        "plan_id": event.plan_id,
+        "consumer_id": event.consumer_id,
+        "depends_on": event.depends_on,
     }
 
 

@@ -1168,16 +1168,26 @@ class CoreAttention(MetaModule):
         specific_name='DotProductAttention',
         is_last_recompute: bool = False,
         use_variance_tail_model: bool = False,
+        kv_head_replication: bool = False,
     ) -> None:
         super().__init__(strategy, system, specific_name)
         self.use_math_sdp = use_math_sdp
         self.use_flash_sdp = use_flash_sdp
         self.attention_sparse_ratio = self.strategy.attention_sparse_ratio
+        # Tensor parallelism always partitions query heads.  MQA/GQA kernels
+        # may instead replicate their (small) KV-head set on every TP rank;
+        # this is a structural layout choice, not a measured efficiency
+        # correction.  Generic attention keeps the historical divisible-KV
+        # requirement unless the caller explicitly enables replication.
+        self.kv_head_replication = bool(kv_head_replication)
         if self.strategy.tp_size > 1:
             assert head_num % self.strategy.tp_size == 0
-            assert kv_head_num % self.strategy.tp_size == 0
-            head_num = head_num / self.strategy.tp_size
-            kv_head_num = kv_head_num / self.strategy.tp_size
+            head_num = head_num // self.strategy.tp_size
+            if self.kv_head_replication:
+                assert kv_head_num >= 1
+            else:
+                assert kv_head_num % self.strategy.tp_size == 0
+                kv_head_num = kv_head_num // self.strategy.tp_size
         self.head_num = head_num
         self.kv_head_num = kv_head_num
         self.head_size = head_size

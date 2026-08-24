@@ -54,17 +54,25 @@ class SWACoreAttention(MetaModule):
         specific_name: str = 'SWAAttention',
         is_last_recompute: bool = False,
         use_variance_tail_model: bool = False,
+        kv_head_replication: bool = False,
     ) -> None:
         super().__init__(strategy, system, specific_name)
         self.use_math_sdp = use_math_sdp
         self.use_flash_sdp = use_flash_sdp
         self.window_size = window_size
         self.attention_sparse_ratio = 0.0  # SWA sparsity is inherent in windowed mask
+        # Query heads are partitioned by TP.  When an MQA/GQA implementation
+        # explicitly replicates KV heads per TP rank, retain the local KV
+        # count; otherwise require the usual divisible KV partition.
+        self.kv_head_replication = bool(kv_head_replication)
         if self.strategy.tp_size > 1:
             assert head_num % self.strategy.tp_size == 0
-            assert kv_head_num % self.strategy.tp_size == 0
-            head_num = head_num / self.strategy.tp_size
-            kv_head_num = kv_head_num / self.strategy.tp_size
+            head_num = head_num // self.strategy.tp_size
+            if self.kv_head_replication:
+                assert kv_head_num >= 1
+            else:
+                assert kv_head_num % self.strategy.tp_size == 0
+                kv_head_num = kv_head_num // self.strategy.tp_size
         self.head_num = head_num
         self.kv_head_num = kv_head_num
         self.head_size = head_size

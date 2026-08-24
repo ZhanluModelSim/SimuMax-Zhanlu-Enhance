@@ -21,6 +21,7 @@ from simumax.core.base_struct import (
 )
 from simumax.core.generate_tracing import write_trace_file
 from simumax.core.simu_events import write_debug_log
+from simumax.core.communication_plan import build_communication_plan_document
 from simumax.core.simu_artifacts import (
     append_memory_events_to_trace,
     export_simu_memory_artifacts,
@@ -310,6 +311,19 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
 
     write_debug_log(ctx.event_sink.events, log_path)
     write_trace_file(ctx.event_sink.events, output_json_path)
+    # Export the same semantic communication plan that the derivation tables
+    # describe.  This is model/DES output only; profiler traces are not read by
+    # the simulator and cannot alter the plan.
+    communication_plan = build_communication_plan_document(
+        events=ctx.event_sink.events,
+        system=perf_model.system,
+        strategy=perf_model.strategy,
+        derivation_records=perf_model.system.forward_derivation_records,
+    )
+    perf_model.system.communication_plan_document = communication_plan
+    communication_plan_path = os.path.join(save_path, "communication_plan.json")
+    with open(communication_plan_path, "w", encoding="utf-8") as f:
+        json.dump(communication_plan, f, indent=2, ensure_ascii=False)
     if ctx.memory_tracker is not None:
         append_memory_events_to_trace(output_json_path, ctx.memory_tracker)
         export_simu_memory_artifacts(save_path, ctx.memory_tracker, pickle_module=pickle)
@@ -327,7 +341,14 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
     # DES wall-clock duration = max clock over every thread and resource lane.
     # Communication exposure comes from graph dependencies in the single pass.
     des_wall_ms = max(max(th.t.values()) for th in simu.threads)
-    des_summary = {"duration_time_per_iter_ms": des_wall_ms}
+    des_summary = {
+        "duration_time_per_iter_ms": des_wall_ms,
+        "communication_plan_version": communication_plan["plan_version"],
+        "communication_plan_count": communication_plan["summary"]["plan_count"],
+        "communication_plan_unknown_count": communication_plan["summary"]["unknown_count"],
+        "communication_plan_partial_count": communication_plan["summary"]["partial_count"],
+        "performance_observations_used_as_parameters": False,
+    }
     des_summary_path = os.path.join(save_path, "des_summary.json")
     with open(des_summary_path, "w", encoding="utf-8") as f:
         json.dump(des_summary, f, indent=2)
