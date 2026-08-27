@@ -91,6 +91,50 @@ def _fsdp_dur(events):
     return total
 
 
+def _optimizer_lifecycle_summary(events):
+    """Summarize the model-declared optimizer dependency lifecycle.
+
+    This is an audit artifact, not a calibration path.  It records whether
+    the DES trace carries an explicit gradient-sync consumer edge and where
+    optimizer compute starts/ends.  No profiler data or measured duration is
+    consulted.
+    """
+    optimizer_compute = [
+        event for event in events
+        if event.scope == "optimizer" and event.kind in {"compute", "fused"}
+    ]
+    barriers = [event for event in events if event.kind == "wait"]
+    consumer_links = [
+        event for event in events if event.consumer_phase == "optimizer"
+    ]
+    explicit_dependencies = [
+        event for event in events
+        if event.dependency_status == "explicit"
+        and (event.depends_on or event.consumer_id)
+    ]
+    stage_counts = {}
+    for event in optimizer_compute:
+        stage = event.semantic_stage or "optimizer.compute"
+        stage_counts[stage] = stage_counts.get(stage, 0) + 1
+    return {
+        "optimizer_compute_event_count": len(optimizer_compute),
+        "optimizer_compute_start_ms": (
+            min((event.st for event in optimizer_compute), default=None)
+        ),
+        "optimizer_compute_end_ms": (
+            max((event.ed for event in optimizer_compute), default=None)
+        ),
+        "consumer_link_event_count": len(consumer_links),
+        "consumer_link_phases": sorted({
+            event.consumer_phase for event in consumer_links
+            if event.consumer_phase
+        }),
+        "wait_event_count": len(barriers),
+        "explicit_dependency_event_count": len(explicit_dependencies),
+        "optimizer_compute_stage_counts": stage_counts,
+    }
+
+
 def run_simulation(perf_model, save_path, merge_lanes=True):
     """Run simulator replay for a configured PerfLLM-like object.
 
@@ -104,6 +148,13 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
     # Resource lanes are computed once from the system config (design doc 4.2)
     # and shared by the SimuSystem, every SimuThread lane dict, and the ctx.
     resource_lanes = perf_model.system.simu_resource_lanes()
+    # ``fsdp_comm_streams`` is a strategy-level dependency experiment.  Keep
+    # custom semantic streams in the per-thread lane clocks without changing
+    # the default ``dp_comm`` queue or any communication cost formula.
+    fsdp_streams = getattr(perf_model.strategy, "fsdp_comm_streams", None) or {}
+    for stream in fsdp_streams.values():
+        if stream not in resource_lanes:
+            resource_lanes.append(stream)
     t0 = time.time()
     os.makedirs(save_path, exist_ok=True)
     log_path = os.path.join(save_path, "log.log")
@@ -169,6 +220,10 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
         simu = SimuSystem(resource_lanes=resource_lanes)
         ctx = SimuContext(BarrierBackend(), merge_lanes=merge_lanes, log_path=log_path,
                           resource_lanes=resource_lanes)
+        # Expose the forward-derived SystemConfig to collective lifecycle
+        # metadata.  This supplies declared algorithm/chunk/launch policy;
+        # no profiler duration or measured efficiency enters the DES context.
+        ctx.system = perf_model.system
         # Phase C virtual waiters (network-fabric design doc section 8)
         ctx.collective_skew = getattr(perf_model.strategy, "collective_skew", None)
         ctx.strategy = perf_model.strategy
@@ -310,7 +365,11 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
     print("wall time", time.time() - t0)
 
     write_debug_log(ctx.event_sink.events, log_path)
-    write_trace_file(ctx.event_sink.events, output_json_path)
+    write_trace_file(
+        ctx.event_sink.events,
+        output_json_path,
+        provenance=perf_model.system.provenance_audit(),
+    )
     # Export the same semantic communication plan that the derivation tables
     # describe.  This is model/DES output only; profiler traces are not read by
     # the simulator and cannot alter the plan.
@@ -341,17 +400,35 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
     # DES wall-clock duration = max clock over every thread and resource lane.
     # Communication exposure comes from graph dependencies in the single pass.
     des_wall_ms = max(max(th.t.values()) for th in simu.threads)
+    optimizer_lifecycle = _optimizer_lifecycle_summary(ctx.event_sink.events)
+    calibration_profile = getattr(perf_model.system, "calibration_profile", None)
+    calibration_enabled = (
+        isinstance(calibration_profile, dict)
+        and calibration_profile.get("mode") == "measured_calibration")
     des_summary = {
         "duration_time_per_iter_ms": des_wall_ms,
         "communication_plan_version": communication_plan["plan_version"],
         "communication_plan_count": communication_plan["summary"]["plan_count"],
         "communication_plan_unknown_count": communication_plan["summary"]["unknown_count"],
         "communication_plan_partial_count": communication_plan["summary"]["partial_count"],
-        "performance_observations_used_as_parameters": False,
+        "runtime_spec": communication_plan.get("runtime_spec"),
+        "optimizer_lifecycle": optimizer_lifecycle,
+        "performance_observations_used_as_parameters": calibration_enabled,
     }
     des_summary_path = os.path.join(save_path, "des_summary.json")
     with open(des_summary_path, "w", encoding="utf-8") as f:
         json.dump(des_summary, f, indent=2)
+    optimizer_lifecycle_path = os.path.join(save_path, "optimizer_lifecycle.json")
+    with open(optimizer_lifecycle_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "schema": "simumax_optimizer_lifecycle_v1",
+            "source": ("model_structure_and_configuration_plus_aggregate_"
+                       "measured_calibration"
+                       if calibration_enabled
+                       else "model_structure_and_configuration"),
+            "measured_data_used_as_parameters": calibration_enabled,
+            **optimizer_lifecycle,
+        }, f, indent=2)
     print(f"[DES] aligned wall-clock = {des_wall_ms / 1e3:.4f} s "
           f"-> {des_summary_path}")
     return des_summary

@@ -18,6 +18,48 @@ from simumax.core.transformer.dense_module import Swiglu, Gelu, MLP, Float8Quant
 from simumax.core.utils import format_model_info_microbatch_tag, get_rank_group
 from simumax.core.transformer.function import AddFunction
 Input = InputOutputInfo
+
+
+def _layout_logical_passes(system, op_name, local_expert_num):
+    """Return the declared logical layout-pass count for a fused route op.
+
+    The historical fallback models an index sort as ``1 + ceil(log2(E))``
+    memory passes.  A target CANN structural profile may declare a fused
+    implementation's total logical passes instead.  This keeps the model
+    portable and shape-driven while avoiding a trace-derived per-kernel time
+    or a hard-coded event duration.
+    """
+    fallback = 1 + math.ceil(math.log2(max(1, local_expert_num)))
+    resolver = getattr(system, "layout_pass_count", None)
+    if resolver is None:
+        return fallback
+    return resolver(op_name, fallback)
+
+
+def _layout_kernel_time(system, op_name, read_bytes, write_bytes, stage,
+                        path_key=None):
+    """Derive a materialized layout-kernel time from tensor traffic.
+
+    Layout operations are memory-bound, but they are still distinct kernels in
+    the DES graph.  Keeping the read/write split here lets the same
+    HBM/transaction/launch/MTE model serve both ``prefill`` and the analytical
+    parent cost.  A legacy SystemConfig without ``compute_layout_time`` keeps
+    the old byte-only fallback, so this helper does not introduce a measured
+    duration or an implementation-specific kernel name.
+    """
+    read_bytes = max(0, int(read_bytes))
+    write_bytes = max(0, int(write_bytes))
+    layout_time = getattr(system, "compute_layout_time", None)
+    if layout_time is not None:
+        return layout_time(
+            op_name,
+            read_bytes,
+            write_bytes,
+            stage=stage,
+            path_key=path_key,
+            shape_desc=(f"input_bytes={read_bytes},output_bytes={write_bytes}"),
+        )
+    return system.compute_mem_access_time(op_name, read_bytes + write_bytes)
 #region ------------------ Atomic module ------------------
 class Router(LinearBase):
     """
@@ -113,6 +155,7 @@ class Router(LinearBase):
                 strategy=self.strategy,
                 group_kind="ep",
                 comm_stage="Router_FWD_expert_header_AR",
+                comm_direction="fwd",
             )
             ar_bwd_cost = self.system.compute_net_op_time(
                 "all_reduce", expert_header_size,
@@ -121,6 +164,7 @@ class Router(LinearBase):
                 strategy=self.strategy,
                 group_kind="ep",
                 comm_stage="Router_BWD_expert_header_AR",
+                comm_direction="bwd",
             )
             self.layers.append(all_reduce(
                 f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}-expert_header_ar",
@@ -140,6 +184,7 @@ class Router(LinearBase):
                     strategy=self.strategy,
                     group_kind="ep",
                     comm_stage=f"Router_FWD_{field}_AGV",
+                    comm_direction="fwd",
                 )
                 self.layers.append(ag_cls(
                     f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}-{field}_agv",
@@ -155,7 +200,8 @@ class Router(LinearBase):
                 "reduce_scatterv", route_field_size,
                 comm_num=self.strategy.ep_size, net=self.strategy.ep_net,
                 strategy=self.strategy, group_kind="ep",
-                comm_stage="Router_BWD_route_grad_RSV")
+                comm_stage="Router_BWD_route_grad_RSV",
+                comm_direction="bwd")
             self.layers.append(reduce_scatterv(
                 f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}-route_grad_rsv",
                 rank_info['ep_rank'], self.strategy.ep_size,
@@ -224,25 +270,29 @@ class Router(LinearBase):
                     ag_op, route_field_size,
                     comm_num=self.strategy.ep_size, net=self.strategy.ep_net,
                     strategy=self.strategy, group_kind="ep",
-                    comm_stage=f"Router_FWD_{field}_AGV")
+                    comm_stage=f"Router_FWD_{field}_AGV",
+                    comm_direction="fwd")
             self._cost_info.fwd_net_time += self.system.compute_net_op_time(
                 "all_reduce", 2 * expert_field_size,
                 comm_num=self.strategy.ep_size, net=self.strategy.ep_net,
                 strategy=self.strategy, group_kind="ep",
-                comm_stage="Router_FWD_expert_header_AR")
+                comm_stage="Router_FWD_expert_header_AR",
+                comm_direction="fwd")
             self._cost_info.bwd_grad_act_net_time += \
                 self.system.compute_net_op_time(
                     "all_reduce", 2 * expert_field_size,
                     comm_num=self.strategy.ep_size,
                     net=self.strategy.ep_net,
                     strategy=self.strategy, group_kind="ep",
-                    comm_stage="Router_BWD_expert_header_AR")
+                    comm_stage="Router_BWD_expert_header_AR",
+                    comm_direction="bwd")
             self._cost_info.bwd_grad_act_net_time += \
                 self.system.compute_net_op_time(
                     "reduce_scatterv", route_field_size,
                     comm_num=self.strategy.ep_size, net=self.strategy.ep_net,
                     strategy=self.strategy, group_kind="ep",
-                    comm_stage="Router_BWD_route_grad_RSV")
+                    comm_stage="Router_BWD_route_grad_RSV",
+                    comm_direction="bwd")
 
     def _comp_leaf_act_info_impl(self):
         """
@@ -444,18 +494,19 @@ class Permutation(MetaModule):
         permutate1_mem_accessed = (
             self.input_act_size + 2 * self.permuted_act_size
         ) * self.dtype_to_element_size[self.strategy.dtype]
-        fwd_mem_time = self.system.compute_mem_access_time(
-            "permute_fwd",
-            permutate1_mem_accessed
-        )
-        bwd_mem_time = self.system.compute_mem_access_time(
-            "permute_bwd",
-            permutate1_mem_accessed
-        )
-        fwd_compute_time = self.system.compute_end2end_time(0, fwd_mem_time)
+        element_size = self.dtype_to_element_size[self.strategy.dtype]
+        permutate1_read = (
+            self.input_act_size + self.permuted_act_size) * element_size
+        permutate1_write = self.permuted_act_size * element_size
+        fwd_compute_time = _layout_kernel_time(
+            self.system, "permute1", permutate1_read, permutate1_write,
+            "fwd", self.call_stk)
+        bwd_mem_time = _layout_kernel_time(
+            self.system, "permute1", permutate1_read, permutate1_write,
+            "bwd", self.call_stk)
         bwd_grad_w_accessed_mem = 0
         bwd_grad_act_accessed_mem = bwd_mem_time
-        bwd_grad_act_time = self.system.compute_end2end_time(0, bwd_grad_act_accessed_mem)
+        bwd_grad_act_time = bwd_mem_time
         bwd_grad_w_time = self.system.compute_end2end_time(0, bwd_grad_w_accessed_mem)
         if include_pre:
             self.layers.append(AtomModel(fwd_cost=fwd_compute_time,
@@ -541,22 +592,20 @@ class Permutation(MetaModule):
             state.comm_order += 1
 
         #permutate2 after ep all2all and tp
-        concat_depth = math.ceil(math.log2(max(1, self.local_expert_num)))
+        concat_depth = _layout_logical_passes(
+            self.system, "permute2", self.local_expert_num)
         permutate2_mem_accessed = (
-            2 * self.permuted_act_size * (1 + concat_depth)
+            2 * self.permuted_act_size * concat_depth
         ) * self.dtype_to_element_size[self.strategy.dtype]
-        fwd_mem_time = self.system.compute_mem_access_time(
-            "permute_fwd",
-            permutate2_mem_accessed
-        )
-        bwd_mem_time = self.system.compute_mem_access_time(
-            "permute_bwd",
-            permutate2_mem_accessed
-        )
-        fwd_compute_time = self.system.compute_end2end_time(0, fwd_mem_time)
+        fwd_compute_time = _layout_kernel_time(
+            self.system, "permute2", permutate2_mem_accessed // 2,
+            permutate2_mem_accessed // 2, "fwd", self.call_stk)
+        bwd_mem_time = _layout_kernel_time(
+            self.system, "permute2", permutate2_mem_accessed // 2,
+            permutate2_mem_accessed // 2, "bwd", self.call_stk)
         bwd_grad_w_accessed_mem = 0
         bwd_grad_act_accessed_mem = bwd_mem_time
-        bwd_grad_act_time = self.system.compute_end2end_time(0, bwd_grad_act_accessed_mem)
+        bwd_grad_act_time = bwd_mem_time
         bwd_grad_w_time = self.system.compute_end2end_time(0, bwd_grad_w_accessed_mem)
         if include_post:
             self.layers.append(AtomModel(fwd_cost=fwd_compute_time,
@@ -785,9 +834,10 @@ class Permutation(MetaModule):
         permutate1_mem_accessed = (
             self.input_act_size + self.permuted_act_size
         ) * self.dtype_to_element_size[self.strategy.dtype] # fused: scatter
+        permutate2_passes = _layout_logical_passes(
+            self.system, "permute2", self.local_expert_num)
         permutate2_mem_accessed = (
-            2 * self.permuted_act_size
-            * (1 + math.ceil(math.log2(max(1, self.local_expert_num))))
+            2 * self.permuted_act_size * permutate2_passes
         ) * self.dtype_to_element_size[self.strategy.dtype]
 
         include_pre = self.stage_partition in ('all', 'pre_metadata')
@@ -811,33 +861,54 @@ class Permutation(MetaModule):
         permutate1_mem_accessed = (
             self.input_act_size + self.permuted_act_size
         ) * self.dtype_to_element_size[self.strategy.dtype]
+        permutate2_passes = _layout_logical_passes(
+            self.system, "permute2", self.local_expert_num)
         permutate2_mem_accessed = (
-            2 * self.permuted_act_size
-            * (1 + math.ceil(math.log2(max(1, self.local_expert_num))))
+            2 * self.permuted_act_size * permutate2_passes
         ) * self.dtype_to_element_size[self.strategy.dtype]
 
-        def split_stage_time(op_name, mem_chunks):
-            # compute_end2end_time returns ms; keep _cost_info.*_time fields
-            # in ms to stay consistent with compute/net times.
-            return sum(
-                self.compute_end2end_time(
-                    compute_time=0,
-                    mem_time=self.system.compute_mem_access_time(op_name, mem_bytes),
-                )
-                for mem_bytes in mem_chunks
+        element_size = self.dtype_to_element_size[self.strategy.dtype]
+        permutate1_read = (
+            self.input_act_size + self.permuted_act_size) * element_size
+        permutate1_write = self.permuted_act_size * element_size
+        permutate2_read = permutate2_mem_accessed // 2
+        permutate2_write = permutate2_mem_accessed // 2
+
+        def split_stage_time(stage):
+            # ``compute_layout_time`` returns milliseconds and includes the
+            # declared launch/MTE/layout resource costs for each materialized
+            # kernel.  Keep the parent cost in the same units as net times.
+            return (
+                _layout_kernel_time(
+                    self.system, "permute1", permutate1_read,
+                    permutate1_write, stage, self.call_stk)
+                + _layout_kernel_time(
+                    self.system, "permute2", permutate2_read,
+                    permutate2_write, stage, self.call_stk)
             )
 
         include_pre = self.stage_partition in ('all', 'pre_metadata')
         include_post = self.stage_partition in ('all', 'post_metadata')
-        selected_chunks = []
-        if include_pre:
-            selected_chunks.append(permutate1_mem_accessed)
-        if include_post:
-            selected_chunks.append(permutate2_mem_accessed)
-        self._cost_info.fwd_compute_time = split_stage_time(
-            "permute_fwd", selected_chunks)
-        self._cost_info.bwd_grad_act_time = split_stage_time(
-            "permute_bwd", selected_chunks)
+        if include_pre and include_post:
+            self._cost_info.fwd_compute_time = split_stage_time("fwd")
+            self._cost_info.bwd_grad_act_time = split_stage_time("bwd")
+        elif include_pre:
+            self._cost_info.fwd_compute_time = _layout_kernel_time(
+                self.system, "permute1", permutate1_read, permutate1_write,
+                "fwd", self.call_stk)
+            self._cost_info.bwd_grad_act_time = _layout_kernel_time(
+                self.system, "permute1", permutate1_read, permutate1_write,
+                "bwd", self.call_stk)
+        elif include_post:
+            self._cost_info.fwd_compute_time = _layout_kernel_time(
+                self.system, "permute2", permutate2_read, permutate2_write,
+                "fwd", self.call_stk)
+            self._cost_info.bwd_grad_act_time = _layout_kernel_time(
+                self.system, "permute2", permutate2_read, permutate2_write,
+                "bwd", self.call_stk)
+        else:
+            self._cost_info.fwd_compute_time = 0
+            self._cost_info.bwd_grad_act_time = 0
         self._cost_info.bwd_grad_w_time = 0
         self._cost_info.recompute_compute_time = (
             self._cost_info.fwd_compute_time if self.enable_recompute else 0
@@ -893,23 +964,23 @@ class UnPermutation(MetaModule):
 
     
         #unpermutate1 before tp and ep all2all
+        unpermutate1_passes = _layout_logical_passes(
+            self.system, "unpermute1", self.local_expert_num)
         unpermutate1_mem_accessed = ( # none-fused: contiguous memory(drop_and_pad) or sort_chunks_by_idxs
-            2 * self.act_size_before_combined
-            * (1 + math.ceil(math.log2(max(1, self.local_expert_num))))
+            2 * self.act_size_before_combined * unpermutate1_passes
         ) * self.dtype_to_element_size[self.strategy.dtype]
 
-        fwd_mem_time = self.system.compute_mem_access_time(
-            "permute_fwd",
-            unpermutate1_mem_accessed
-        )
-        bwd_mem_time = self.system.compute_mem_access_time(
-            "permute_bwd",
-            unpermutate1_mem_accessed
-        )
-        fwd_compute_time = self.system.compute_end2end_time(0, fwd_mem_time)
+        unpermutate1_read = unpermutate1_mem_accessed // 2
+        unpermutate1_write = unpermutate1_mem_accessed // 2
+        fwd_compute_time = _layout_kernel_time(
+            self.system, "unpermute1", unpermutate1_read,
+            unpermutate1_write, "fwd", self.call_stk)
+        bwd_mem_time = _layout_kernel_time(
+            self.system, "unpermute1", unpermutate1_read,
+            unpermutate1_write, "bwd", self.call_stk)
         bwd_grad_w_accessed_mem = 0
         bwd_grad_act_accessed_mem = bwd_mem_time
-        bwd_grad_act_time = self.system.compute_end2end_time(0, bwd_grad_act_accessed_mem)
+        bwd_grad_act_time = bwd_mem_time
         bwd_grad_w_time = self.system.compute_end2end_time(0, bwd_grad_w_accessed_mem)
         self.layers.append(AtomModel(fwd_cost=fwd_compute_time,
                                  bwd_cost=bwd_grad_act_time+bwd_grad_w_time,
@@ -976,18 +1047,17 @@ class UnPermutation(MetaModule):
         unpermutate2_and_combine_mem_accessed = (
             self.act_size_before_combined + self.act_size_after_combined
         ) * self.dtype_to_element_size[self.strategy.dtype]
-        fwd_mem_time = self.system.compute_mem_access_time(
-            "permute_fwd",
-            unpermutate2_and_combine_mem_accessed
-        )
-        bwd_mem_time = self.system.compute_mem_access_time(
-            "permute_bwd",
-            unpermutate2_and_combine_mem_accessed
-        )
-        fwd_compute_time = self.system.compute_end2end_time(0, fwd_mem_time)
+        unpermutate2_read = self.act_size_before_combined * self.dtype_to_element_size[self.strategy.dtype]
+        unpermutate2_write = self.act_size_after_combined * self.dtype_to_element_size[self.strategy.dtype]
+        fwd_compute_time = _layout_kernel_time(
+            self.system, "unpermutate2_and_combine", unpermutate2_read,
+            unpermutate2_write, "fwd", self.call_stk)
+        bwd_mem_time = _layout_kernel_time(
+            self.system, "unpermutate2_and_combine", unpermutate2_read,
+            unpermutate2_write, "bwd", self.call_stk)
         bwd_grad_w_accessed_mem = 0
         bwd_grad_act_accessed_mem = bwd_mem_time
-        bwd_grad_act_time = self.system.compute_end2end_time(0, bwd_grad_act_accessed_mem)
+        bwd_grad_act_time = bwd_mem_time
         bwd_grad_w_time = self.system.compute_end2end_time(0, bwd_grad_w_accessed_mem)
         self.layers.append(AtomModel(fwd_cost=fwd_compute_time,
                                  bwd_cost=bwd_grad_act_time+bwd_grad_w_time,
@@ -1153,9 +1223,10 @@ class UnPermutation(MetaModule):
         3.combine scores
         """
         # pylint: disable=invalid-name
+        unpermutate1_passes = _layout_logical_passes(
+            self.system, "unpermute1", self.local_expert_num)
         permutate1_mem_accessed = ( # none-fused: contiguous memory(drop_and_pad) or sort_chunks_by_idxs
-            2 * self.act_size_before_combined
-            * (1 + math.ceil(math.log2(max(1, self.local_expert_num))))
+            2 * self.act_size_before_combined * unpermutate1_passes
         ) * self.dtype_to_element_size[self.strategy.dtype]
         
         permutate2_and_combine_mem_accessed = ( # fused-op: combine permuted_features by probs and scatter_add
@@ -1182,33 +1253,38 @@ class UnPermutation(MetaModule):
         # kernel times matches simulator timing better than aggregating the
         # total bytes into one memory-bound estimate, because the bandwidth
         # model includes a fixed launch latency per kernel.
+        unpermutate1_passes = _layout_logical_passes(
+            self.system, "unpermute1", self.local_expert_num)
         unpermutate1_mem_accessed = (
-            2 * self.act_size_before_combined
-            * (1 + math.ceil(math.log2(max(1, self.local_expert_num))))
+            2 * self.act_size_before_combined * unpermutate1_passes
         ) * self.dtype_to_element_size[self.strategy.dtype]
         unpermutate2_and_combine_mem_accessed = (
             self.act_size_before_combined + self.act_size_after_combined
         ) * self.dtype_to_element_size[self.strategy.dtype]
 
-        def split_stage_time(op_name, mem_chunks):
-            # compute_end2end_time returns ms; keep _cost_info.*_time fields
-            # in ms to stay consistent with compute/net times.
-            return sum(
-                self.compute_end2end_time(
-                    compute_time=0,
-                    mem_time=self.system.compute_mem_access_time(op_name, mem_bytes),
-                )
-                for mem_bytes in mem_chunks
-            )
+        unpermutate1_read = unpermutate1_mem_accessed // 2
+        unpermutate1_write = unpermutate1_mem_accessed // 2
+        unpermutate2_read = (
+            self.act_size_before_combined
+            * self.dtype_to_element_size[self.strategy.dtype])
+        unpermutate2_write = (
+            self.act_size_after_combined
+            * self.dtype_to_element_size[self.strategy.dtype])
 
-        self._cost_info.fwd_compute_time = split_stage_time(
-            "permute_fwd",
-            [unpermutate1_mem_accessed, unpermutate2_and_combine_mem_accessed],
-        )
-        self._cost_info.bwd_grad_act_time = split_stage_time(
-            "permute_bwd",
-            [unpermutate1_mem_accessed, unpermutate2_and_combine_mem_accessed],
-        )
+        self._cost_info.fwd_compute_time = (
+            _layout_kernel_time(
+                self.system, "unpermute1", unpermutate1_read,
+                unpermutate1_write, "fwd", self.call_stk)
+            + _layout_kernel_time(
+                self.system, "unpermutate2_and_combine", unpermutate2_read,
+                unpermutate2_write, "fwd", self.call_stk))
+        self._cost_info.bwd_grad_act_time = (
+            _layout_kernel_time(
+                self.system, "unpermute1", unpermutate1_read,
+                unpermutate1_write, "bwd", self.call_stk)
+            + _layout_kernel_time(
+                self.system, "unpermutate2_and_combine", unpermutate2_read,
+                unpermutate2_write, "bwd", self.call_stk))
         self._cost_info.bwd_grad_w_time = 0
         self._cost_info.recompute_compute_time = (
             self._cost_info.fwd_time if self.enable_recompute else 0

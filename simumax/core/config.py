@@ -351,15 +351,31 @@ class StrategyConfig(Config):
     #          does not need all-gather. Only meaningful when zero_state >= 3
     #          and fsdp_mode == "layer-wise".
     reshard_after_forward: bool = True
-    # Number of layers to prefetch in layer-wise FSDP (FSDP2 gap analysis doc
-    # section 3.1). 1 = implicit prefetch (AG of next layer overlaps with
-    # current compute). 2+ = explicit prefetch (multiple AGs fly simultaneously).
+    # Number of successor layers to prefetch in layer-wise FSDP (FSDP2 gap
+    # analysis doc section 3.1). 0 = no successor prefetch (only the current
+    # layer's AGs are posted). 1 = the historical implicit prefetch (the next
+    # layer's AGs overlap with current compute). 2+ = explicit deeper
+    # prefetch. The total structural AG depth is therefore 1 + this value.
     # Only meaningful when zero_state >= 3 and fsdp_mode == "layer-wise".
     fsdp_prefetch_layers: int = 1
+    # FSDP forward AG consumer dependency. ``shared`` preserves the historical
+    # one-barrier model in which dense and MoE AGs of a layer are released
+    # together. ``split`` is a structural what-if/portable schedule option:
+    # dense parameters are released before Attention and MoE parameters before
+    # the MoE block. It changes dependency placement only; it does not alter
+    # collective payloads or costs.
+    fsdp_ag_consumer_dependency_mode: str = "shared"
     # Runtime queue depth for layer-wise FSDP gradient reduce-scatter. This is
     # a framework scheduling choice (not a measured overlap coefficient): the
     # producer waits for the oldest bucket before posting bucket N+depth.
     fsdp_max_inflight_reduce_scatters: int = 1
+    # Optional semantic communication streams for layer-wise FSDP.  The
+    # default keeps the historical single ``dp_comm`` queue.  A configured
+    # mapping may declare independent framework streams for all-gather and
+    # reduce-scatter; it changes only queue dependencies, never payload or
+    # collective cost.  This is intentionally a strategy choice rather than
+    # a hardware/CANN constant.
+    fsdp_comm_streams: Optional[Dict[str, str]] = None
     # Override the dense FSDP shard group size. When set, the dense
     # all-gather/reduce-scatter and ZeRO-1/2/3 memory sharding use this
     # value instead of the default dp_size * cp_size. This models
@@ -385,6 +401,12 @@ class StrategyConfig(Config):
     # None (default) disables the behavior entirely, so configs that do not set
     # it (e.g. the 16p regression config) are bit-for-bit unaffected.
     activation_offload: Optional[dict] = None
+    # DES trace granularity for the optimizer.  The analytical optimizer
+    # model derives a Newton--Schulz/orthogonal update as one logical phase,
+    # while ``detailed`` can be selected when callers need every structural
+    # sub-step for debugging.  The default is semantic because the base
+    # model is an offline cost model rather than a CANN kernel emulator.
+    optimizer_trace_granularity: str = "semantic"
     # Fraction of the forward cost replayed by gradient checkpointing
     # (recompute). The 16p trace recomputes only part of the layer forward
     # (attention/vwn kernels, ~0.65s) while a full-block replay would re-run
@@ -854,6 +876,10 @@ class StrategyConfig(Config):
         assert self.collective_skew is None or self.collective_skew in self.valid_collective_skew, (
             f"collective_skew {self.collective_skew} must be None or in [{','.join(self.valid_collective_skew)}]"
         )
+        assert self.optimizer_trace_granularity in {"semantic", "detailed"}, (
+            "optimizer_trace_granularity must be 'semantic' or 'detailed', "
+            f"got {self.optimizer_trace_granularity!r}"
+        )
         if self.cache_groupgemm_col_fp8_inputs:
             assert self.fp8, "cache_groupgemm_col_fp8_inputs requires fp8"
             
@@ -873,8 +899,12 @@ class StrategyConfig(Config):
                 "fsdp_mode has no effect when zero_state < 3"
             )
         if self.zero_state >= 3:
-            assert self.fsdp_prefetch_layers >= 1, (
-                f"fsdp_prefetch_layers must be >= 1, got {self.fsdp_prefetch_layers}"
+            assert self.fsdp_prefetch_layers >= 0, (
+                f"fsdp_prefetch_layers must be >= 0, got {self.fsdp_prefetch_layers}"
+            )
+            assert self.fsdp_ag_consumer_dependency_mode in {"shared", "split"}, (
+                "fsdp_ag_consumer_dependency_mode must be 'shared' or 'split', "
+                f"got {self.fsdp_ag_consumer_dependency_mode!r}"
             )
             assert self.fsdp_max_inflight_reduce_scatters >= 1, (
                 "fsdp_max_inflight_reduce_scatters must be >= 1, got "
@@ -883,6 +913,18 @@ class StrategyConfig(Config):
             if self.fsdp_prefetch_layers > 1 and self.fsdp_mode != "layer-wise":
                 warnings.warn(
                     "fsdp_prefetch_layers > 1 has no effect when fsdp_mode != 'layer-wise'"
+                )
+        if self.fsdp_comm_streams is not None:
+            assert isinstance(self.fsdp_comm_streams, dict), (
+                "fsdp_comm_streams must be a mapping of collective role to stream"
+            )
+            for role, stream in self.fsdp_comm_streams.items():
+                assert role in {"all_gather", "reduce_scatter"}, (
+                    "fsdp_comm_streams supports only all_gather and "
+                    f"reduce_scatter, got {role!r}"
+                )
+                assert isinstance(stream, str) and stream, (
+                    f"fsdp_comm_streams[{role!r}] must be a non-empty string"
                 )
         assert self.recompute_granularity is None or self.recompute_granularity in self.valid_recompute_granularity, f"recompute_granularity {self.recompute_granularity} must be in [{','.join(self.valid_recompute_granularity)}]"
         assert self.recompute_layer_num >= 0
@@ -1148,6 +1190,11 @@ class SystemConfig(Config):
     # efficiency/bandwidth tables remain loadable for regression, but are not
     # consulted by compute, HBM, or network timing.
     forward_derivation: Optional[Dict[str, Any]] = None
+    # Separate measured-calibration branch. It is applied only when the
+    # profile declares ``mode=measured_calibration`` and never changes the
+    # structural FLOPs, shapes, topology, or event graph produced by the
+    # forward-derived model.
+    calibration_profile: Optional[Dict[str, Any]] = None
     # Versioned software implementation profiles.  These are deliberately
     # separate from hardware_spec: CANN tiling/engine facts and HCCL host/task
     # scheduling are software/runtime behavior, not physical device limits.
@@ -1176,6 +1223,13 @@ class SystemConfig(Config):
         self.efficiency_overrides_strategy = None
         self.efficiency_overrides_api = None
         self.operator_mfu_overrides = {}
+        self._calibration_compute_index = {}
+        self._calibration_memory_index = {}
+        self._calibration_communication_index = {}
+        self._calibration_compute_match_policy = "shape_then_stage_fallback"
+        self._calibration_communication_strict_roles = False
+        self._calibration_communication_bucket_tolerance = 0
+        self._load_calibration_profile()
         self.forward_derivation_records = {
             "operators": {}, "network_layers": {}, "communications": {}}
         # The plan is a derived output, not a configuration input.  It is
@@ -1235,6 +1289,7 @@ class SystemConfig(Config):
         topology_ref = config_dict.pop("topology_profile", None)
         cann_ref = config_dict.pop("cann_profile", None)
         hccl_ref = config_dict.pop("hccl_runtime_profile", None)
+        calibration_ref = config_dict.pop("calibration_profile_ref", None)
         cann_defaulted = False
         hccl_defaulted = False
         profile_sources = {}
@@ -1277,6 +1332,20 @@ class SystemConfig(Config):
                 "hccl_runtime", profile)
             profile_sources["hccl_runtime"] = (
                 "default:portable_hccl_runtime" if hccl_defaulted else resolved)
+
+        if calibration_ref:
+            profile, resolved = cls._read_profile_ref(calibration_ref, config_file)
+            config_dict["calibration_profile"] = profile.get(
+                "calibration_profile", profile)
+            # Preserve the hardware/topology/CANN/HCCL provenance collected
+            # above when adding the calibration source.  Replacing this map
+            # would make an explicitly selected software profile appear to be
+            # a built-in default in calibrated-run audits.
+            profile_sources = {
+                **profile_sources,
+                **dict(config_dict.get("profile_sources", {})),
+            }
+            profile_sources["measured_calibration"] = resolved
 
         if profile_sources:
             existing_sources = config_dict.get("profile_sources", {})
@@ -1331,6 +1400,7 @@ class SystemConfig(Config):
         topology = config_dict.pop("topology", None)
         operator_efficiency = config_dict.pop("operator_efficiency", None)
         forward_derivation = config_dict.pop("forward_derivation", None)
+        calibration_profile = config_dict.pop("calibration_profile", None)
         cann_runtime = config_dict.pop("cann_runtime", None)
         hccl_runtime = config_dict.pop("hccl_runtime", None)
         profile_sources = config_dict.pop("profile_sources", None)
@@ -1369,6 +1439,7 @@ class SystemConfig(Config):
             topology=topology,
             operator_efficiency=operator_efficiency,
             forward_derivation=forward_derivation,
+            calibration_profile=calibration_profile,
             cann_runtime=cann_runtime,
             hccl_runtime=hccl_runtime,
             profile_sources=profile_sources,
@@ -1396,6 +1467,519 @@ class SystemConfig(Config):
     def forward_derivation_enabled(self):
         return bool((self.forward_derivation or {}).get("enabled", False))
 
+    def _load_calibration_profile(self):
+        """Index an explicitly requested measured-calibration profile.
+
+        The index is intentionally separate from ``operator_efficiency`` and
+        from the forward-derived hardware/software profiles.  A calibrated
+        run therefore keeps the same structural formulas and applies only
+        explicitly declared aggregate calibration components.  Compute
+        entries adjust semantic operator utilization.  Communication entries
+        may adjust only the pure transfer component through
+        ``transfer_efficiency``; the newer profile never scales a complete
+        Elapse/lifetime value.  The older ``time_multiplier`` form remains
+        readable for backwards-compatible regression profiles.  Profiles
+        generated by the calibration tool use list entries, but the parser
+        accepts a missing/empty profile so baseline construction stays
+        byte-compatible.
+        """
+        profile = self.calibration_profile
+        if not isinstance(profile, dict):
+            return
+        if profile.get("mode") != "measured_calibration":
+            return
+
+        compute = profile.get("compute") or {}
+        self._calibration_compute_match_policy = str(
+            compute.get("match_policy") or "shape_then_stage_fallback")
+        for entry in compute.get("entries", []):
+            if not isinstance(entry, dict):
+                continue
+            op_name = entry.get("op_name")
+            multiplier = entry.get("efficiency_multiplier")
+            if not op_name or multiplier is None:
+                continue
+            try:
+                multiplier = float(multiplier)
+            except (TypeError, ValueError):
+                continue
+            if multiplier <= 0:
+                continue
+            key = (
+                str(op_name),
+                str(entry.get("stage") or ""),
+                str(entry.get("shape_desc") or ""),
+                self._normalize_calibration_context(entry.get("kernel_role")),
+                self._normalize_calibration_context(entry.get("projection")),
+            )
+            self._calibration_compute_index[key] = {
+                "multiplier": multiplier,
+                "samples": entry.get("samples"),
+                "statistic": entry.get("statistic"),
+                "source": entry.get("source"),
+                "parameter_name": entry.get(
+                    "parameter_name", "operator_utilization"),
+                "value": entry.get("value"),
+                "source_type": entry.get("source_type"),
+                "derivation_method": entry.get("derivation_method"),
+                "confidence": entry.get("confidence"),
+                "portable": entry.get("portable"),
+                "case_specific": entry.get("case_specific"),
+                "direct_duration_fill": bool(entry.get(
+                    "direct_duration_fill", False)),
+                "kernel_role": key[3],
+                "projection": key[4],
+            }
+
+        memory = profile.get("memory") or {}
+        for entry in memory.get("entries", []):
+            if not isinstance(entry, dict):
+                continue
+            op_name = entry.get("op_name")
+            multiplier = entry.get("memory_time_multiplier")
+            if not op_name or multiplier is None:
+                continue
+            try:
+                multiplier = float(multiplier)
+            except (TypeError, ValueError):
+                continue
+            if multiplier <= 0:
+                continue
+            key = (
+                str(op_name),
+                str(entry.get("stage") or ""),
+                str(entry.get("shape_desc") or ""),
+                self._normalize_calibration_context(entry.get("kernel_role")),
+                self._normalize_calibration_context(entry.get("projection")),
+            )
+            self._calibration_memory_index[key] = {
+                "multiplier": multiplier,
+                "samples": entry.get("samples"),
+                "statistic": entry.get("statistic"),
+                "source": entry.get("source"),
+                "kernel_role": key[3],
+                "projection": key[4],
+            }
+
+        communication = profile.get("communication") or {}
+        self._calibration_communication_strict_roles = bool(
+            communication.get("strict_semantic_roles", False))
+        try:
+            self._calibration_communication_bucket_tolerance = max(
+                0, int(communication.get("size_bucket_tolerance", 0)))
+        except (TypeError, ValueError):
+            self._calibration_communication_bucket_tolerance = 0
+        for entry in communication.get("entries", []):
+            if not isinstance(entry, dict):
+                continue
+            op_name = entry.get("op_name")
+            transfer_efficiency = entry.get("transfer_efficiency")
+            multiplier = entry.get("time_multiplier")
+            # ``efficiency_multiplier`` is accepted only as a compatibility
+            # alias for older calibration artifacts.  New communication
+            # profiles must use the component-specific transfer field.
+            if transfer_efficiency is None and multiplier is None:
+                transfer_efficiency = entry.get("efficiency_multiplier")
+            if not op_name or (transfer_efficiency is None and multiplier is None):
+                continue
+            try:
+                if transfer_efficiency is not None:
+                    transfer_efficiency = float(transfer_efficiency)
+                if multiplier is not None:
+                    multiplier = float(multiplier)
+            except (TypeError, ValueError):
+                continue
+            if ((transfer_efficiency is not None and transfer_efficiency <= 0)
+                    or (transfer_efficiency is None
+                        and (multiplier is None or multiplier <= 0))):
+                continue
+            comm_num = entry.get("comm_num")
+            try:
+                comm_num = int(comm_num) if comm_num is not None else None
+            except (TypeError, ValueError):
+                comm_num = None
+            size_bucket = entry.get("size_bucket")
+            try:
+                size_bucket = int(size_bucket) if size_bucket is not None else None
+            except (TypeError, ValueError):
+                size_bucket = None
+            key = (
+                str(op_name),
+                self._calibration_comm_role(entry.get("comm_role")),
+                comm_num,
+                size_bucket,
+                self._calibration_direction(entry.get("direction")),
+            )
+            self._calibration_communication_index[key] = {
+                "multiplier": multiplier,
+                "transfer_efficiency": transfer_efficiency,
+                "samples": entry.get("samples"),
+                "statistic": entry.get("statistic"),
+                "source": entry.get("source"),
+                "parameter_name": entry.get(
+                    "parameter_name",
+                    "collective_transfer_efficiency"
+                    if transfer_efficiency is not None
+                    else "communication_time_multiplier"),
+                "value": entry.get("value"),
+                "source_type": entry.get("source_type"),
+                "derivation_method": entry.get("derivation_method"),
+                "confidence": entry.get("confidence"),
+                "portable": entry.get("portable"),
+                "case_specific": entry.get("case_specific"),
+                "direct_duration_fill": bool(entry.get(
+                    "direct_duration_fill", False)),
+                "comm_role": key[1],
+                "direction": key[4],
+                "direct_observation": entry.get("direct_observation", True),
+                "structural_extrapolation": entry.get(
+                    "structural_extrapolation", False),
+                "paired_from": entry.get("paired_from"),
+            }
+
+    @staticmethod
+    def _normalize_calibration_context(value):
+        """Normalize optional role/projection metadata without inventing it."""
+        value = " ".join(str(value or "").strip().split())
+        if value.lower() in {"", "未记录", "未提取", "n/a", "na", "none", "null"}:
+            return ""
+        return value
+
+    @staticmethod
+    def _calibration_direction(value):
+        """Map a semantic stage label to the portable fwd/bwd/optimizer family."""
+        value = str(value or "").lower().replace("-", "_")
+        if value.startswith("bwd") or "backward" in value or "_bwd" in value:
+            return "bwd"
+        if value.startswith("opt") or "optimizer" in value or "_opt" in value:
+            return "optimizer"
+        if value.startswith("fwd") or "forward" in value or "_fwd" in value:
+            return "fwd"
+        return ""
+
+    @staticmethod
+    def _calibration_comm_role(value):
+        """Normalize an optional semantic collective role for calibration.
+
+        ``all_gather`` and ``reduce_scatter`` are reused by model-level sync,
+        layer FSDP, and router paths.  A role is a structural model field
+        (carried by the communication plan), not a measured identity.  Empty
+        roles remain the portable fallback used by older profiles.
+        """
+        value = SystemConfig._normalize_calibration_context(value)
+        return value.lower() if value else ""
+
+    def _calibration_context(self, op_name, shape_desc, stage,
+                             kernel_role=None, projection=None):
+        """Resolve context available to the forward-derived call site.
+
+        Most cost-model call sites pass the structural shape only.  GroupGEMM
+        projection is therefore read from its model-generated shape descriptor,
+        while the VWN phase role is read from its explicit structural stage.
+        These are semantic model fields, not profiler timings.
+        """
+        role = self._normalize_calibration_context(kernel_role)
+        projection = self._normalize_calibration_context(projection)
+        shape_desc = str(shape_desc or "")
+        if not projection:
+            match = re.search(
+                r"(?:^|[, ])projection=([A-Za-z0-9_]+)",
+                shape_desc, re.IGNORECASE)
+            if match:
+                projection = self._normalize_calibration_context(match.group(1))
+        if not role:
+            match = re.search(
+                r"(?:^|[, ])(?:kernel_role|role)=([A-Za-z0-9_]+)",
+                shape_desc, re.IGNORECASE)
+            if match:
+                role = self._normalize_calibration_context(match.group(1))
+        stage_text = str(stage or "").lower()
+        if not role:
+            for token in ("vwn_width", "vwn_depth", "vwn_out"):
+                if token in stage_text:
+                    role = token
+                    break
+        if not role and stage_text in {"bwd_grad_act", "bwd_grad_w"}:
+            role = stage_text
+        if not role and projection and str(op_name or "") in {
+                "group_linear_col", "group_linear_row"}:
+            role = projection
+        return role, projection
+
+    @staticmethod
+    def _calibration_stage_family(stage):
+        stage = str(stage or "")
+        stage_lower = stage.lower().replace("-", "_")
+        if stage_lower.startswith("opt") or "optimizer" in stage_lower:
+            return "optimizer"
+        if stage.startswith("bwd"):
+            return "bwd"
+        if stage == "fwd" or stage.endswith("_fwd"):
+            return "fwd"
+        return ""
+
+    def _calibration_compute_multiplier(self, op_name, shape_desc, stage,
+                                        kernel_role=None, projection=None):
+        """Resolve one aggregate compute-efficiency multiplier."""
+        if not self._calibration_compute_index:
+            return None
+        op_name = str(op_name or "")
+        stage = str(stage or "")
+        shape_desc = str(shape_desc or "")
+        # The forward derivation records detailed backward stages, while
+        # calibration groups may intentionally use the portable ``bwd``
+        # family.  Keep exact semantic stages first (important for VWN and
+        # other explicitly split phases), then fall back to the family.
+        stage_family = self._calibration_stage_family(stage)
+        role, projection = self._calibration_context(
+            op_name, shape_desc, stage, kernel_role, projection)
+        context_policy = (
+            self._calibration_compute_match_policy
+            == "role_projection_shape_then_shape")
+        if context_policy:
+            keys = []
+            if role or projection:
+                keys.append((op_name, stage, shape_desc, role, projection))
+                if stage_family and stage_family != stage:
+                    keys.append((op_name, stage_family, shape_desc,
+                                 role, projection))
+            # Context-free exact-shape entries are intentionally second tier.
+            keys.append((op_name, stage, shape_desc, "", ""))
+            if stage_family and stage_family != stage:
+                keys.append((op_name, stage_family, shape_desc, "", ""))
+            for key in keys:
+                entry = self._calibration_compute_index.get(key)
+                if entry is not None:
+                    return entry
+            return None
+        if self._calibration_compute_match_policy == "exact_shape_stage_only":
+            if not shape_desc:
+                return None
+            keys = [(op_name, stage, shape_desc, "", "")]
+            if stage_family and stage_family != stage:
+                keys.append((op_name, stage_family, shape_desc, "", ""))
+            for key in keys:
+                entry = self._calibration_compute_index.get(key)
+                if entry is not None:
+                    return entry
+            return None
+        keys = [
+            (op_name, stage, shape_desc, "", ""),
+            (op_name, stage, "", "", ""),
+        ]
+        if stage_family and stage_family != stage:
+            keys.extend([
+                (op_name, stage_family, shape_desc, "", ""),
+                (op_name, stage_family, "", "", ""),
+            ])
+        keys.extend([
+            (op_name, "", shape_desc, "", ""),
+            (op_name, "", "", "", ""),
+        ])
+        for key in keys:
+            entry = self._calibration_compute_index.get(key)
+            if entry is not None:
+                return entry
+        return None
+
+    def _calibration_memory_multiplier(self, op_name, shape_desc, stage,
+                                       kernel_role=None, projection=None):
+        """Resolve one memory-transfer multiplier for a forward-derived stage."""
+        if not self._calibration_memory_index:
+            return None
+        op_name = str(op_name or "")
+        stage = str(stage or "")
+        shape_desc = str(shape_desc or "")
+        stage_family = self._calibration_stage_family(stage)
+        role, projection = self._calibration_context(
+            op_name, shape_desc, stage, kernel_role, projection)
+        context_policy = (
+            self._calibration_compute_match_policy
+            == "role_projection_shape_then_shape")
+        keys = []
+        if context_policy and (role or projection):
+            keys.append((op_name, stage, shape_desc, role, projection))
+            if stage_family and stage_family != stage:
+                keys.append((op_name, stage_family, shape_desc,
+                             role, projection))
+        keys.append((op_name, stage, shape_desc, "", ""))
+        if stage_family and stage_family != stage:
+            keys.append((op_name, stage_family, shape_desc, "", ""))
+        for key in keys:
+            entry = self._calibration_memory_index.get(key)
+            if entry is not None:
+                return entry
+        return None
+
+    @staticmethod
+    def _calibration_size_bucket(size):
+        if not size or size <= 0:
+            return None
+        return int(round(math.log2(max(1, float(size)))))
+
+    def _calibration_communication_multiplier(self, op_name, size, comm_num,
+                                              direction=None, comm_role=None,
+                                              comm_stage=None):
+        """Resolve one structural communication calibration entry.
+
+        Size buckets are logarithmic rather than exact payload keys, so the
+        calibration is reusable for nearby shapes and is not a per-event
+        duration table.
+        """
+        if not self._calibration_communication_index:
+            return None
+        op_name = str(op_name or "")
+        # Runtime/model call sites may use semantic aliases such as
+        # ``fsdp_all_gather`` and ``fsdp_reduce_scatter`` while calibration
+        # profiles intentionally use the canonical collective family.  Keep
+        # the requested name first, then fall back to the canonical network
+        # operation without making the profile depend on one implementation's
+        # event spelling.
+        op_names = [op_name]
+        canonical_op_name = NET_OP_FALLBACK.get(op_name)
+        if canonical_op_name and canonical_op_name not in op_names:
+            op_names.append(canonical_op_name)
+        # ``all2all`` is the historical model spelling for the same
+        # all-to-all-v semantic family used by the newer communication plan
+        # and calibration profile.  Keep both spellings in the structural
+        # lookup without changing the forward formula.
+        if op_name == "all2all" and "alltoallv" not in op_names:
+            op_names.append("alltoallv")
+        try:
+            comm_num = int(comm_num) if comm_num is not None else None
+        except (TypeError, ValueError):
+            comm_num = None
+        size_bucket = self._calibration_size_bucket(size)
+        raw_role = comm_role or self._calibration_role_from_stage(comm_stage)
+        comm_role = self._calibration_comm_role(raw_role)
+        direction = self._calibration_direction(direction)
+        if not direction:
+            direction = self._calibration_direction_from_role(comm_role)
+        role_keys = (comm_role,) if (
+            comm_role and self._calibration_communication_strict_roles) \
+            else ((comm_role, "") if comm_role else ("",))
+        direction_keys = (direction, "") if direction else ("",)
+        keys = []
+        for key_role in role_keys:
+            for key_op_name in op_names:
+                for key_direction in direction_keys:
+                    keys.extend([
+                        (key_op_name, key_role, comm_num, size_bucket,
+                         key_direction),
+                        (key_op_name, key_role, comm_num, None,
+                         key_direction),
+                        (key_op_name, key_role, None, size_bucket,
+                         key_direction),
+                        (key_op_name, key_role, None, None, key_direction),
+                    ])
+        for key in keys:
+            entry = self._calibration_communication_index.get(key)
+            if entry is not None:
+                return entry
+        # A payload may move by a small, structural logarithmic bucket when a
+        # model/strategy changes a token count or dtype.  When the profile
+        # explicitly opts in, reuse the nearest bucket within that tolerance
+        # instead of silently dropping to a role-free multiplier.  The lookup
+        # is based only on op/role/group/direction/payload structure; measured
+        # durations never choose the identity of a communication event.
+        tolerance = self._calibration_communication_bucket_tolerance
+        if size_bucket is not None and tolerance > 0:
+            nearest = []
+            for key, entry in self._calibration_communication_index.items():
+                key_op, key_role, key_num, key_bucket, key_direction = key
+                if key_op not in op_names or key_role not in role_keys:
+                    continue
+                if key_num != comm_num or key_direction not in direction_keys:
+                    continue
+                if key_bucket is None:
+                    continue
+                delta = abs(int(key_bucket) - int(size_bucket))
+                if delta <= tolerance:
+                    nearest.append((delta, key, entry))
+            if nearest:
+                nearest.sort(key=lambda item: (item[0], str(item[1])))
+                entry = dict(nearest[0][2])
+                entry["lookup"] = "nearest_payload_bucket"
+                entry["payload_bucket_delta"] = nearest[0][0]
+                return entry
+        return None
+
+    @staticmethod
+    def _calibration_role_from_stage(comm_stage):
+        """Resolve known semantic role aliases from a model stage label.
+
+        Some older operator call sites provide a semantic ``comm_stage`` but
+        predate the optional ``comm_role`` argument.  These aliases describe
+        the model graph (Router route fields, CP attention exchanges, and the
+        two MoE physical exchanges); they do not inspect profiler timing or
+        infer a runtime coefficient.
+        """
+        value = str(comm_stage or "").strip().lower().replace("-", "_")
+        if value in {"moe_dispatch", "dispatch"}:
+            return "dispatch_activation_a2av"
+        if value in {"moe_combine", "combine"}:
+            return "combine_ep"
+        if value.startswith("router_"):
+            if "route_grad" in value or "_rsv" in value:
+                return "router_route_grad_rsv"
+            if "topk_ids" in value or "topk_weights" in value or "_agv" in value:
+                return "router_route_fields_agv"
+        if value.startswith("attention_"):
+            return value
+        return ""
+
+    @staticmethod
+    def _calibration_direction_from_role(comm_role):
+        value = str(comm_role or "").lower()
+        if "bwd" in value or "grad" in value:
+            return "bwd"
+        if "fwd" in value or value in {
+                "dispatch_activation_a2av", "combine_ep",
+                "router_route_fields_agv"}:
+            return "fwd"
+        return ""
+
+    def _apply_communication_calibration(self, op_name, size, comm_num,
+                                         time_ms, direction=None,
+                                         comm_role=None, transfer_time_ms=None,
+                                         comm_stage=None):
+        """Apply a declared communication calibration component.
+
+        New profiles expose ``transfer_efficiency`` and therefore modify only
+        the model-derived payload-transfer term:
+
+        ``T = T_transfer / efficiency + T_physical_and_runtime``.
+
+        The complete-call ``time_multiplier`` branch is retained solely for
+        older regression profiles.  It is intentionally not used when a
+        component-specific transfer efficiency is present, and no measured
+        Elapse/Wait/Idle/Sync field is accepted here.
+        """
+        entry = self._calibration_communication_multiplier(
+            op_name, size, comm_num, direction, comm_role, comm_stage)
+        if entry is None:
+            return time_ms, None
+        transfer_efficiency = entry.get("transfer_efficiency")
+        if transfer_efficiency is not None:
+            if transfer_time_ms is None:
+                # A caller that has not exposed the transfer component cannot
+                # safely consume a transfer-only calibration.  Keep the
+                # forward-derived time unchanged rather than scaling a whole
+                # semantic lifetime by accident.
+                return time_ms, None
+            return max(
+                0.0,
+                time_ms - transfer_time_ms
+                + transfer_time_ms / transfer_efficiency,
+            ), entry
+        multiplier = entry.get("multiplier")
+        if multiplier is None:
+            return time_ms, None
+        # Legacy time_multiplier is measured/base. Keep the physical/topology
+        # formula intact and scale only the final semantic call lifetime for
+        # explicitly old profiles.
+        return max(0.0, time_ms * multiplier), entry
+
     def _cann_compute_config(self, create=False):
         """Return the versioned CANN compute profile."""
         if self.cann_runtime is not None:
@@ -1406,11 +1990,210 @@ class SystemConfig(Config):
         # profile. Keep the same portable-default semantics as init_from_dict.
         return {}
 
+    def layout_pass_count(self, op_name, default):
+        """Resolve a structural logical-pass count for a layout operation.
+
+        ``Permutation``/``UnPermutation`` historically estimated an indexed
+        reorder as ``1 + ceil(log2(local_expert_num))`` full-buffer passes.
+        A software implementation profile may instead declare that the
+        target library fuses the reorder into a smaller number of logical
+        streaming passes.  This is a CANN/layout contract, not a measured
+        duration or a per-event calibration value.  If no declaration exists,
+        the caller's shape-derived fallback is preserved.
+        """
+        try:
+            fallback = max(1, int(default))
+        except (TypeError, ValueError):
+            fallback = 1
+        cfg = self._cann_compute_config()
+        models = cfg.get("layout_resource_models", {}) or {}
+        entry = models.get(op_name, {}) if isinstance(models, dict) else {}
+        if not isinstance(entry, dict):
+            return fallback
+        value = entry.get("logical_passes", entry.get("pass_count"))
+        if value is None:
+            return fallback
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return fallback
+
+    def resolve_layout_op_name(self, op_name, stage=None, path_key=None,
+                               shape_desc=None):
+        """Resolve a semantic layout path to its declared resource model.
+
+        Layout operations can share one high-level name while using different
+        physical paths.  For example, a CP ``*_redist`` stage is an indexed
+        scatter into an existing buffer, whereas a Q/OUT stage is a full
+        read--transpose--write pass.  The distinction is a software/library
+        contract and must therefore live in the CANN profile, not in a
+        measured-duration table.  Rules are optional and first-match; without
+        a rule the requested name is preserved for backward compatibility.
+
+        A rule has ``source_op`` (or ``op_name``), ``contains`` (a string or
+        list of case-insensitive tokens), and ``resolved_op``.  Tokens are
+        matched against the declared stage/path/shape description only; no
+        profiler fields are inspected.
+        """
+        requested = str(op_name or "")
+        cfg = self._cann_compute_config()
+        rules = cfg.get("layout_path_rules", []) or []
+        if isinstance(rules, dict):
+            rules = [rules]
+        context = " ".join(str(value or "") for value in (
+            stage, path_key, shape_desc)).lower()
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            source = rule.get("source_op", rule.get("op_name"))
+            if source not in (None, "", requested):
+                continue
+            tokens = rule.get("contains", rule.get("stage_contains", []))
+            if isinstance(tokens, str):
+                tokens = [tokens]
+            if tokens and not all(str(token).lower() in context
+                                  for token in tokens):
+                continue
+            resolved = rule.get("resolved_op", rule.get("profile"))
+            if resolved:
+                return str(resolved)
+        return requested
+
     def _hccl_network_config(self):
         """Return the versioned HCCL/runtime network profile."""
         if self.hccl_runtime is not None:
             return self.hccl_runtime.get("network", self.hccl_runtime)
         return {}
+
+    def provenance_audit(self):
+        """Return an explicit separation of structural and performance inputs.
+
+        A forward-derived run consumes only model/strategy/system facts.  The
+        separate measured-calibration branch may additionally consume shape or
+        role-indexed aggregate multipliers.  Keep these facts explicit so a
+        report cannot accidentally describe a calibrated run as validation-only
+        (or describe a structural mapping as a duration parameter).
+        """
+        profile = self.calibration_profile
+        calibrated = (
+            isinstance(profile, dict)
+            and profile.get("mode") == "measured_calibration")
+        profile = profile if calibrated else {}
+        source = dict(profile.get("source") or {})
+        statistics = dict(profile.get("statistics") or {})
+        groups = {
+            "compute": list((profile.get("compute") or {}).get("entries", []) or []),
+            "memory": list((profile.get("memory") or {}).get("entries", []) or []),
+            "communication": list(
+                (profile.get("communication") or {}).get("entries", []) or []),
+        }
+        entries = [entry for rows in groups.values()
+                   for entry in rows if isinstance(entry, dict)]
+        policy_text = " ".join(
+            str(value).lower()
+            for value in (
+                profile.get("description"),
+                profile.get("calibration_scope"),
+                statistics.get("compute_match_policy"),
+                statistics.get("communication_calibration_scope"),
+            )
+            if value is not None)
+        structural_fallback = bool(
+            source.get("alignment_table")
+            or source.get("trace_view_family_summary")
+            or source.get("communication_sidecar"))
+        shape_fallback = bool(
+            "shape" in policy_text
+            or any(entry.get("shape_desc") or entry.get("shape")
+                   for entry in entries))
+        role_fallback = bool(
+            "role" in policy_text
+            or any(entry.get("kernel_role") or entry.get("projection")
+                   or entry.get("comm_role") for entry in entries))
+        measured_token = (
+            "measured", "duration", "exposed", "raw", "efficiency")
+        duration_fallback = bool(
+            calibrated and entries and any(
+                any(token in str(value).lower() for token in measured_token)
+                for value in list(statistics.values()) + [
+                    entry.get("statistic") for entry in entries]
+                    + [entry.get("source") for entry in entries]))
+        explicit = dict(profile.get("provenance") or {})
+        structural_used = bool(explicit.get(
+            "structural_observations_used", structural_fallback))
+        shape_used = bool(explicit.get(
+            "shape_observations_used", shape_fallback))
+        role_used = bool(explicit.get(
+            "kernel_role_observations_used", role_fallback))
+        duration_used = bool(explicit.get(
+            "performance_duration_observations_used", duration_fallback))
+        performance_used = bool(
+            explicit.get("performance_observations_used_as_parameters",
+                         calibrated and bool(entries)))
+
+        fixed_scope = bool(
+            profile.get("world_size") is not None
+            or "fixed_configuration" in policy_text
+            or "fixed configuration" in policy_text)
+        parameter_sources = {
+            "compute": (source.get("physical_windows")
+                        or source.get("alignment_table")),
+            "memory": source.get("alignment_table"),
+            "communication": (
+                source.get("trace_view_family_summary")
+                or source.get("communication_sidecar")),
+        }
+        parameters = []
+        for group, rows in groups.items():
+            if not rows:
+                continue
+            parameter_names = sorted({
+                str(entry.get("parameter_name") or "")
+                for entry in rows
+                if entry.get("parameter_name")
+            })
+            if group == "memory":
+                parameter = "memory.time_multiplier"
+            elif group == "compute":
+                parameter = parameter_names[0] if len(parameter_names) == 1 \
+                    else "compute.operator_utilization"
+            else:
+                parameter = parameter_names[0] if len(parameter_names) == 1 \
+                    else "communication.transfer_efficiency"
+            source_types = sorted({
+                str(entry.get("source_type") or "")
+                for entry in rows
+                if entry.get("source_type")
+            })
+            parameters.append({
+                "parameter": parameter,
+                "source": parameter_sources.get(group),
+                "source_type": (
+                    source_types[0] if len(source_types) == 1
+                    else "mixed" if source_types else
+                    "measured_duration" if duration_used
+                    else "structural_trace"),
+                "case_specific": fixed_scope,
+                "portable": not fixed_scope,
+                "entries": len(rows),
+                "parameter_names": parameter_names,
+            })
+        mode = "measured_calibration" if calibrated else "forward_derived"
+        return {
+            "mode": mode,
+            "structural_observations_used": structural_used,
+            "shape_observations_used": shape_used,
+            "kernel_role_observations_used": role_used,
+            "performance_duration_observations_used": duration_used,
+            "performance_observations_used_as_parameters": performance_used,
+            "model_structure_and_system_config_used": True,
+            "calibration_parameter_count": len(parameters),
+            "calibration_parameters": parameters,
+            "measured_source": source or None,
+            "inference_basis": (
+                "explicit_profile_provenance_or_profile_fields"
+                if calibrated else "no_measured_profile_loaded"),
+        }
 
     def forward_profile_audit(self):
         """Describe profile provenance and legacy calibration isolation."""
@@ -1442,21 +2225,264 @@ class SystemConfig(Config):
         defaulted_profiles = sorted(
             name for name, source in profile_sources.items()
             if str(source).startswith(("default:", "built_in:")))
+        cann_profile = self.cann_runtime or {}
+        hccl_profile = self.hccl_runtime or {}
+        cann_compute = self._cann_compute_config()
+        cann_execution_contract = cann_compute.get(
+            "public_execution_contract", {}) or {}
+        stage_models = cann_compute.get("implementation_stage_models", {}) or {}
+        if not isinstance(stage_models, dict):
+            stage_models = {}
+        mte_profile = cann_compute.get("mte", {}) or {}
+        host_tiling = cann_compute.get("host_tiling", {}) or {}
+        alignment_constraints = cann_compute.get("alignment_constraints", {}) or {}
+        host_tiling_fields = (
+            "tile", "block_dim", "tiling_key", "workspace_bytes")
+        hccl_runtime = self._hccl_network_config().get("call_runtime", {}) or {}
+        hccl_network = self._hccl_network_config()
+        hccl_execution_contract = hccl_network.get(
+            "public_execution_contract", {}) or {}
+        algorithm_selection = hccl_network.get("algorithm_selection", {}) or {}
+        communicator_defaults = hccl_network.get("communicator_defaults", {}) or {}
+        completion = hccl_runtime.get("completion", {}) or {}
+        completion_fields = (
+            "completion_latency_us", "wait_latency_us", "barrier_latency_us")
+        completion_complete = all(
+            isinstance(completion.get(name), (int, float))
+            and completion.get(name) >= 0
+            for name in completion_fields)
         return {
             "forward_derivation_enabled": self.forward_derivation_enabled,
+            "provenance": self.provenance_audit(),
+            "measured_calibration_enabled": bool(
+                isinstance(self.calibration_profile, dict)
+                and self.calibration_profile.get("mode")
+                == "measured_calibration"),
+            "measured_calibration_world_size": (
+                self.calibration_profile.get("world_size")
+                if isinstance(self.calibration_profile, dict)
+                else None),
+            "measured_calibration_compute_match_policy": (
+                self._calibration_compute_match_policy
+                if isinstance(self.calibration_profile, dict)
+                and self.calibration_profile.get("mode")
+                == "measured_calibration"
+                else None),
+            "measured_calibration_source": (
+                self.calibration_profile.get("source")
+                if isinstance(self.calibration_profile, dict)
+                else None),
+            "measured_calibration_compute_entries": len(
+                self._calibration_compute_index),
+            "measured_calibration_communication_entries": len(
+                self._calibration_communication_index),
+            "measured_calibration_communication_component": (
+                "pure_transfer_efficiency"
+                if any(entry.get("transfer_efficiency") is not None
+                       for entry in self._calibration_communication_index.values())
+                else None),
             "profile_sources": profile_sources,
             "defaulted_software_profiles": defaulted_profiles,
             "cann_version": (self.cann_runtime or {}).get("version"),
             "hccl_runtime_version": (self.hccl_runtime or {}).get("version"),
+            "cann_profile_kind": cann_profile.get("profile_kind"),
+            "cann_spec_status": cann_profile.get("spec_status"),
+            "cann_target_architecture": cann_profile.get("target_architecture"),
+            "cann_source_refs": list(cann_profile.get("source_refs", []) or []),
+            "cann_public_execution_contract": {
+                "source_basis": cann_execution_contract.get("source_basis"),
+                "host_inputs": list((cann_execution_contract.get(
+                    "host_contract", {}) or {}).get("inputs", []) or []),
+                "host_outputs": list((cann_execution_contract.get(
+                    "host_contract", {}) or {}).get("outputs", []) or []),
+                "api_symbols": list((cann_execution_contract.get(
+                    "host_contract", {}) or {}).get("api_symbols", []) or []),
+                "stage_contracts": cann_execution_contract.get(
+                    "portable_stage_contract"),
+                "exact_values_policy": (cann_execution_contract.get(
+                    "host_contract", {}) or {}).get("exact_values_policy"),
+            },
+            "hccl_profile_kind": hccl_profile.get("profile_kind"),
+            "hccl_spec_status": hccl_profile.get("spec_status"),
+            "hccl_source_refs": list(hccl_profile.get("source_refs", []) or []),
+            "hccl_public_execution_contract": {
+                "source_basis": hccl_execution_contract.get("source_basis"),
+                "call_inputs": list((hccl_execution_contract.get(
+                    "call_contract", {}) or {}).get("inputs", []) or []),
+                "executor_lifecycle": list(hccl_execution_contract.get(
+                    "executor_lifecycle", []) or []),
+                "resource_request_fields": list(hccl_execution_contract.get(
+                    "resource_request_fields", []) or []),
+                "topology_contract": hccl_execution_contract.get(
+                    "topology_contract"),
+                "runtime_values_not_publicly_fixed": list(
+                    hccl_execution_contract.get(
+                        "runtime_values_not_publicly_fixed", []) or []),
+            },
             "legacy_calibration_fields_present": sorted(set(legacy_fields)),
             "legacy_calibration_fields_consumed": False
             if self.forward_derivation_enabled else None,
             "hardware_missing_facts": missing_hardware_facts,
+            "cann_stage_models_declared": sorted(stage_models),
+            "cann_stage_split_counts_known": sorted(
+                name for name, value in stage_models.items()
+                if isinstance(value, dict)
+                and isinstance(value.get("materialized_kernel_count"), (int, float))),
+            "mte_profile_declared": bool(mte_profile),
+            "mte_profile_source": mte_profile.get("source"),
+            "cann_host_tiling_declared": bool(host_tiling),
+            "cann_host_tiling_unknown_fields": [
+                name for name in host_tiling_fields
+                if host_tiling.get(name) is None
+            ],
+            "cann_host_tiling_policies": {
+                "policy": host_tiling.get("policy"),
+                "input_fields": list(host_tiling.get("input_fields", []) or []),
+                "output_fields": list(host_tiling.get("output_fields", []) or []),
+                "tile_policy": host_tiling.get("tile_policy"),
+                "block_dim_policy": host_tiling.get("block_dim_policy"),
+                "tiling_key_policy": host_tiling.get("tiling_key_policy"),
+                "workspace_policy": host_tiling.get("workspace_policy"),
+                "stage_dependency_policy": host_tiling.get(
+                    "stage_dependency_policy"),
+            },
+            "cann_alignment_constraints": alignment_constraints or None,
+            "cann_alignment_constraints_known": sorted(
+                name for name, value in alignment_constraints.items()
+                if name.endswith("_bytes") and isinstance(value, (int, float))
+            ),
+            "cann_stage_split_count_policy": sorted(
+                name for name, value in stage_models.items()
+                if isinstance(value, dict)
+                and value.get("materialized_kernel_count_policy")
+            ),
+            "hccl_runtime_execution_stages": hccl_runtime.get("execution_stages"),
+            "hccl_completion_profile_complete": completion_complete,
+            "hccl_completion_unknown_fields": [
+                name for name in completion_fields
+                if not isinstance(completion.get(name), (int, float))
+            ],
+            "hccl_runtime_structural_rules": {
+                "completion_rule": hccl_runtime.get("completion_rule"),
+                "wait_rule": hccl_runtime.get("wait_rule"),
+                "barrier_rule": hccl_runtime.get("barrier_rule"),
+                "descriptor_count": hccl_runtime.get("descriptor_count"),
+                "task_count": hccl_runtime.get("task_count"),
+            },
+            "hccl_algorithm_selection": {
+                "policy": algorithm_selection.get("policy"),
+                "level_scope": algorithm_selection.get("level_scope"),
+                "operator_override_count": len(
+                    algorithm_selection.get("operator_overrides", {}) or {})
+                if isinstance(algorithm_selection.get("operator_overrides", {}), dict)
+                else None,
+            },
+            "hccl_supported_collectives": list(
+                hccl_network.get("supported_collectives", []) or []),
+            "hccl_runtime_policies": {
+                "task_count_policy": hccl_runtime.get("task_count_policy"),
+                "descriptor_policy": hccl_runtime.get("descriptor_policy"),
+                "completion_policy": hccl_runtime.get("completion_policy"),
+                "communicator_defaults_declared": bool(communicator_defaults),
+                "resource_request": hccl_network.get("resource_request"),
+            },
         }
 
     @staticmethod
     def _ceil_to(value, quantum):
         return int(math.ceil(value / quantum) * quantum) if value else 0
+
+    @staticmethod
+    def _canonical_compute_dtype(dtype):
+        """Normalize legacy and framework dtype spellings for peak lookup."""
+        aliases = {
+            "float16": "fp16",
+            "fp16": "fp16",
+            "bfloat16": "bf16",
+            "bf16": "bf16",
+            "float8": "fp8",
+            "fp8": "fp8",
+            "float4": "fp4",
+            "fp4": "fp4",
+            "int8": "int8",
+            "int4": "int4",
+        }
+        name = str(dtype or "bf16").strip().lower().replace("-", "")
+        return aliases.get(name, name)
+
+    @staticmethod
+    def _dtype_size_bytes(dtype):
+        """Return the packed element size used by structural memory formulas."""
+        return {
+            "fp4": 0.5,
+            "int4": 0.5,
+            "fp8": 1,
+            "int8": 1,
+            "bf16": 2,
+            "fp16": 2,
+            "fp32": 4,
+        }.get(SystemConfig._canonical_compute_dtype(dtype), 2)
+
+    @classmethod
+    def _dtype_peak_tflops(cls, spec_compute, engine, dtype, fallback):
+        """Select an optional engine/dtype peak while preserving old profiles."""
+        tables = spec_compute.get("peak_tflops_by_dtype", {}) or {}
+        if not isinstance(tables, dict):
+            tables = {}
+        table = tables.get(engine, {})
+        if not isinstance(table, dict):
+            table = {}
+        # Also accept the explicit flat names in hand-authored normalized
+        # profiles, while the legacy mapper emits the nested table above.
+        if not table:
+            table = spec_compute.get(f"{engine}_peak_tflops_by_dtype", {}) or {}
+        if not isinstance(table, dict):
+            table = {}
+        canonical = cls._canonical_compute_dtype(dtype)
+        peak = table.get(canonical)
+        if peak is None and canonical == "bf16":
+            peak = table.get("fp16")
+        if isinstance(peak, (int, float)) and not isinstance(peak, bool) and peak > 0:
+            return float(peak), (
+                f"hardware_spec.compute.peak_tflops_by_dtype.{engine}.{canonical}")
+        return fallback, None
+
+    @classmethod
+    def _declared_engine_utilization(cls, spec_compute, engine, flops):
+        """Evaluate the optional legacy Cube/Vector utilization declaration.
+
+        ``log_a``/``log_b`` use a natural-log linear fit over FLOP count.  A
+        profile can opt into ``formula='log_flops_power'`` for the equivalent
+        log-log/power form; the bare legacy format intentionally keeps the
+        linear form used by the adapter audit.
+        """
+        profiles = spec_compute.get("utilization", {}) or {}
+        if not isinstance(profiles, dict):
+            return None, None
+        profile = profiles.get(engine)
+        if not isinstance(profile, dict):
+            return None, None
+        if profile.get("constant") is not None:
+            value = float(profile["constant"])
+            source = f"hardware_spec.compute.utilization.{engine}.constant"
+        elif profile.get("log_a") is not None and profile.get("log_b") is not None:
+            log_input = max(float(flops or 0), 1.0)
+            log_base = str(profile.get("log_base", "e")).lower()
+            logarithm = math.log10(log_input) if log_base in {"10", "log10"} \
+                else math.log(log_input)
+            value = float(profile["log_a"]) * logarithm + float(profile["log_b"])
+            if str(profile.get("formula", "log_flops_linear")).lower() in {
+                    "log_flops_power", "log_power", "power"}:
+                value = math.exp(value)
+            source = f"hardware_spec.compute.utilization.{engine}.log_fit"
+        else:
+            return None, None
+        lower = float(profile.get("min_ratio", 0.0))
+        upper = float(profile.get("max_ratio", 1.0))
+        if lower < 0 or upper <= 0 or lower > upper:
+            raise ValueError(
+                f"invalid utilization bounds for {engine}: min={lower}, max={upper}")
+        return max(lower, min(upper, value)), source
 
     def set_operator_mfu_override(self, op_name, mfu, shape_desc=None):
         """Set a customer what-if MFU for one operator, never baseline calibration."""
@@ -1539,8 +2565,58 @@ class SystemConfig(Config):
                 (value.get("shapes") or {}).get(shape_desc, value.get("default", {})))
         return value
 
+    @staticmethod
+    def _implementation_stage_model(op_name, cfg, engine=None):
+        """Return a generic CANN implementation-stage declaration.
+
+        Stage declarations describe portable semantic phases (for example
+        ``mte2_read -> vector_compute -> mte3_write``).  They are not CANN
+        kernel names and do not imply that a semantic event was materialized
+        as that many profiler kernels.  A concrete
+        ``materialized_kernel_count`` is optional and remains unknown until
+        the target CANN host tiling/export supplies it.
+        """
+        table = cfg.get("implementation_stage_models", {}) or {}
+        if not isinstance(table, dict):
+            return {}
+        aliases = cfg.get("implementation_stage_aliases", {}) or {}
+        alias = aliases.get(op_name) if isinstance(aliases, dict) else None
+        for key in (op_name, alias, engine, "default"):
+            if not key:
+                continue
+            value = table.get(key)
+            if isinstance(value, dict):
+                return copy.deepcopy(value)
+        return {}
+
+    @staticmethod
+    def _implementation_stage_overhead_ms(stage_model, launch_us):
+        """Charge only explicitly declared extra kernel launches.
+
+        A stage list alone is metadata: internal pipeline phases do not imply
+        extra wall time.  Extra launch time is charged only when a profile
+        explicitly declares a numeric materialized-kernel count and opts into
+        ``launch_per_materialized_kernel``.  This keeps an unknown CANN split
+        from being inferred from measured durations.
+        """
+        if not isinstance(stage_model, dict):
+            return 0.0, None
+        raw_count = stage_model.get("materialized_kernel_count")
+        try:
+            count = int(raw_count) if raw_count is not None else None
+        except (TypeError, ValueError):
+            count = None
+        if count is None:
+            return 0.0, None
+        count = max(1, count)
+        charge = str(stage_model.get("timing_charge") or "none")
+        if charge != "launch_per_materialized_kernel" or count <= 1:
+            return 0.0, count
+        return max(0.0, count - 1) * float(launch_us) / 1e3, count
+
     def _derive_compute_efficiency(
         self, op_name, flops, shape_desc, accessed_mem, stage=None, path_key=None,
+        kernel_role=None, projection=None,
     ):
         """Derive theoretical, limiting, and achievable operator utilization."""
         cfg = self._cann_compute_config()
@@ -1554,23 +2630,22 @@ class SystemConfig(Config):
                 rf"(?:^|[, ]){name}=([0-9]+)", shape_desc or "", re.IGNORECASE)
             if match:
                 dims[name.lower()] = int(match.group(1))
-        dtype_sizes = {
-            "fp8": 1, "int8": 1, "bf16": 2, "fp16": 2, "fp32": 4,
-        }
         compute_dtype_match = re.search(
             r"(?:^|[, ])(?:compute_dtype|dtype|out_dtype)=([A-Za-z0-9_]+)",
             shape_desc or "", re.IGNORECASE)
         compute_dtype_name = (
-            compute_dtype_match.group(1).lower() if compute_dtype_match else "bf16")
-        compute_dtype_bytes = dtype_sizes.get(compute_dtype_name, 2)
+            self._canonical_compute_dtype(
+                compute_dtype_match.group(1) if compute_dtype_match else "bf16"))
         output_dtype_match = re.search(
             r"(?:^|[, ])out_dtype=([A-Za-z0-9_]+)",
             shape_desc or "", re.IGNORECASE)
         output_dtype_name = (
-            output_dtype_match.group(1).lower()
+            self._canonical_compute_dtype(output_dtype_match.group(1))
             if output_dtype_match else compute_dtype_name)
-        output_dtype_bytes = dtype_sizes.get(
-            output_dtype_name, compute_dtype_bytes)
+        compute_dtype_bytes = self._dtype_size_bytes(compute_dtype_name)
+        output_dtype_bytes = self._dtype_size_bytes(output_dtype_name)
+        if output_dtype_match is None:
+            output_dtype_bytes = compute_dtype_bytes
         if "accumulate=True" in (shape_desc or ""):
             output_dtype_bytes = max(output_dtype_bytes, 4)
         batch = dims.get("b", dims.get("batch", dims.get("ng", 1)))
@@ -1585,7 +2660,12 @@ class SystemConfig(Config):
                 batch * ((m * k + k * n) * compute_dtype_bytes
                          + m * n * output_dtype_bytes))
         memory_bytes = accessed_mem if accessed_mem and accessed_mem > 0 else shape_bytes
-        transaction_bytes = max(1, int(cfg.get("memory_transaction_bytes", 256)))
+        mte_cfg = cfg.get("mte", {}) or {}
+        host_tiling_cfg = cfg.get("host_tiling", {}) or {}
+        alignment_constraints = cfg.get("alignment_constraints", {}) or {}
+        transaction_bytes = max(1, int(cfg.get(
+            "memory_transaction_bytes",
+            mte_cfg.get("transaction_bytes", 256))))
         padded_memory_bytes = self._ceil_to(memory_bytes, transaction_bytes)
         memory_transaction_utilization = (
             memory_bytes / padded_memory_bytes if padded_memory_bytes else None)
@@ -1593,7 +2673,13 @@ class SystemConfig(Config):
             op_name, self.accelerator.op["default"]).tflops
         engine = self._operator_engine(op_name, cfg)
         spec_compute = (self.hardware_spec or {}).get("compute", {})
-        if engine == "vector":
+        declared_utilization, declared_utilization_source = (
+            self._declared_engine_utilization(spec_compute, engine, flops))
+        peak_tflops, dtype_peak_source = self._dtype_peak_tflops(
+            spec_compute, engine, compute_dtype_name, reference_peak_tflops)
+        if dtype_peak_source is not None:
+            peak_source = dtype_peak_source
+        elif engine == "vector":
             peak_tflops = spec_compute.get(
                 "vector_peak_tflops", cfg.get("vector_peak_tflops"))
             peak_source = "hardware_spec.vector_peak_tflops"
@@ -1603,15 +2689,31 @@ class SystemConfig(Config):
         else:
             peak_tflops = reference_peak_tflops
             peak_source = "accelerator.op"
+        peak_tflops = float(peak_tflops)
         hbm_gbps = self.accelerator.bandwidth["default"].gbps
+        memory_spec = (self.hardware_spec or {}).get("memory", {})
+        l2_gbps = memory_spec.get("l2_bandwidth_gbps")
+        l2_capacity_bytes = memory_spec.get("l2_cache_bytes")
+        hbm_roofline = None
+        l2_roofline = None
         if memory_bytes and peak_tflops > 0:
             arithmetic_intensity = flops / memory_bytes
-            roofline = min(1.0, arithmetic_intensity * hbm_gbps * 1e9
-                           / (peak_tflops * 1e12))
+            hbm_roofline = min(1.0, arithmetic_intensity * hbm_gbps * 1e9
+                               / (peak_tflops * 1e12))
+            roofline = hbm_roofline
+            # L2 is a second physical bandwidth ceiling when declared.  The
+            # model does not invent cache-hit reuse; capacity is retained as
+            # a hardware fact, while bandwidth participates conservatively as
+            # an upper bound for traffic that traverses the cache.
+            if isinstance(l2_gbps, (int, float)) and l2_gbps > 0:
+                l2_roofline = min(1.0, arithmetic_intensity * l2_gbps * 1e9
+                                  / (peak_tflops * 1e12))
+                roofline = min(roofline, l2_roofline)
         else:
             arithmetic_intensity = None
             roofline = 1.0
         tiling = self._tiling_for_operator(op_name, shape_desc, cfg)
+        stage_model = self._implementation_stage_model(op_name, cfg, engine)
         core_key = "aiv_core_num" if engine == "vector" else "aic_core_num"
         core_num = cfg.get(core_key) or spec_compute.get(core_key)
         active_core_num = (
@@ -1721,8 +2823,9 @@ class SystemConfig(Config):
                             + output_tiles * output_tile_bytes)
             if composite_batch_alignment < 1.0:
                 onchip_bytes /= composite_batch_alignment
-            transfer_transaction_bytes = max(
-                1, int(cfg.get("onchip_transfer_bytes_per_cycle", 512)))
+            transfer_transaction_bytes = max(1, int(cfg.get(
+                "onchip_transfer_bytes_per_cycle",
+                mte_cfg.get("gm_issue_bytes_per_cycle", 512))))
 
             # P = cores * frequency * 2*Tm*Tn*Tk for one BF16 MMAD/cycle.
             # This makes frequency a consequence of declared peak/core/tile
@@ -1795,17 +2898,22 @@ class SystemConfig(Config):
             raise ValueError(
                 "forward_derivation.compute.resource_overlap_policy must be "
                 f"'serial' or 'overlap', got {resource_policy!r}")
+        implementation_stage_overhead_ms, materialized_kernel_count = (
+            self._implementation_stage_overhead_ms(stage_model, launch_us))
         hbm_latency_us = (
             float(self.accelerator.bandwidth["default"].latency_us)
             if memory_bytes else 0.0)
         derived_time_ms = (
             resource_time_ms + library_extra_time_ms
+            + implementation_stage_overhead_ms
             + (launch_us + hbm_latency_us) / 1e3)
         optimistic_time_ms = (max(
             padded_compute_ms, ideal_memory_ms, onchip_time_ms)
+            + implementation_stage_overhead_ms
             + (launch_us + hbm_latency_us) / 1e3)
         conservative_time_ms = (
             padded_compute_ms + ideal_memory_ms + onchip_time_ms
+            + implementation_stage_overhead_ms
             + (launch_us + hbm_latency_us) / 1e3)
         optimistic_utilization = (
             ideal_compute_ms / optimistic_time_ms if optimistic_time_ms else None)
@@ -1824,7 +2932,8 @@ class SystemConfig(Config):
             ideal_compute_ms / resource_time_ms
             if ideal_compute_ms > 0 and resource_time_ms > 0 else None)
         library_runtime_efficiency = (
-            (resource_time_ms + (launch_us + hbm_latency_us) / 1e3)
+            (resource_time_ms + implementation_stage_overhead_ms
+             + (launch_us + hbm_latency_us) / 1e3)
             / derived_time_ms
             if derived_time_ms > 0 else None)
         attainable_efficiency = achievable if flops > 0 else None
@@ -1832,9 +2941,28 @@ class SystemConfig(Config):
         # Translate an engine-relative utilization back to that reference.
         relative_peak = peak_tflops / reference_peak_tflops
         derived_reference_efficiency = achievable * relative_peak
+        declared_reference_efficiency = (
+            declared_utilization * relative_peak
+            if declared_utilization is not None else None)
         override = self._operator_mfu_override(op_name, shape_desc)
+        calibration_entry = self._calibration_compute_multiplier(
+            op_name, shape_desc, stage, kernel_role, projection)
+        memory_calibration_entry = self._calibration_memory_multiplier(
+            op_name, shape_desc, stage, kernel_role, projection)
+        calibrated_reference_efficiency = None
+        if calibration_entry is not None:
+            calibrated_reference_efficiency = max(
+                1e-12,
+                min(1.0, derived_reference_efficiency
+                    * calibration_entry["multiplier"]),
+            )
         used_efficiency = (
-            override if override is not None else derived_reference_efficiency)
+            override if override is not None
+            else (calibrated_reference_efficiency
+                  if calibrated_reference_efficiency is not None
+                  else (declared_reference_efficiency
+                        if declared_reference_efficiency is not None
+                        else derived_reference_efficiency)))
         stage_key = stage or "unspecified"
         path = path_key or "path_unspecified"
         key = f"{path}|{op_name}|{stage_key}|{shape_desc or 'shape_unspecified'}"
@@ -1846,13 +2974,22 @@ class SystemConfig(Config):
             "latent_bmm",
         }
         missing_facts = []
-        if engine == "vector" and spec_compute.get("vector_peak_tflops") is None:
+        dtype_tables = spec_compute.get("peak_tflops_by_dtype", {}) or {}
+        engine_dtype_table = dtype_tables.get(engine, {}) if isinstance(
+            dtype_tables, dict) else {}
+        has_vector_peak = (
+            spec_compute.get("vector_peak_tflops") is not None
+            or (isinstance(engine_dtype_table, dict)
+                and engine_dtype_table.get(compute_dtype_name) is not None))
+        if engine == "vector" and not has_vector_peak:
             missing_facts.append("vector_peak_tflops")
         if (engine == "cube" and not tiling_is_operator_specific
                 and op_name not in generic_matmul_ops):
             missing_facts.append("operator_specific_library_tiling")
         if engine == "cube" and not all(name in dims for name in ("m", "n", "k")):
             missing_facts.append("composite_cube_vector_mte_stage_decomposition")
+        if not stage_model or materialized_kernel_count is None:
+            missing_facts.append("cann_materialized_kernel_split_count")
         self.forward_derivation_records["operators"][key] = {
             "path": path_key,
             "stage": stage,
@@ -1866,10 +3003,21 @@ class SystemConfig(Config):
             "output_dtype": output_dtype_name,
             "output_dtype_bytes": output_dtype_bytes,
             "engine": engine,
+            "cann_runtime_spec_status": (
+                (self.cann_runtime or {}).get("spec_status")),
             "peak_tflops": peak_tflops,
             "peak_source": peak_source,
             "reference_peak_tflops": reference_peak_tflops,
+            "dtype_peak_tflops": peak_tflops,
+            "dtype_peak_source": dtype_peak_source,
+            "declared_utilization": declared_utilization,
+            "declared_utilization_source": declared_utilization_source,
+            "declared_reference_utilization": declared_reference_efficiency,
             "hbm_bandwidth_gbps": hbm_gbps,
+            "hbm_roofline_utilization": hbm_roofline,
+            "l2_cache_bytes": l2_capacity_bytes,
+            "l2_bandwidth_gbps": l2_gbps,
+            "l2_roofline_utilization": l2_roofline,
             "memory_transaction_bytes": transaction_bytes,
             "memory_transaction_utilization": memory_transaction_utilization,
             "tensor_tile": {"m": tm, "n": tn, "k": tk},
@@ -1883,6 +3031,21 @@ class SystemConfig(Config):
             "library_tiling": tiling or None,
             "library_tiling_source": (
                 tiling.get("source") if isinstance(tiling, dict) else None),
+            "mte_profile": mte_cfg or None,
+            "cann_host_tiling_policy": {
+                "policy": host_tiling_cfg.get("policy"),
+                "input_fields": list(
+                    host_tiling_cfg.get("input_fields", []) or []),
+                "output_fields": list(
+                    host_tiling_cfg.get("output_fields", []) or []),
+                "tile_policy": host_tiling_cfg.get("tile_policy"),
+                "block_dim_policy": host_tiling_cfg.get("block_dim_policy"),
+                "tiling_key_policy": host_tiling_cfg.get("tiling_key_policy"),
+                "workspace_policy": host_tiling_cfg.get("workspace_policy"),
+                "stage_dependency_policy": host_tiling_cfg.get(
+                    "stage_dependency_policy"),
+            },
+            "cann_alignment_constraints": alignment_constraints or None,
             "tiling_is_operator_specific": tiling_is_operator_specific,
             "work_tiles": work_tiles,
             "wave_count": wave_count,
@@ -1899,19 +3062,26 @@ class SystemConfig(Config):
             "resource_overlap_policy": resource_policy,
             "library_extra_time_ms": library_extra_time_ms,
             "library_extra_detail": library_extra_detail,
+            "implementation_stage_model": stage_model or None,
+            "materialized_kernel_count": materialized_kernel_count,
+            "implementation_stage_overhead_ms": implementation_stage_overhead_ms,
             "derived_time_ms": derived_time_ms,
             "attainable_efficiency": attainable_efficiency,
             "attainable_efficiency_bound": (
                 limit_efficiency if flops > 0 else None),
             "attainable_efficiency_factors": {
                 "roofline_bound": roofline,
+                "hbm_roofline_bound": hbm_roofline,
+                "l2_roofline_bound": l2_roofline,
                 "shape_tile_alignment": alignment,
                 "composite_batch_alignment": composite_batch_alignment,
                 "instruction_utilization": instruction_utilization,
                 "wave_utilization": wave_utilization,
                 "memory_transaction_utilization": memory_transaction_utilization,
+                "mte_profile": mte_cfg or None,
                 "resource_schedule_efficiency": resource_efficiency,
                 "library_runtime_efficiency": library_runtime_efficiency,
+                "implementation_stage_overhead": implementation_stage_overhead_ms,
                 "formula": (
                     "U_attainable=min(U_bound,"
                     "ideal_compute_time/derived_time)"
@@ -1932,9 +3102,52 @@ class SystemConfig(Config):
             "derived_achievable_utilization": achievable,
             "derived_reference_peak_utilization": derived_reference_efficiency,
             "customer_mfu_override": self._operator_mfu_override(op_name, shape_desc),
+            "calibration_efficiency_multiplier": (
+                calibration_entry["multiplier"]
+                if calibration_entry is not None else None),
+            "calibrated_reference_utilization": calibrated_reference_efficiency,
+            "calibration_samples": (
+                calibration_entry.get("samples")
+                if calibration_entry is not None else None),
+            "calibration_comm_role": (
+                calibration_entry.get("comm_role")
+                if calibration_entry is not None else None),
+            "calibration_kernel_role": (
+                calibration_entry.get("kernel_role")
+                if calibration_entry is not None else None),
+            "calibration_projection": (
+                calibration_entry.get("projection")
+                if calibration_entry is not None else None),
+            "calibration_memory_time_multiplier": (
+                memory_calibration_entry["multiplier"]
+                if memory_calibration_entry is not None else None),
+            "calibration_memory_samples": (
+                memory_calibration_entry.get("samples")
+                if memory_calibration_entry is not None else None),
+            "memory_performance_observations_used": (
+                memory_calibration_entry is not None),
             "used_utilization": used_efficiency,
-            "performance_observations_used": False,
+            "used_engine_utilization": (
+                used_efficiency / relative_peak
+                if relative_peak > 0 else None),
+            "utilization_source": (
+                "api_override" if override is not None else
+                "measured_calibration" if calibrated_reference_efficiency is not None else
+                declared_utilization_source if declared_utilization_source is not None else
+                "forward_formula"),
+            "performance_observations_used": calibration_entry is not None,
+            "performance_observations_used_as_parameters": (
+                calibration_entry is not None),
             "formula": (
+                "theory=roofline; limit=theory*instruction_tile*wave; "
+                "T_resource=serial_or_overlap(padded_cube,HBM,GM-L1-L0-FixPipe)"
+                "+library_structural_stage; "
+                "achievable=ideal_compute/(T_resource+launch); "
+                "calibrated=derived_reference_efficiency*aggregate_efficiency_multiplier"
+                if calibration_entry is not None else
+                "declared=clamp(log_a*ln(FLOPs)+log_b|constant); "
+                "used=declared_reference_utilization"
+                if declared_utilization is not None else
                 "theory=roofline; limit=theory*instruction_tile*wave; "
                 "T_resource=serial_or_overlap(padded_cube,HBM,GM-L1-L0-FixPipe)"
                 "+library_structural_stage; "
@@ -1959,6 +3172,11 @@ class SystemConfig(Config):
         """
         network_cfg = self._hccl_network_config()
         runtime_cfg = network_cfg.get("call_runtime", {})
+        algorithm_selection = network_cfg.get("algorithm_selection", {}) or {}
+        if not isinstance(algorithm_selection, dict):
+            algorithm_selection = {}
+        supported_collectives = network_cfg.get("supported_collectives", []) or []
+        resource_request = network_cfg.get("resource_request")
         compute_cfg = self._cann_compute_config()
         default_launch_us = float(
             compute_cfg.get("kernel_launch_latency_us", 0.0))
@@ -1970,6 +3188,21 @@ class SystemConfig(Config):
         chunk_bytes = max(0, int(runtime_cfg.get("descriptor_chunk_bytes", 0)))
         tasks_per_chunk = max(0, int(runtime_cfg.get(
             "tasks_per_additional_chunk", 0)))
+        execution_stages = runtime_cfg.get(
+            "execution_stages", ["post", "task", "completion", "wait"])
+        if not isinstance(execution_stages, list):
+            execution_stages = [str(execution_stages)]
+        completion_cfg = runtime_cfg.get("completion", {}) or {}
+        completion_fields = (
+            "completion_latency_us", "wait_latency_us", "barrier_latency_us")
+        completion_unknown_fields = [
+            name for name in completion_fields
+            if not isinstance(completion_cfg.get(name), (int, float))
+        ]
+        completion_overhead_us = sum(
+            max(0.0, float(completion_cfg.get(name, 0.0)))
+            for name in completion_fields
+            if isinstance(completion_cfg.get(name), (int, float)))
 
         algorithm, stages = self._collective_algorithm(op_name, comm_num)
         if stages is None:
@@ -1986,6 +3219,21 @@ class SystemConfig(Config):
                 "call_launch_latency_us": call_launch_us,
                 "task_launch_latency_us": task_launch_us,
                 "call_runtime_overhead_us": None,
+                "execution_stages": execution_stages,
+                "algorithm_selection_policy": algorithm_selection.get("policy"),
+                "algorithm_level_scope": algorithm_selection.get("level_scope"),
+                "supported_collectives": list(supported_collectives),
+                "resource_request": resource_request,
+                "task_count_policy": runtime_cfg.get("task_count_policy"),
+                "descriptor_policy": runtime_cfg.get("descriptor_policy"),
+                "completion_policy": runtime_cfg.get("completion_policy"),
+                "runtime_profile_spec_status": (
+                    (self.hccl_runtime or {}).get("spec_status")),
+                "completion_latency_us": completion_cfg.get("completion_latency_us"),
+                "wait_latency_us": completion_cfg.get("wait_latency_us"),
+                "barrier_latency_us": completion_cfg.get("barrier_latency_us"),
+                "completion_overhead_us": None,
+                "runtime_profile_unknown_fields": completion_unknown_fields,
                 "status": "unknown",
                 "unknown_reason": "unsupported_collective_algorithm",
                 "formula": (
@@ -1998,7 +3246,8 @@ class SystemConfig(Config):
                   if chunk_bytes and message_bytes else 1)
         descriptor_tasks = max(0, chunks - 1) * tasks_per_chunk
         task_count = stage_tasks + descriptor_tasks
-        runtime_us = call_launch_us + task_count * task_launch_us
+        runtime_us = call_launch_us + task_count * task_launch_us \
+            + completion_overhead_us
         return {
             "execution_engine": runtime_cfg.get(
                 "execution_engine", "host_cpu_ts"),
@@ -2012,16 +3261,34 @@ class SystemConfig(Config):
             "call_launch_latency_us": call_launch_us,
             "task_launch_latency_us": task_launch_us,
             "call_runtime_overhead_us": runtime_us,
+            "execution_stages": execution_stages,
+            "algorithm_selection_policy": algorithm_selection.get("policy"),
+            "algorithm_level_scope": algorithm_selection.get("level_scope"),
+            "supported_collectives": list(supported_collectives),
+            "resource_request": resource_request,
+            "task_count_policy": runtime_cfg.get("task_count_policy"),
+            "descriptor_policy": runtime_cfg.get("descriptor_policy"),
+            "completion_policy": runtime_cfg.get("completion_policy"),
+            "runtime_profile_spec_status": (
+                (self.hccl_runtime or {}).get("spec_status")),
+            "completion_latency_us": completion_cfg.get("completion_latency_us"),
+            "wait_latency_us": completion_cfg.get("wait_latency_us"),
+            "barrier_latency_us": completion_cfg.get("barrier_latency_us"),
+            "completion_overhead_us": completion_overhead_us,
+            "runtime_profile_unknown_fields": completion_unknown_fields,
             "formula": (
                 "T_runtime=L_call+(algorithm_stages*active_levels*"
-                "tasks_per_stage+descriptor_tasks)*L_task"),
+                "tasks_per_stage+descriptor_tasks)*L_task+"
+                "T_completion+T_wait+T_barrier"),
         }
 
     def _derive_network_time(self, op_name, actual_size, comm_num, net,
                              comm_stage, strategy, group_kind, topology_bw,
-                             topology_latency):
+                             topology_latency, comm_direction=None,
+                             comm_role=None):
         """Return alpha+payload/beta using only topology/hardware inputs."""
         del strategy  # topology/group decomposition has already been applied
+        requested_op_name = op_name
         cfg = self._hccl_network_config()
         flit_bytes = max(1, int(cfg.get("flit_bytes", 256)))
         if topology_bw is None:
@@ -2039,8 +3306,13 @@ class SystemConfig(Config):
             physical_latency_us + runtime["call_runtime_overhead_us"])
         # Network configuration uses decimal GB/s (the hardware/link-rate
         # convention), unlike memory capacity fields that commonly use GiB.
-        time_ms = (actual_size / (beta * 1e9) * 1e3
-                   + collective_latency_us / 1e3)
+        transfer_time_ms = actual_size / (beta * 1e9) * 1e3
+        time_ms = transfer_time_ms + collective_latency_us / 1e3
+        calibration_direction = comm_direction or comm_stage
+        time_ms, calibration_entry = self._apply_communication_calibration(
+            requested_op_name, actual_size, comm_num, time_ms,
+            calibration_direction, comm_role,
+            transfer_time_ms=transfer_time_ms, comm_stage=comm_stage)
         layer_key = f"{net}|bytes={int(actual_size)}"
         self.forward_derivation_records["network_layers"][layer_key] = {
             "network_level": net,
@@ -2056,10 +3328,13 @@ class SystemConfig(Config):
             "algorithm_independent": True,
             "formula": "beta=B_physical*payload/ceil(payload/flit)",
         }
-        key = f"{op_name}|{comm_stage.lower()}|n={comm_num}|bytes={int(actual_size)}"
+        key = (f"{op_name}|{comm_stage.lower()}"
+               f"|direction={self._calibration_direction(calibration_direction)}"
+               f"|n={comm_num}|bytes={int(actual_size)}")
         self.forward_derivation_records["communications"][key] = {
             "op_name": op_name,
             "stage": comm_stage.lower(),
+            "direction": self._calibration_direction(calibration_direction),
             "group_kind": group_kind,
             "comm_num": comm_num,
             "message_bytes": actual_size,
@@ -2075,8 +3350,44 @@ class SystemConfig(Config):
             "call_runtime_overhead_us": runtime["call_runtime_overhead_us"],
             "call_runtime": runtime,
             "collective_latency_us": collective_latency_us,
+            "derived_transfer_time_ms": transfer_time_ms,
             "derived_time_ms": time_ms,
-            "formula": "T=D/beta_layer+T_physical_propagation+T_call_runtime",
+            "calibration_transfer_efficiency": (
+                calibration_entry.get("transfer_efficiency")
+                if calibration_entry is not None else None),
+            "calibration_applied_to": (
+                "pure_transfer_component"
+                if calibration_entry is not None
+                and calibration_entry.get("transfer_efficiency") is not None
+                else "aggregate_call_lifetime"
+                if calibration_entry is not None else None),
+            "calibration_time_multiplier": (
+                calibration_entry.get("multiplier")
+                if calibration_entry is not None
+                and calibration_entry.get("transfer_efficiency") is None
+                else None),
+            "calibration_samples": (
+                calibration_entry.get("samples")
+                if calibration_entry is not None else None),
+            "calibration_parameter_name": (
+                calibration_entry.get("parameter_name")
+                if calibration_entry is not None else None),
+            "calibration_source_type": (
+                calibration_entry.get("source_type")
+                if calibration_entry is not None else None),
+            "performance_observations_used": calibration_entry is not None,
+            "performance_observations_used_as_parameters": (
+                calibration_entry is not None),
+            "formula": (
+                "T=D/beta_layer+T_physical_propagation+T_call_runtime"
+                "+T_transfer*(1/transfer_efficiency-1)"
+                if calibration_entry is not None
+                and calibration_entry.get("transfer_efficiency") is not None
+                else
+                "T=D/beta_layer+T_physical_propagation+T_call_runtime"
+                "+aggregate_runtime_multiplier"
+                if calibration_entry is not None else
+                "T=D/beta_layer+T_physical_propagation+T_call_runtime"),
         }
         self.record_net_bw(op_name, net, comm_num, comm_stage, topology_bw,
                            beta, packet_eff, time_ms * 1e3, actual_size,
@@ -2289,6 +3600,7 @@ class SystemConfig(Config):
     def compute_op_accuracy_time(
         self, op_name: str, flops: int, shape_desc: str, reture_detail=False,
         class_key=None, path_key=None, accessed_mem=None, stage=None,
+        kernel_role=None, projection=None,
     ):
         """
         compute float point operation time,
@@ -2306,13 +3618,28 @@ class SystemConfig(Config):
                 op = self.accelerator.op.get(
                     op_name, self.accelerator.op["default"])
                 self._derive_compute_efficiency(
-                    op_name, flops, shape_desc, accessed_mem, stage, path_key)
+                    op_name, flops, shape_desc, accessed_mem, stage, path_key,
+                    kernel_role, projection)
+                record_key = (
+                    f"{path_key or 'path_unspecified'}|{op_name}|"
+                    f"{stage or 'unspecified'}|{shape_desc or 'shape_unspecified'}")
+                record = self.forward_derivation_records["operators"].get(
+                    record_key, {})
                 detail = dict(
                     op_name=op_name,
                     tflops=op.tflops,
                     efficient_factor=None,
                     compute_only_time=0.0,
                     efficiency_source="forward_derived",
+                    peak_tflops=record.get("peak_tflops", op.tflops),
+                    peak_source=record.get("peak_source"),
+                    compute_dtype=record.get("compute_dtype"),
+                    declared_utilization=record.get("declared_utilization"),
+                    utilization_source=record.get("utilization_source"),
+                    calibration_efficiency_multiplier=(
+                        record.get("calibration_efficiency_multiplier")),
+                    performance_observations_used=bool(
+                        record.get("performance_observations_used", False)),
                 )
                 return detail if reture_detail else 0
             if reture_detail:
@@ -2337,12 +3664,27 @@ class SystemConfig(Config):
 
         if self.forward_derivation_enabled:
             efficient_factor = self._derive_compute_efficiency(
-                op_name, flops, shape_desc, accessed_mem, stage, path_key)
+                op_name, flops, shape_desc, accessed_mem, stage, path_key,
+                kernel_role, projection)
             time = flops / (op.tflops * 1e12 * efficient_factor) * 1e3
+            record_key = (
+                f"{path_key or 'path_unspecified'}|{op_name}|"
+                f"{stage or 'unspecified'}|{shape_desc or 'shape_unspecified'}")
+            record = self.forward_derivation_records["operators"].get(
+                record_key, {})
             detail = dict(op_name=op_name, tflops=op.tflops,
                           efficient_factor=efficient_factor,
                           compute_only_time=time,
-                          efficiency_source="forward_derived")
+                          efficiency_source="forward_derived",
+                          peak_tflops=record.get("peak_tflops", op.tflops),
+                          peak_source=record.get("peak_source"),
+                          compute_dtype=record.get("compute_dtype"),
+                          declared_utilization=record.get("declared_utilization"),
+                          utilization_source=record.get("utilization_source"),
+                          calibration_efficiency_multiplier=(
+                              record.get("calibration_efficiency_multiplier")),
+                          performance_observations_used=bool(
+                              record.get("performance_observations_used", False)))
             return detail if reture_detail else time
 
         if class_key is not None or path_key is not None:
@@ -2411,31 +3753,50 @@ class SystemConfig(Config):
         else:
             return time
 
-    def compute_mem_access_time(self, op_name, mem_bytes: int, reture_detail=False):
+    def compute_mem_access_time(
+            self, op_name, mem_bytes: int, reture_detail=False,
+            shape_desc=None, stage=None, kernel_role=None, projection=None):
         """
         compute memory access time,
         return time in ms
         """
         
         if self.forward_derivation_enabled:
-            # Forward derivation uses only the physical HBM bandwidth (a
-            # hardware property, identical for all operators).  Per-operator
-            # "effective" bandwidth entries that absorb fusion effects are a
-            # calibration anti-pattern and are not consulted here.
+            # Forward derivation starts from the physical HBM bandwidth (a
+            # hardware property, identical for all operators).  The separate
+            # calibration branch may scale only the derived HBM transfer term
+            # with a shape/stage/profile multiplier; it never replaces the
+            # event duration or the model-derived latency.
             op = self.accelerator.bandwidth["default"]
             cfg = self._cann_compute_config()
-            transaction = max(1, int(cfg.get("memory_transaction_bytes", 256)))
+            mte_cfg = cfg.get("mte", {}) or {}
+            transaction = max(1, int(cfg.get(
+                "memory_transaction_bytes",
+                mte_cfg.get("transaction_bytes", 256))))
             padded = self._ceil_to(mem_bytes, transaction)
             efficiency = mem_bytes / padded if padded else 1.0
             # Hardware bandwidth is declared in decimal GB/s throughout the
             # forward model (the same convention as topology levels).
-            time = mem_bytes / (op.gbps * 1e9 * efficiency) * 1e3
+            transfer_time = mem_bytes / (op.gbps * 1e9 * efficiency) * 1e3
+            calibration_entry = self._calibration_memory_multiplier(
+                op_name, shape_desc, stage, kernel_role, projection)
+            if calibration_entry is not None:
+                transfer_time *= calibration_entry["multiplier"]
+            time = transfer_time
             if mem_bytes:
                 time += op.latency_us / 1e3
             if reture_detail:
                 return dict(gbps=op.gbps, efficient_factor=efficiency,
                             latency_us=op.latency_us, io_time=time,
-                            efficiency_source="forward_derived")
+                            efficiency_source="forward_derived",
+                            calibration_time_multiplier=(
+                                calibration_entry["multiplier"]
+                                if calibration_entry is not None else None),
+                            calibration_samples=(
+                                calibration_entry.get("samples")
+                                if calibration_entry is not None else None),
+                            performance_observations_used=(
+                                calibration_entry is not None))
             return time
 
         op = self.accelerator.bandwidth.get(op_name, None)
@@ -2475,18 +3836,35 @@ class SystemConfig(Config):
         or efficiency argument.
         """
         output_bytes = input_bytes if output_bytes is None else output_bytes
-        accessed_mem = max(0, input_bytes) + max(0, output_bytes)
         shape_desc = shape_desc or (
             f"input_bytes={int(input_bytes)}, output_bytes={int(output_bytes)}")
+        resolved_op_name = self.resolve_layout_op_name(
+            op_name, stage=stage, path_key=path_key, shape_desc=shape_desc)
+        cfg = self._cann_compute_config()
+        mte_cfg = cfg.get("mte", {}) or {}
+        resource_profile = (cfg.get("layout_resource_models", {}) or {}).get(
+            resolved_op_name, {})
+        if not isinstance(resource_profile, dict):
+            resource_profile = {}
+        traffic_policy = str(resource_profile.get(
+            "traffic_policy", "read_write")).lower()
+        if traffic_policy in {"write_only", "indexed_write", "scatter_write"}:
+            accessed_mem = max(0, output_bytes)
+        elif traffic_policy in {"read_only", "indexed_read"}:
+            accessed_mem = max(0, input_bytes)
+        else:
+            accessed_mem = max(0, input_bytes) + max(0, output_bytes)
         compute_detail = self.compute_op_accuracy_time(
-            op_name, 0, shape_desc=shape_desc, reture_detail=True,
+            resolved_op_name, 0, shape_desc=shape_desc, reture_detail=True,
             accessed_mem=accessed_mem, stage=stage, path_key=path_key)
         io_detail = self.compute_mem_access_time(
-            op_name, accessed_mem, reture_detail=True)
-        cfg = self._cann_compute_config()
+            resolved_op_name, accessed_mem, reture_detail=True,
+            shape_desc=shape_desc, stage=stage)
         launch_us = float(cfg.get("kernel_launch_latency_us", 0.0))
-        resource_profile = (cfg.get("layout_resource_models", {}) or {}).get(
-            op_name, {})
+        stage_model = self._implementation_stage_model(
+            resolved_op_name, cfg, "vector")
+        stage_overhead_ms, materialized_kernel_count = (
+            self._implementation_stage_overhead_ms(stage_model, launch_us))
         # Pure streaming kernels can overlap the first GM response with
         # later MTE2/MTE3 transfers through DoubleBuffer.  The bandwidth term
         # remains payable; only the non-overlapped first-response term is
@@ -2498,14 +3876,27 @@ class SystemConfig(Config):
         time_ms = (
             io_detail["io_time"]
             - hidden_hbm_latency_us / 1e3
-            + launch_us / 1e3)
+            + launch_us / 1e3
+            + stage_overhead_ms)
+        # Layout events have zero FLOPs, but their calibration profile may
+        # still carry an efficiency multiplier for the same structural
+        # layout operation.  Apply it as the inverse time factor only in the
+        # explicit measured_calibration branch; forward-derived runs keep the
+        # pure HBM/UB/MTE formula unchanged.
+        layout_efficiency_multiplier = compute_detail.get(
+            "calibration_efficiency_multiplier")
+        if (layout_efficiency_multiplier is not None
+                and layout_efficiency_multiplier > 0):
+            time_ms /= float(layout_efficiency_multiplier)
         layout_detail = None
         if resource_profile:
             memory_spec = (self.hardware_spec or {}).get("memory", {})
             ub_bytes = max(1, int(memory_spec.get(
                 "ub_per_aiv_bytes", resource_profile.get("tile_bytes", 1))))
             ub_buffers = max(1, int(resource_profile.get("ub_buffer_count", 1)))
-            transaction = max(1, int(cfg.get("memory_transaction_bytes", 256)))
+            transaction = max(1, int(cfg.get(
+                "memory_transaction_bytes",
+                mte_cfg.get("transaction_bytes", 256))))
             tile_bytes = max(
                 transaction,
                 (ub_bytes // ub_buffers // transaction) * transaction)
@@ -2541,13 +3932,21 @@ class SystemConfig(Config):
                 "hidden_hbm_base_latency_us": hidden_hbm_latency_us,
                 "wave_startup_latency_us": wave_startup_us,
                 "extra_wave_time_ms": extra_wave_time_ms,
+                "calibration_efficiency_multiplier": (
+                    layout_efficiency_multiplier),
             }
 
         if self.forward_derivation_enabled:
-            key = (f"{path_key or 'path_unspecified'}|{op_name}|"
+            key = (f"{path_key or 'path_unspecified'}|{resolved_op_name}|"
                    f"{stage or 'unspecified'}|{shape_desc or 'shape_unspecified'}")
             record = self.forward_derivation_records["operators"].get(key)
             if record is not None:
+                transfer_expr = (
+                    "D_write" if traffic_policy in {
+                        "write_only", "indexed_write", "scatter_write"}
+                    else "D_read" if traffic_policy in {
+                        "read_only", "indexed_read"}
+                    else "D_read+D_write")
                 record.update({
                     "kernel_path_kind": "materialized_layout",
                     "structure_source": "model_graph_or_library_implementation_path",
@@ -2555,24 +3954,37 @@ class SystemConfig(Config):
                     "input_bytes": input_bytes,
                     "output_bytes": output_bytes,
                     "layout_resource_profile": resource_profile or None,
+                    "resolved_layout_op_name": resolved_op_name,
+                    "traffic_policy": traffic_policy,
                     "layout_resource_detail": layout_detail,
+                    "mte_profile": mte_cfg or None,
+                    "implementation_stage_model": stage_model or None,
+                    "materialized_kernel_count": materialized_kernel_count,
+                    "implementation_stage_overhead_ms": stage_overhead_ms,
                     "derived_time_ms": time_ms,
                     "formula": (
-                        "T_layout=T_launch+(D_read+D_write)/(HBM_bw*"
+                        f"T_layout=T_launch+({transfer_expr})/(HBM_bw*"
                         "transaction_efficiency)+HBM_base_latency+"
-                        "(waves-1)*pipeline_startup-hidden_streaming_latency"
+                        "(waves-1)*pipeline_startup-hidden_streaming_latency+"
+                        "declared_implementation_stage_overhead"
                     ),
                 })
         if reture_detail:
             return {
                 "op_name": op_name,
+                "resolved_op_name": resolved_op_name,
                 "input_bytes": input_bytes,
                 "output_bytes": output_bytes,
                 "accessed_mem": accessed_mem,
                 "compute_detail": compute_detail,
                 "io_detail": io_detail,
                 "kernel_launch_latency_us": launch_us,
+                "mte_profile": mte_cfg or None,
+                "implementation_stage_model": stage_model or None,
+                "materialized_kernel_count": materialized_kernel_count,
+                "implementation_stage_overhead_ms": stage_overhead_ms,
                 "layout_resource_profile": resource_profile or None,
+                "traffic_policy": traffic_policy,
                 "layout_resource_detail": layout_detail,
                 "time_ms": time_ms,
             }
@@ -2587,7 +3999,12 @@ class SystemConfig(Config):
                 return values[key]
         return default
 
-    def compute_net_op_time(self, op_name: str, size: int, comm_num: int, net="", comm_stage="unkonw", strategy:StrategyConfig=None, group_kind: str = None):
+    def compute_net_op_time(self, op_name: str, size: int, comm_num: int,
+                            net="", comm_stage="unkonw",
+                            strategy:StrategyConfig=None,
+                            group_kind: str = None,
+                            comm_direction: str = None,
+                            comm_role: str = None):
         """
         compute network operation time,
         return time in ms
@@ -2598,6 +4015,15 @@ class SystemConfig(Config):
         traffic ratios come from the real group->node mapping
         (`simumax.core.utils.group_cross_node_ratio`). Calls that pass no
         `strategy`/`group_kind` keep the legacy heuristics unchanged.
+
+        ``comm_direction`` is an optional semantic fwd/bwd/optimizer label
+        used only by the separate measured-calibration branch. Omitting it
+        preserves the historical ``comm_stage``-based lookup.
+
+        ``comm_role`` is an optional structural collective role (for example
+        ``model_moe_ag`` or ``layer_moe_rs``).  It is used only to select a
+        role-scoped entry in a separate measured-calibration profile; the
+        forward-derived topology formula is unchanged when it is absent.
         """
         # Using ring alg for now
         assert op_name in kNetOp, f"{op_name} not exist on {kNetOp}"
@@ -2605,7 +4031,8 @@ class SystemConfig(Config):
             # Hierarchical levels path (design_simu_hierarchical_network.md
             # sections 5-7); fully separate from the single-net path below.
             return self._compute_net_op_time_levels(
-                op_name, size, comm_num, comm_stage, strategy, group_kind)
+                op_name, size, comm_num, comm_stage, strategy, group_kind,
+                comm_direction, comm_role)
         net_data = self.networks.get(net, None)
         assert net_data is not None, f"{net} not exist on {self.networks.keys()}, op_name={op_name}"
         requested_op_name = op_name
@@ -2680,7 +4107,7 @@ class SystemConfig(Config):
                 return 0
             return self._derive_network_time(
                 requested_op_name, actual_size, comm_num, net, comm_stage, strategy,
-                group_kind, _topo_bw, _topo_latency)
+                group_kind, _topo_bw, _topo_latency, comm_direction, comm_role)
         # Per-card-count bandwidth (align by comm group size, not by net/domain
         # name): when the net profile declares gbps_by_comm_num, use the value
         # for this comm_num; the op's efficient_factor below still applies
@@ -2960,7 +4387,9 @@ class SystemConfig(Config):
 
     def _compute_net_op_time_levels(self, op_name: str, size: int, comm_num: int,
                                     comm_stage: str, strategy: "StrategyConfig",
-                                    group_kind: str):
+                                    group_kind: str,
+                                    comm_direction: str = None,
+                                    comm_role: str = None):
         """Hierarchical per-level cost composition (design doc sections 5-6).
 
         The group's traffic is decomposed across topology["levels"] via
@@ -3035,6 +4464,21 @@ class SystemConfig(Config):
             }
             values["world_size"] = strategy.world_size
             values[dimension] = comm_num
+            # Preserve the configured FSDP/OE shard override when making a
+            # subgroup routing view.  Without this, a 256p strategy with
+            # ``oe_shard_size=128`` is copied with only ``edp_size=128``;
+            # the router then falls back to the logical EP stride (8) even
+            # though rank-group construction correctly uses the override
+            # stride (world_size/group_size = 2).  The resulting level span
+            # has the wrong members-per-node and therefore the wrong
+            # per-level beta/time.  Keep the override and bind it to the
+            # subgroup size so routing and emitted communication metadata
+            # describe the same declared domain.  These are strategy facts,
+            # not measured timing parameters.
+            if group_kind == "dp_cp":
+                values["fsdp_shard_size"] = comm_num
+            elif group_kind == "edp":
+                values["oe_shard_size"] = comm_num
             route_strategy = types.SimpleNamespace(**values)
         composition, spans = group_level_span(group_kind, route_strategy, levels)
         if op_name == "p2p":
@@ -3234,39 +4678,82 @@ class SystemConfig(Config):
             # Group of one (or no crossed level): no communication.
             return 0.0
         if policy == "max":
-            total_time = max(phase[4] for phase in phases)
+            base_phase_time = max(phase[4] for phase in phases)
         else:
-            total_time = sum(phase[4] for phase in phases)
+            base_phase_time = sum(phase[4] for phase in phases)
         runtime = None
+        calibration_entry = None
+        effective_phase_times = [phase[4] for phase in phases]
+        ideal_level_transfer_ms = [
+            phase_size / (bw * 1e9 * eff_factor) * 1e3
+            for _span, phase_size, bw, eff_factor, _phase_time, _latency
+            in phases
+            if bw > 0 and eff_factor > 0
+        ]
+        ideal_transfer_ms = (
+            max(ideal_level_transfer_ms)
+            if policy == "max" and ideal_level_transfer_ms
+            else sum(ideal_level_transfer_ms)
+            if ideal_level_transfer_ms else None
+        )
+        communication_attainable_efficiency = None
         if self.forward_derivation_enabled:
             runtime = self._collective_runtime_overhead(
                 op_name, comm_num, size, active_level_count=len(phases))
-            total_time += runtime["call_runtime_overhead_us"] / 1e3
-            ideal_level_transfer_ms = [
-                phase_size / (bw * 1e9 * eff_factor) * 1e3
-                for _span, phase_size, bw, eff_factor, _phase_time, _latency
-                in phases
-                if bw > 0 and eff_factor > 0
-            ]
-            ideal_transfer_ms = (
-                max(ideal_level_transfer_ms)
-                if policy == "max" and ideal_level_transfer_ms
-                else sum(ideal_level_transfer_ms)
-                if ideal_level_transfer_ms else None
-            )
+            calibration_direction = comm_direction or comm_stage
+            calibration_entry = self._calibration_communication_multiplier(
+                requested_op_name, size, comm_num,
+                calibration_direction, comm_role, comm_stage)
+            if (calibration_entry is not None
+                    and calibration_entry.get("transfer_efficiency") is not None):
+                transfer_efficiency = calibration_entry["transfer_efficiency"]
+                effective_phase_times = []
+                for phase in phases:
+                    _span, phase_size, bw, eff_factor, phase_time, _latency = phase
+                    transfer_time = (
+                        phase_size / (bw * 1e9 * eff_factor) * 1e3
+                        if bw > 0 and eff_factor > 0 else 0.0)
+                    effective_phase_times.append(
+                        phase_time - transfer_time
+                        + transfer_time / transfer_efficiency)
+                if phase_facts:
+                    for fact, effective_time in zip(
+                            phase_facts, effective_phase_times):
+                        fact["calibrated_phase_time_ms"] = effective_time
+                        fact["calibration_applied_to"] = (
+                            "pure_transfer_component")
+                        fact["calibration_transfer_efficiency"] = (
+                            transfer_efficiency)
+            total_phase_time = (
+                max(effective_phase_times)
+                if policy == "max" else sum(effective_phase_times))
+            total_time = total_phase_time + runtime["call_runtime_overhead_us"] / 1e3
+            # Keep the legacy complete-call multiplier readable for old
+            # profiles, but never apply it on top of a component calibration.
+            if (calibration_entry is not None
+                    and calibration_entry.get("transfer_efficiency") is None):
+                multiplier = calibration_entry.get("multiplier")
+                if multiplier is not None:
+                    total_time = max(0.0, total_time * multiplier)
             communication_attainable_efficiency = (
                 ideal_transfer_ms / total_time
                 if ideal_transfer_ms is not None and total_time > 0 else None)
+        else:
+            total_time = base_phase_time
+        if self.forward_derivation_enabled:
             reachable_betas = [
                 bw * eff_factor for _span, _phase_size, bw, eff_factor,
                 _phase_time, _latency in phases if bw > 0 and eff_factor > 0
             ]
-            record_key = (f"{requested_op_name}|levels:{comm_stage.lower()}:call"
-                          f"|n={comm_num}|bytes={int(size)}")
+            record_key = (
+                f"{requested_op_name}|levels:{comm_stage.lower()}:call"
+                f"|direction={self._calibration_direction(calibration_direction)}"
+                f"|n={comm_num}|bytes={int(size)}")
             self.forward_derivation_records["communications"][record_key] = {
                 "op_name": requested_op_name,
                 "algorithm_family": op_name,
                 "stage": f"levels:{comm_stage.lower()}:call",
+                "direction": self._calibration_direction(calibration_direction),
                 "group_kind": group_kind,
                 "comm_num": comm_num,
                 "message_bytes": size,
@@ -3288,8 +4775,46 @@ class SystemConfig(Config):
                     sum(phase[5] for phase in phases)
                     + runtime["call_runtime_overhead_us"]),
                 "derived_time_ms": total_time,
-                "performance_observations_used": False,
+                "calibration_transfer_efficiency": (
+                    calibration_entry.get("transfer_efficiency")
+                    if calibration_entry is not None else None),
+                "calibration_applied_to": (
+                    "pure_transfer_component"
+                    if calibration_entry is not None
+                    and calibration_entry.get("transfer_efficiency") is not None
+                    else "aggregate_call_lifetime"
+                    if calibration_entry is not None else None),
+                "calibration_time_multiplier": (
+                    calibration_entry.get("multiplier")
+                    if calibration_entry is not None
+                    and calibration_entry.get("transfer_efficiency") is None
+                    else None),
+                "calibration_samples": (
+                    calibration_entry.get("samples")
+                    if calibration_entry is not None else None),
+                "calibration_comm_role": (
+                    calibration_entry.get("comm_role")
+                    if calibration_entry is not None else None),
+                "calibration_parameter_name": (
+                    calibration_entry.get("parameter_name")
+                    if calibration_entry is not None else None),
+                "calibration_source_type": (
+                    calibration_entry.get("source_type")
+                    if calibration_entry is not None else None),
+                "performance_observations_used": calibration_entry is not None,
+                "performance_observations_used_as_parameters": (
+                    calibration_entry is not None),
                 "formula": (
+                    "T_call=compose_levels(D_i/beta_i+hop_i*L_i)"
+                    "+T_runtime(call,group,payload,algorithm)"
+                    "+T_transfer_i*(1/transfer_efficiency-1)"
+                    if calibration_entry is not None
+                    and calibration_entry.get("transfer_efficiency") is not None
+                    else
+                    "T_call=compose_levels(D_i/beta_i+hop_i*L_i)"
+                    "+T_runtime(call,group,payload,algorithm)"
+                    "+aggregate_runtime_multiplier"
+                    if calibration_entry is not None else
                     "T_call=compose_levels(D_i/beta_i+hop_i*L_i)"
                     "+T_runtime(call,group,payload,algorithm)"),
             }
@@ -3297,11 +4822,12 @@ class SystemConfig(Config):
         # "levels:<stage>:<level>" plus the composed total under
         # "levels:<stage>". Records keep the legacy field set.
         stage_key = comm_stage.lower()
-        for span, phase_size, bw, eff_factor, phase_time, base_latency in phases:
+        for index, (span, phase_size, bw, eff_factor, phase_time, base_latency) in enumerate(phases):
             self.record_net_bw(
                 requested_op_name, span.net, comm_num,
                 f"levels:{stage_key}:{span.name}",
-                bw, bw * eff_factor, eff_factor, phase_time * 1e3,
+                bw, bw * eff_factor, eff_factor,
+                effective_phase_times[index] * 1e3,
                 phase_size, base_latency)
         self.record_net_bw(
             requested_op_name, self.LEVELS_NET, comm_num,

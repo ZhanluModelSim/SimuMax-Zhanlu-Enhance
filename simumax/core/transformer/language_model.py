@@ -305,6 +305,7 @@ class LLMBlock(MetaModule):
             "all_gather", model_info.dense_weight_bytes * dense_group_size, dense_group_size,
             net=self._fsdp_net_resolved, comm_stage="dp_cp",
             strategy=self.strategy, group_kind="dp_cp",
+            comm_direction="fwd",
         )
         ops.append(async_all_gather(
             f"{state.comm_order}-fsdp_ag-dp_cp_group:{rank_info['dp_cp_group_id']}",
@@ -320,6 +321,7 @@ class LLMBlock(MetaModule):
                 "all_gather", model_info.moe_weight_bytes * moe_group_size, moe_group_size,
                 net=self._fsdp_moe_net_resolved, comm_stage="edp",
                 strategy=self.strategy, group_kind="edp",
+                comm_direction="fwd",
             )
             ops.append(async_all_gather(
                 f"{state.comm_order}-fsdp_ag-edp_group:{rank_info['edp_group_id']}",
@@ -349,6 +351,7 @@ class LLMBlock(MetaModule):
             "reduce_scatter", model_info.dense_grad_bytes * dense_group_size, dense_group_size,
             net=self._fsdp_net_resolved, comm_stage="dp_cp",
             strategy=self.strategy, group_kind="dp_cp",
+            comm_direction="bwd",
         )
         ops.append(async_reduce_scatter(
             f"{state.comm_order}-fsdp_rs-dp_cp_group:{rank_info['dp_cp_group_id']}",
@@ -364,6 +367,7 @@ class LLMBlock(MetaModule):
                 "reduce_scatter", model_info.moe_grad_bytes * moe_group_size, moe_group_size,
                 net=self._fsdp_moe_net_resolved, comm_stage="edp",
                 strategy=self.strategy, group_kind="edp",
+                comm_direction="bwd",
             )
             ops.append(async_reduce_scatter(
                 f"{state.comm_order}-fsdp_rs-edp_group:{rank_info['edp_group_id']}",
@@ -397,6 +401,7 @@ class LLMBlock(MetaModule):
             "all_gather", model_info.dense_weight_bytes * dense_group_size, dense_group_size,
             net=self._fsdp_net_resolved, comm_stage="dp_cp",
             strategy=self.strategy, group_kind="dp_cp",
+            comm_direction="bwd",
         )
         ops.append(async_all_gather(
             f"{state.comm_order}-fsdp_bwd_ag-dp_cp_group:{rank_info['dp_cp_group_id']}",
@@ -412,6 +417,7 @@ class LLMBlock(MetaModule):
                 "all_gather", model_info.moe_weight_bytes * moe_group_size, moe_group_size,
                 net=self._fsdp_moe_net_resolved, comm_stage="edp",
                 strategy=self.strategy, group_kind="edp",
+                comm_direction="bwd",
             )
             ops.append(async_all_gather(
                 f"{state.comm_order}-fsdp_bwd_ag-edp_group:{rank_info['edp_group_id']}",
@@ -437,7 +443,16 @@ class LLMBlock(MetaModule):
             # exposed); blocks near the end have fewer successors to post.
             prefetch = self.strategy.fsdp_prefetch_layers
             ag_this = self._fsdp_ag_ops
-            head = [async_wait_collective(ag_this, call_stk=self.call_stk + '-fsdp_ag_wait')]
+            head = [async_wait_collective(
+                ag_this,
+                call_stk=self.call_stk + '-fsdp_ag_wait',
+                metadata={
+                    "consumer_id": f"layer{self.layer_idx}/forward/parameter_use",
+                    "consumer_event": f"layer{self.layer_idx}/forward/compute",
+                    "consumer_phase": "fwd",
+                    "dependency_kind": "fsdp_all_gather_consumer",
+                    "dependency_status": "explicit",
+                })]
             if self._prev_block is None:
                 # First block: its own AG is posted then immediately waited
                 # (fully exposed, no overlap window available).
@@ -487,7 +502,18 @@ class LLMBlock(MetaModule):
             # Block links: _next_block = bwd predecessor (ran before us),
             #              _prev_block = bwd successor (runs after us).
             ag_this = self._fsdp_bwd_ag_ops
-            head = [async_wait_collective(ag_this, call_stk=self.call_stk + '-fsdp_bwd_ag_wait')]
+            head = [async_wait_collective(
+                ag_this,
+                call_stk=self.call_stk + '-fsdp_bwd_ag_wait',
+                wait_phase="bwd",
+                metadata={
+                    "consumer_id": f"layer{self.layer_idx}/backward/parameter_use",
+                    "consumer_event": (
+                        f"layer{self.layer_idx}/backward/recompute_compute"),
+                    "consumer_phase": "bwd",
+                    "dependency_kind": "fsdp_backward_ag_consumer",
+                    "dependency_status": "explicit",
+                })]
             if self._next_block is None:
                 # First backward block (last forward): self-post AG (exposed)
                 head = [op.prefill_bwd() for op in ag_this] + head

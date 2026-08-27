@@ -7,6 +7,8 @@ from typing import ClassVar, List, Tuple, Dict
 from collections import defaultdict, deque
 import heapq
 import itertools
+import math
+import re
 import time
 import types
 import multiprocessing
@@ -36,6 +38,191 @@ from simumax.core.utils import get_rank_group
 from simumax.core.utils import group_node_stats, estimate_straggler_increase_ratio
 from simumax.core.utils import group_level_span
 from simumax.core.graph import SimuONNXGraphBuilder
+
+
+_COLLECTIVE_LIFECYCLE_COMPONENTS = (
+    "post",
+    "task_dispatch",
+    "data_transfer",
+    "completion",
+    "wait",
+    "consumer_release",
+)
+
+
+def _collective_lifecycle_facts(
+    op_id,
+    group_size=None,
+    payload_bytes=0,
+    comm_role=None,
+    comm_stage=None,
+    ctx=None,
+):
+    """Build model-side collective lifecycle facts.
+
+    This is deliberately a structural description.  It does not read a
+    profiler and it never turns a measured duration into a cost.  The
+    optional runtime profile contributes only declared launch/task policies;
+    completion and wait values remain ``None`` when the target runtime does
+    not expose a portable fact for them.
+    """
+
+    token = "_".join(
+        str(value or "").lower()
+        for value in (op_id, comm_role, comm_stage)
+    ).replace("-", "_")
+    # ``all2all`` is the fixed-count semantic exchange used by the router
+    # metadata call.  ``alltoallv`` is the variable-count exchange used by
+    # dispatch/combine and must remain a separate family in the lifecycle
+    # ledger.  The old substring rule classified both as alltoallv, which
+    # corrupted family counts even though the cost formula itself was still
+    # selected through the compatibility fallback.
+    if "alltoallv" in token or "all2allv" in token or "a2av" in token:
+        collective = "alltoallv"
+        algorithm = "pairwise_exchange"
+        stages = max(0, int(group_size or 1) - 1)
+    elif "alltoall" in token or "all2all" in token:
+        collective = "alltoall"
+        algorithm = "pairwise_exchange"
+        stages = max(0, int(group_size or 1) - 1)
+    elif "allreduce" in token or "all_reduce" in token:
+        collective = "all_reduce"
+        algorithm = "ring"
+        stages = 2 * max(0, int(group_size or 1) - 1)
+    elif (
+        "reducescatter" in token
+        or "reduce_scatter" in token
+        or re.search(r"(?:^|_)rs(?:_|$)", token)
+    ):
+        collective = "reduce_scatter"
+        algorithm = "ring"
+        stages = max(0, int(group_size or 1) - 1)
+    elif (
+        "allgather" in token
+        or "all_gather" in token
+        or re.search(r"(?:^|_)ag(?:_|$)", token)
+    ):
+        collective = "all_gather"
+        algorithm = "ring"
+        stages = max(0, int(group_size or 1) - 1)
+    else:
+        collective = "communication"
+        algorithm = "unknown"
+        stages = None
+
+    payload = max(0, int(payload_bytes or 0))
+    system = getattr(ctx, "system", None) if ctx is not None else None
+    runtime_cfg = {}
+    if system is not None:
+        getter = getattr(system, "_hccl_network_config", None)
+        if callable(getter):
+            network_cfg = dict(getter() or {})
+            runtime_cfg = dict(network_cfg.get("call_runtime", {}) or {})
+
+    descriptor_bytes = runtime_cfg.get("descriptor_chunk_bytes")
+    if descriptor_bytes:
+        descriptor_bytes = max(1, int(descriptor_bytes))
+        chunk_count = max(1, math.ceil(payload / descriptor_bytes)) if payload else 1
+        chunk_source = "system_config.hccl_runtime.call_runtime.descriptor_chunk_bytes"
+    else:
+        # No physical HCCL bucket count is invented when the target profile
+        # does not declare one.  One logical call is still a valid internal
+        # representation, while the provenance tells consumers that physical
+        # decomposition is unresolved.
+        chunk_count = 1
+        chunk_source = "portable_logical_call_default"
+
+    payload_per_chunk = math.ceil(payload / chunk_count) if payload else 0
+    completion = dict(runtime_cfg.get("completion", {}) or {})
+    launch = runtime_cfg.get("call_launch_latency_us")
+    task = runtime_cfg.get("task_launch_latency_us", launch)
+    tasks_per_stage = runtime_cfg.get("tasks_per_stage")
+    descriptor_tasks = max(0, chunk_count - 1) * int(
+        runtime_cfg.get("tasks_per_additional_chunk", 0) or 0
+    )
+    task_count = None
+    if stages is not None and tasks_per_stage is not None:
+        task_count = (
+            stages * max(1, len(getattr(ctx, "levels", []) or [1]))
+            * int(tasks_per_stage)
+            + descriptor_tasks
+        )
+    return {
+        "schema": "collective_call_v1",
+        "collective": collective,
+        "algorithm": algorithm,
+        "algorithm_stages": stages,
+        "group_size": int(group_size) if group_size is not None else None,
+        "payload_bytes": payload,
+        "chunk_count": chunk_count,
+        "payload_per_chunk_bytes": payload_per_chunk,
+        "chunk_count_source": chunk_source,
+        "lifecycle_components": list(_COLLECTIVE_LIFECYCLE_COMPONENTS),
+        "runtime": {
+            "call_launch_latency_us": launch,
+            "task_dispatch_latency_us": task,
+            "tasks_per_stage": tasks_per_stage,
+            "runtime_task_count": task_count,
+            "completion_latency_us": completion.get("completion_latency_us"),
+            "wait_latency_us": completion.get("wait_latency_us"),
+            "barrier_latency_us": completion.get("barrier_latency_us"),
+            "unknown_fields": [
+                name for name in (
+                    "completion_latency_us",
+                    "wait_latency_us",
+                    "barrier_latency_us",
+                )
+                if not isinstance(completion.get(name), (int, float))
+            ],
+        },
+        "provenance": {
+            "source": (
+                "model_strategy_system_config"
+                if system is not None
+                else "model_structure_portable_default"
+            ),
+            "measured_duration_used": False,
+            "physical_kernel_identity_used": False,
+        },
+    }
+
+
+def _lifecycle_with_times(
+    metadata,
+    *,
+    stage=None,
+    phase=None,
+    post_time=None,
+    completion_time=None,
+    consumer_release_time=None,
+    entry=None,
+):
+    """Copy lifecycle metadata and attach simulator-clock timestamps."""
+
+    result = dict(metadata or {})
+    lifecycle = dict(result.get("lifecycle") or {})
+    if phase is not None:
+        lifecycle["phase"] = phase
+    if stage is not None:
+        lifecycle["event_stage"] = stage
+    if entry is not None:
+        post_time = post_time if post_time is not None else entry.issue_t
+        completion_time = (
+            completion_time if completion_time is not None else entry.completion_t
+        )
+        consumer_release_time = (
+            consumer_release_time
+            if consumer_release_time is not None
+            else entry.consumer_release_t
+        )
+    if post_time is not None:
+        lifecycle["post_time_ms"] = post_time
+    if completion_time is not None:
+        lifecycle["completion_time_ms"] = completion_time
+    if consumer_release_time is not None:
+        lifecycle["consumer_release_time_ms"] = consumer_release_time
+    result["lifecycle"] = lifecycle
+    return result
 
 class FwdQue:
     def __init__(
@@ -595,7 +782,7 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
         dtype = next((d for d in output_dtypes if d), None)
         if dtype is None:
             dtype = next((d for d in input_dtypes if d), None)
-        return {
+        metadata = {
             "shape_desc_by_stage": shape_desc_by_stage,
             "input_shapes": input_shapes,
             "output_shapes": output_shapes,
@@ -603,6 +790,55 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
             "output_dtypes": output_dtypes,
             "dtype": dtype,
         }
+        # Layout-bearing modules may expose a portable physical-work contract
+        # in addition to the ordinary logical tensor shapes. Keep unknown
+        # physical facts explicit instead of guessing a CANN kernel format.
+        # The contract is metadata only; it never changes DES cost.
+        # A sequence module supplies the common contract while each AtomModel
+        # may refine the physical stage (bytes, owner, fusion boundary).  Merge
+        # the leaf refinement after the parent so stage-local facts are not
+        # overwritten when the parent attaches metadata during prefill.
+        layout_contract = dict(getattr(self, "layout_contract", {}) or {})
+        child_metadata = dict(getattr(leaf, "event_metadata", {}) or {})
+        layout_contract.update(
+            dict(child_metadata.get("layout_contract") or {}))
+        if layout_contract:
+            physical_work_id = layout_contract.get("physical_work_id")
+            if (physical_work_id in (None, "auto")
+                    or str(physical_work_id).startswith("auto/")):
+                owner = getattr(self, "full_name", None) or self.call_stk
+                stage_name = (
+                    layout_contract.get("physical_stage_role")
+                    or getattr(leaf, "specific_name", None)
+                    or getattr(self, "specific_name", None)
+                    or "layout")
+                if str(physical_work_id).startswith("auto/"):
+                    stage_name = str(physical_work_id).split("/", 1)[1]
+                layout_contract["physical_work_id"] = (
+                    f"{owner}/{stage_name}")
+            layout_contract.setdefault("logical_input_shape", input_shapes)
+            layout_contract.setdefault("logical_output_shape", output_shapes)
+            layout_contract.setdefault("dtype", dtype)
+            layout_contract.setdefault("source_format", None)
+            layout_contract.setdefault("target_format", None)
+            layout_contract.setdefault("transpose_dims", None)
+            layout_contract.setdefault("padding", None)
+            layout_contract.setdefault("contiguous", None)
+            # Zero is a physical claim.  Keep temporary traffic unknown unless
+            # the model explicitly declares that no temporary tensor exists.
+            layout_contract.setdefault("temporary_bytes", None)
+            layout_contract.setdefault("physical_shape", None)
+            layout_contract.setdefault("physical_shape_status", "unknown")
+            metadata["layout_contract"] = layout_contract
+            for field_name in (
+                    "fusion_scope", "physical_work_id",
+                    "memory_transaction_owner", "physical_stage_role"):
+                value = child_metadata.get(field_name)
+                if value is None:
+                    value = layout_contract.get(field_name)
+                if value is not None:
+                    metadata[field_name] = value
+        return metadata
         
     def get_all_leaf_modules(self):
         assert self.status_ready, f"{self.__class__.__name__} is not ready yet, please run set_first_last_recompute_status() first"
@@ -940,14 +1176,16 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
         def compute_details(op_name, stage, flops, accessed_mem):
             #compute_details include compute time, tflops of accelerator, flops of current op, etc.
             class_key, path_key = self.get_cost_keys()
+            shape_desc = self.get_input_shapes_desc(stage)
             compute_details = self.system.compute_op_accuracy_time(
-                op_name, flops, shape_desc=self.get_input_shapes_desc(stage),
+                op_name, flops, shape_desc=shape_desc,
                 reture_detail=True, class_key=class_key, path_key=path_key,
                 accessed_mem=accessed_mem, stage=stage)
 
             # io_details include io time, gbps of accelerator, io size of current op, etc.
             io_details = self.system.compute_mem_access_time(op_name,
-                accessed_mem, reture_detail=True
+                accessed_mem, reture_detail=True, shape_desc=shape_desc,
+                stage=stage,
             )
 
             # Get final time, we can set "roofline" or "compute_only" in accelerator config, default is roofline
@@ -1609,6 +1847,15 @@ class CommEntry:
     expected: int | None = None
     status: str = "queued"
     ready_t: float | None = None
+    # CollectiveCall lifecycle timestamps.  These are simulator-clock facts,
+    # not values copied from a profiler.  ``dispatch_t`` is the modelled
+    # submit point; a target runtime may later provide a more detailed split
+    # without changing the semantic call identity.
+    post_t: float | None = None
+    dispatch_t: float | None = None
+    transfer_start_t: float | None = None
+    completion_t: float | None = None
+    consumer_release_t: float | None = None
     launch_t: float | None = None
     end_t: float | None = None
     log_call_stk: str | None = None
@@ -1920,6 +2167,10 @@ class SimuContext:
         self.event_sink = EventSink()
         self.current_rank = None
         self.memory_tracker = None
+        # Set by the simulation runner from the model's SystemConfig.  It is
+        # used only to expose declared runtime/lifecycle policy in events;
+        # measured traces never enter this context.
+        self.system = None
         # Resource-lane names shared by all threads (design doc 4.2); kept on
         # the context so comm code can resolve lane membership if needed.
         self.resource_lanes = resource_lanes
@@ -2246,6 +2497,8 @@ class SimuContext:
             "mode": mode,
             "backend_kind": backend_kind,
             "expected": expected,
+            "post_t": issue_t,
+            "dispatch_t": issue_t,
             "log_call_stk": log_call_stk,
             "log_id": log_id,
             "meta": meta or {},
@@ -2286,6 +2539,17 @@ class SimuContext:
         entry.status = "done"
         entry.launch_t = launch_t
         entry.end_t = end_t
+        entry.transfer_start_t = launch_t
+        entry.completion_t = end_t
+        lifecycle = dict(entry.meta.get("lifecycle") or {})
+        lifecycle.update({
+            "post_time_ms": entry.post_t,
+            "task_dispatch_time_ms": entry.dispatch_t,
+            "transfer_start_time_ms": entry.transfer_start_t,
+            "completion_time_ms": entry.completion_t,
+            "time_provenance": "simulator_clock",
+        })
+        entry.meta["lifecycle"] = lifecycle
         queue.popleft()
         self.rank_comm_tail[lane_key] = end_t
         # Uniform fabric charge (network-fabric design doc 5.3): covers local
@@ -2520,7 +2784,16 @@ class LeafModel():
     simu_kind: ClassVar[str | None] = "compute"
     simu_lane: ClassVar[str | None] = None
 
-    def _event_metadata(self):
+    def _event_metadata(
+        self,
+        ctx=None,
+        phase=None,
+        lifecycle_stage=None,
+        post_time=None,
+        completion_time=None,
+        consumer_release_time=None,
+        entry=None,
+    ):
         """Return portable metadata shared by all leaf event kinds."""
         structural = dict(getattr(self, "event_metadata", {}) or {})
         op_id = str(getattr(self, "id", ""))
@@ -2564,6 +2837,27 @@ class LeafModel():
         # what allows compute atoms and communication atoms to share one event
         # schema without changing their scheduling behavior.
         defaults.update(structural)
+        if getattr(self, "simu_kind", None) in ("comm", "wait") or group_kind is not None:
+            lifecycle = _collective_lifecycle_facts(
+                op_id=op_id,
+                group_size=getattr(self, "group_size", None),
+                payload_bytes=getattr(self, "size_bytes", 0),
+                comm_role=getattr(self, "comm_role", None),
+                comm_stage=comm_stage,
+                ctx=ctx,
+            )
+            supplied_lifecycle = dict(defaults.get("lifecycle") or {})
+            lifecycle.update(supplied_lifecycle)
+            defaults["lifecycle"] = lifecycle
+            defaults = _lifecycle_with_times(
+                defaults,
+                stage=lifecycle_stage,
+                phase=phase,
+                post_time=post_time,
+                completion_time=completion_time,
+                consumer_release_time=consumer_release_time,
+                entry=entry,
+            )
         return defaults
 
     def __init__(self, specific_name='', event_metadata=None):
@@ -2821,7 +3115,16 @@ class Com(LeafModel):
         self._bwd_done_t = None
         self._batch_submit_by_gid = {}
 
-    def _event_metadata(self):
+    def _event_metadata(
+        self,
+        ctx=None,
+        phase=None,
+        lifecycle_stage=None,
+        post_time=None,
+        completion_time=None,
+        consumer_release_time=None,
+        entry=None,
+    ):
         """Return portable communication ownership metadata for trace spans."""
         group_kind = self.group_kind
         comm_stage = self.comm_stage
@@ -2866,6 +3169,25 @@ class Com(LeafModel):
             "comm_role": self.comm_role or comm_stage or group_kind,
         }
         metadata.update(getattr(self, "event_metadata", {}) or {})
+        lifecycle = _collective_lifecycle_facts(
+            op_id=self.id,
+            group_size=self.group_size,
+            payload_bytes=self.size_bytes,
+            comm_role=metadata.get("comm_role"),
+            comm_stage=comm_stage,
+            ctx=ctx,
+        )
+        lifecycle.update(dict(metadata.get("lifecycle") or {}))
+        metadata["lifecycle"] = lifecycle
+        metadata = _lifecycle_with_times(
+            metadata,
+            stage=lifecycle_stage,
+            phase=phase,
+            post_time=post_time,
+            completion_time=completion_time,
+            consumer_release_time=consumer_release_time,
+            entry=entry,
+        )
         return metadata
 
     def _dp_comm_push(self, ctx, t, end_t, launch_st):
@@ -2897,8 +3219,23 @@ class Com(LeafModel):
             gid=self.id, stream=self.stream,
             kind="comm", lane=self.simu_lane,
             name=self.call_stk.split("-")[-1] + "-post",
-            metadata=self._event_metadata(),
+            metadata=self._event_metadata(
+                ctx=ctx, phase=phase, lifecycle_stage="post",
+                post_time=issue_t,
+            ),
         )
+
+    def _forward_phase(self):
+        """Return the semantic phase for the forward-side lifecycle.
+
+        Normal forward calls use ``fwd``. Recompute calls are cloned by
+        :meth:`prefill_recompute_fwd` and set ``forward_op`` to
+        ``recompute_fwd``; they execute while the backward queue replays
+        saved activations, so retaining that label is important for phase and
+        overlap analysis. The value is supplied by the model scheduler, not
+        inferred from measured trace names or timings.
+        """
+        return getattr(self, "forward_op", "fwd") or "fwd"
 
     def step(self, t, ctx):
         out = self._step(t, ctx)
@@ -2907,11 +3244,18 @@ class Com(LeafModel):
             done_t = self._fwd_done_t if self._fwd_done_t is not None else t[self.stream]
             if self._fwd_launch_st is None or done_t == self._fwd_launch_st:
                 return True, None
+            entry = ctx.get_entry(self._fwd_entry_eid)
+            if entry is not None:
+                entry.consumer_release_t = done_t
             ctx.event_sink.emit_span(
-                self.call_stk, "fwd", self._fwd_launch_st, done_t,
+                self.call_stk, self._forward_phase(), self._fwd_launch_st, done_t,
                 gid=self.id, stream=self.stream,
                 kind=self.simu_kind, lane=self.simu_lane,
-                metadata=self._event_metadata(),
+                metadata=self._event_metadata(
+                    ctx=ctx, phase=self._forward_phase(), lifecycle_stage="completion",
+                    completion_time=done_t,
+                    entry=entry,
+                ),
             )
             self._fwd_launch_st = None
             self._fwd_done_t = None
@@ -2925,18 +3269,25 @@ class Com(LeafModel):
             done_t = self._bwd_done_t if self._bwd_done_t is not None else t[self.stream]
             if self._bwd_launch_st is None or done_t == self._bwd_launch_st:
                 return True, None
+            entry = ctx.get_entry(self._bwd_entry_eid)
+            if entry is not None:
+                entry.consumer_release_t = done_t
             ctx.event_sink.emit_span(
                 self.call_stk, "bwd", self._bwd_launch_st, done_t,
                 gid=self.id, stream=self.stream,
                 kind=self.simu_kind, lane=self.simu_lane,
-                metadata=self._event_metadata(),
+                metadata=self._event_metadata(
+                    ctx=ctx, phase="bwd", lifecycle_stage="completion",
+                    completion_time=done_t,
+                    entry=entry,
+                ),
             )
             self._bwd_launch_st = None
             self._bwd_done_t = None
             return True, None
         return False, blk
 
-    def _issue_meta(self, ctx):
+    def _issue_meta(self, ctx, phase=None):
         """Meta dict for the comm entry issued by _step/_bwd.
 
         Under an active level topology (ctx.levels set by the runner AND
@@ -2950,7 +3301,8 @@ class Com(LeafModel):
         is an intra-node phase and engages nothing). Level 0 has no
         level_tail entry — its server is the ToR.
         """
-        meta = self._event_metadata()
+        meta = self._event_metadata(
+            ctx=ctx, phase=phase or self._forward_phase())
         levels = getattr(ctx, "levels", None)
         fabric = ctx.fabric
         if (self.net in ("inter_node", "levels") and levels
@@ -3001,11 +3353,11 @@ class Com(LeafModel):
                 expected=expected,
                 log_call_stk=self.call_stk,
                 log_id=self.id,
-                meta=self._issue_meta(ctx),
+                meta=self._issue_meta(ctx, phase=self._forward_phase()),
             )
             # Faithful post marker (design doc 9.3): the post happens at issue;
             # the completion span follows from the step wrapper as before.
-            self._emit_post_marker(ctx, "fwd", t["comp"])
+            self._emit_post_marker(ctx, self._forward_phase(), t["comp"])
             ctx.pump_comm_queue()
         if not ctx.entry_done(self._fwd_entry_eid):
             return False, ("comm_entry", self._fwd_entry_eid)
@@ -3053,7 +3405,7 @@ class Com(LeafModel):
                 expected=expected,
                 log_call_stk=self.call_stk,
                 log_id=self.id,
-                meta=self._issue_meta(ctx),
+                meta=self._issue_meta(ctx, phase="bwd"),
             )
             # Faithful post marker (design doc 9.3): the post happens at issue;
             # the completion span follows from the bwd wrapper as before.
@@ -3407,7 +3759,7 @@ class async_all_gather(LeafModel):
                  global_rank=None, stream="comm", net=None, size_bytes=0,
                  call_stk='', group_kind=None, comm_stage=None,
                  comm_owner=None, comm_role=None, **kwargs):
-        super().__init__()
+        super().__init__(event_metadata=kwargs.pop("metadata", None))
         self.call_stk = call_stk + f'-{self.__class__.__name__}'
         self.id = id
         self.rank = rank
@@ -3427,13 +3779,17 @@ class async_all_gather(LeafModel):
         self._eid = None
         self._posted_fwd = False
         self._posted_bwd = False
+        # A collective may be observed by an inflight wait and by the final
+        # optimizer barrier.  Keep completion logging at the operation level
+        # so a second wait cannot manufacture a duplicate semantic event.
+        self._completion_logged = set()
 
-    def _issue_meta(self):
+    def _issue_meta(self, ctx=None, phase=None):
         # Keep the communication entry metadata identical to its eventual
         # completion span.  This matters for level routing and for async FSDP
         # posts: a payload/domain override must not disappear at the queue
         # boundary.
-        return self._event_metadata()
+        return self._event_metadata(ctx=ctx, phase=phase)
 
     def _backend_kind(self, ctx):
         expected = 2 if self.id.startswith("send_recv-") else self.group_size
@@ -3470,7 +3826,7 @@ class async_all_gather(LeafModel):
             expected=expected,
             log_call_stk=self.call_stk,
             log_id=self.id,
-            meta=self._issue_meta(),
+            meta=self._issue_meta(ctx=ctx, phase=phase),
         )
         # Faithful post marker (design doc 9.3): a zero-duration marker at the
         # moment the op posts; the completion span is emitted by the wait.
@@ -3479,7 +3835,10 @@ class async_all_gather(LeafModel):
             gid=self.id, stream=self.stream,
             kind="comm", lane=self.simu_lane,
             name=self.call_stk.split("-")[-1] + "-post",
-            metadata=self._event_metadata(),
+            metadata=self._event_metadata(
+                ctx=ctx, phase=phase, lifecycle_stage="post",
+                post_time=t["comp"],
+            ),
         )
         ctx.pump_comm_queue()
         setattr(self, posted_attr, True)
@@ -3517,7 +3876,7 @@ class async_reduce_scatter(LeafModel):
                  global_rank=None, stream="comm", net=None, size_bytes=0,
                  call_stk='', group_kind=None, comm_stage=None,
                  comm_owner=None, comm_role=None, **kwargs):
-        super().__init__()
+        super().__init__(event_metadata=kwargs.pop("metadata", None))
         self.call_stk = call_stk + f'-{self.__class__.__name__}'
         self.id = id
         self.rank = rank
@@ -3535,9 +3894,15 @@ class async_reduce_scatter(LeafModel):
         self._eid = None
         self._posted_fwd = False
         self._posted_bwd = False
+        # See async_all_gather._completion_logged.  Reduce-scatter is commonly
+        # waited first by the inflight limiter and again before optimizer.
+        self._completion_logged = set()
 
-    def _issue_meta(self):
-        return {"net": self.net, "size_bytes": self.size_bytes}
+    def _issue_meta(self, ctx=None, phase=None):
+        # Keep domain/owner/group metadata on the posted entry.  Losing it at
+        # this queue boundary made async reduce-scatter completion records look
+        # like unowned communication to structural trace consumers.
+        return self._event_metadata(ctx=ctx, phase=phase)
 
     def _backend_kind(self, ctx):
         return async_all_gather._backend_kind(self, ctx)
@@ -3564,14 +3929,17 @@ class async_reduce_scatter(LeafModel):
             expected=expected,
             log_call_stk=self.call_stk,
             log_id=self.id,
-            meta=self._issue_meta(),
+            meta=self._issue_meta(ctx=ctx, phase=phase),
         )
         ctx.event_sink.emit_span(
             self.call_stk, phase, t["comp"], t["comp"],
             gid=self.id, stream=self.stream,
             kind="comm", lane=self.simu_lane,
             name=self.call_stk.split("-")[-1] + "-post",
-            metadata=self._event_metadata(),
+            metadata=self._event_metadata(
+                ctx=ctx, phase=phase, lifecycle_stage="post",
+                post_time=t["comp"],
+            ),
         )
         ctx.pump_comm_queue()
         setattr(self, posted_attr, True)
@@ -3608,16 +3976,28 @@ class async_wait_collective(LeafModel):
     """
     simu_kind = "wait"
 
-    def __init__(self, ag_ops, call_stk=''):
-        super().__init__()
+    def __init__(self, ag_ops, call_stk='', wait_phase=None,
+                 consumer_phase=None, metadata=None):
+        super().__init__(event_metadata=metadata)
         self.call_stk = call_stk or '-async_wait_collective'
         # ag_ops: a single async_all_gather/async_reduce_scatter instance, or a
         # list (dense + MoE sub-ops of one block are waited together).
         self.ag_ops = list(ag_ops) if isinstance(ag_ops, (list, tuple)) else [ag_ops]
         self._completed = set()
+        # ``wait_phase`` is the semantic phase of the collective being
+        # completed, which can differ from the DES container phase.  For
+        # example, the final layer-wise FSDP wait is stored in an optimizer
+        # FwdQue but completes backward reduce-scatter operations.
+        self.wait_phase = wait_phase
+        # The lifecycle phase being completed and the phase that owns the
+        # consumer are deliberately separate.  A backward RS can therefore
+        # remain a backward communication event while its final barrier is
+        # explicitly attributed to the optimizer consumer.
+        self.consumer_phase = consumer_phase
 
     def _wait(self, t, ctx, phase):
-        if phase in self._completed:
+        effective_phase = self.wait_phase or phase
+        if effective_phase in self._completed:
             return True, None
         wait_start = t["comp"]
         # First pass: every referenced post must be done; find the latest end.
@@ -3636,6 +4016,24 @@ class async_wait_collective(LeafModel):
                 end_t = done_t
         if pending_eid is not None:
             return False, ("comm_entry", pending_eid)
+        dependency_refs = [
+            f"comm/{getattr(op, 'id', 'unknown')}/{effective_phase}"
+            for op in self.ag_ops
+            if getattr(op, '_eid', None) is not None
+        ]
+        # A wait is the model-side consumer edge.  Keep the edge on both the
+        # consumer marker and the completion span so a trace consumer can
+        # reconstruct ``post -> completion -> consumer`` without relying on
+        # event name matching or duration ordering.  The optional fields are
+        # supplied by the schedule from layer/phase structure; when legacy
+        # callers do not provide them, the lifecycle remains explicit but
+        # owner-unknown.
+        wait_semantic = self._event_metadata()
+        consumer_fields = {
+            key: wait_semantic.get(key)
+            for key in ("consumer_id", "consumer_event", "consumer_phase")
+            if wait_semantic.get(key) is not None
+        }
         # Emit the comm-lane completion span for each posted op (the AG/RS
         # activity that ran in parallel with compute), plus a comp-lane wait
         # span for the stall (zero-duration when fully overlapped).
@@ -3646,16 +4044,85 @@ class async_wait_collective(LeafModel):
             entry = ctx.get_entry(eid)
             if entry is None or entry.launch_t is None or entry.end_t is None:
                 continue
+            logged = getattr(op, "_completion_logged", None)
+            if logged is None:
+                logged = set()
+                op._completion_logged = logged
+            # Multiple structural waits may observe the same communication
+            # lifecycle.  The first wait owns the semantic completion span;
+            # later waits are dependency checks only.
+            if effective_phase in logged:
+                continue
+            completion_metadata = op._event_metadata(
+                ctx=ctx, phase=effective_phase, lifecycle_stage="completion")
+            # The completion remains a communication event in the phase in
+            # which it was issued, while the explicit consumer link records
+            # which later queue/compute owns the dependency.  ``depends_on``
+            # is retained on the completion for portable audit consumers.
+            if consumer_fields:
+                completion_metadata.update(consumer_fields)
+            if dependency_refs:
+                completion_metadata["depends_on"] = dependency_refs
+            entry.consumer_release_t = end_t
+            lifecycle = dict(entry.meta.get("lifecycle") or {})
+            lifecycle["consumer_release_time_ms"] = end_t
+            lifecycle["time_provenance"] = "simulator_clock"
+            entry.meta["lifecycle"] = lifecycle
+            completion_metadata = _lifecycle_with_times(
+                completion_metadata,
+                stage="completion",
+                phase=effective_phase,
+                entry=entry,
+                consumer_release_time=end_t,
+            )
             ctx.event_sink.emit_span(
-                op.call_stk, phase, entry.launch_t, entry.end_t,
+                op.call_stk, effective_phase, entry.launch_t, entry.end_t,
                 gid=op.id, stream=op.stream, kind="comm", lane=op.simu_lane,
-                metadata=op._event_metadata())
-        if end_t > wait_start + 1e-12:
+                metadata=completion_metadata)
+            logged.add(effective_phase)
+        # A consumer-owned barrier is useful even when the dependency is
+        # completely overlapped and therefore has zero stall time.  Emit a
+        # zero-duration structural marker in that case; it does not advance
+        # any lane or alter the performance result, but makes the lifecycle
+        # visible to trace consumers.
+        if end_t > wait_start + 1e-12 or self.consumer_phase is not None:
+            wait_metadata = self._event_metadata(
+                ctx=ctx, phase=effective_phase,
+                lifecycle_stage="consumer_release",
+                consumer_release_time=end_t,
+            )
+            defaults = {
+                # This is a model/DES dependency declaration: it identifies
+                # the lifecycle entries that the consumer barrier observes.
+                # It is not inferred from profiler timing or kernel names.
+                "dependency_kind": "consumer_barrier",
+                "dependency_status": "explicit" if dependency_refs else "implicit_lifecycle",
+                "ready_rule": "all_dependencies_complete",
+                "overlap_policy": "wait_for_dependencies",
+                "overlap_lanes": ["comp"],
+            }
+            for key, value in defaults.items():
+                wait_metadata.setdefault(key, value)
+            wait_metadata["depends_on"] = dependency_refs
+            # Preserve an explicit stable semantic consumer id supplied by
+            # the model; fall back to the display call stack for legacy waits.
+            wait_metadata.setdefault("consumer_id", self.call_stk)
+            if self.consumer_phase is not None:
+                wait_metadata["consumer_phase"] = self.consumer_phase
+            if wait_semantic.get("consumer_event") is not None:
+                wait_metadata["consumer_event"] = wait_semantic["consumer_event"]
+            wait_lifecycle = dict(wait_metadata.get("lifecycle") or {})
+            wait_lifecycle["consumer_release_time_ms"] = end_t
+            wait_lifecycle["time_provenance"] = "simulator_clock"
+            wait_metadata["lifecycle"] = wait_lifecycle
             ctx.event_sink.emit_span(
-                self.call_stk, phase, wait_start, end_t,
-                kind="wait", lane=None)
+                self.call_stk, effective_phase, wait_start, end_t,
+                kind="wait", lane=None,
+                name=("optimizer_gradient_sync_barrier"
+                      if self.consumer_phase == "optimizer" else None),
+                metadata=wait_metadata)
         t["comp"] = max(t["comp"], end_t)
-        self._completed.add(phase)
+        self._completed.add(effective_phase)
         return True, None
 
     def _step(self, t, ctx):

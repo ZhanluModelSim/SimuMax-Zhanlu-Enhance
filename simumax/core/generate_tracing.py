@@ -351,7 +351,46 @@ def convert_to_tracing_format(parsed_logs):
                     "comm_id": log.get("comm_id"),
                     "plan_id": log.get("plan_id"),
                     "consumer_id": log.get("consumer_id"),
+                    "consumer_phase": log.get("consumer_phase"),
                     "depends_on": log.get("depends_on"),
+                    "dependency_kind": log.get("dependency_kind"),
+                    "dependency_status": log.get("dependency_status"),
+                    "ready_rule": log.get("ready_rule"),
+                    "overlap_policy": log.get("overlap_policy"),
+                    "overlap_lanes": log.get("overlap_lanes"),
+                    # Stable model-side event identity.  These counters are
+                    # assigned by EventSink from the generated call stack and
+                    # operation phase; they are exported for portable trace
+                    # consumers and never depend on profiler event ids or
+                    # measured durations.
+                    "event_index": log.get("event_index"),
+                    "semantic_occurrence": log.get("semantic_occurrence"),
+                    "microbatch_index": log.get("microbatch_index"),
+                    "aggregation_policy": log.get("aggregation_policy"),
+                    "logical_substep_count": log.get("logical_substep_count"),
+                    "collective": log.get("collective"),
+                    "lifecycle_stage": log.get("lifecycle_stage"),
+                    "algorithm": log.get("algorithm"),
+                    "algorithm_stages": log.get("algorithm_stages"),
+                    "chunk_count": log.get("chunk_count"),
+                    "payload_per_chunk_bytes": log.get("payload_per_chunk_bytes"),
+                    "post_time_ms": log.get("post_time_ms"),
+                    "completion_time_ms": log.get("completion_time_ms"),
+                    "consumer_release_time_ms": log.get("consumer_release_time_ms"),
+                    "lifecycle": log.get("lifecycle"),
+                    "semantic_owner": log.get("semantic_owner"),
+                    "layer_id": log.get("layer_id"),
+                    "module_path": log.get("module_path"),
+                    "semantic_phase": log.get("semantic_phase"),
+                    "consumer_event": log.get("consumer_event"),
+                    "iteration_boundary": log.get("iteration_boundary"),
+                    "physical_decomposition": log.get("physical_decomposition"),
+                    "measured_duration_used": log.get("measured_duration_used"),
+                    "fusion_scope": log.get("fusion_scope"),
+                    "physical_work_id": log.get("physical_work_id"),
+                    "memory_transaction_owner": log.get("memory_transaction_owner"),
+                    "physical_stage_role": log.get("physical_stage_role"),
+                    "layout_contract": log.get("layout_contract"),
                     "post_ts": (log.get("post") * 1e3) if log.get("post") is not None else None,
                     "post_order": log.get("order"),
                 },
@@ -593,8 +632,13 @@ def process_log_file(log_path, output_json_path):
     print(f"Processed {len(parsed_logs)} logs. Saved to {output_json_path}.")
 
 
-def write_trace_file(events, output_json_path):
-    """Convert a list of SimuEvent objects to Chrome trace JSON."""
+def write_trace_file(events, output_json_path, provenance=None):
+    """Convert SimuEvents to Chrome trace JSON and a provenance ledger.
+
+    ``provenance`` is supplied by the configured SystemConfig.  The fallback
+    keeps this exporter compatible with standalone callers and only inspects
+    explicit event flags; it never infers measured parameters from durations.
+    """
     records = [event_to_record(event) for event in events]
     tracing_events = convert_to_tracing_format(records)
     with open(output_json_path, "w", encoding="utf-8") as f:
@@ -607,6 +651,24 @@ def write_trace_file(events, output_json_path):
         "semantic_event_ledger.json",
     )
     ledger_events = []
+    ledger_provenance = dict(provenance or {})
+    if not ledger_provenance:
+        performance_used = any(
+            record.get("measured_duration_used") is True
+            for record in records)
+        ledger_provenance = {
+            "mode": "unknown_export_context",
+            "structural_observations_used": False,
+            "shape_observations_used": False,
+            "kernel_role_observations_used": False,
+            "performance_duration_observations_used": performance_used,
+            "performance_observations_used_as_parameters": performance_used,
+            "model_structure_and_system_config_used": True,
+            "calibration_parameter_count": 0,
+            "calibration_parameters": [],
+            "measured_source": None,
+            "inference_basis": "explicit_event_flags_only",
+        }
     for index, record in enumerate(records):
         ledger_events.append({
             "event_index": index,
@@ -620,6 +682,9 @@ def write_trace_file(events, output_json_path):
             "ed_ms": record.get("ed"),
             "cost_ms": record.get("cost"),
             "gid": record.get("gid"),
+            "owner_path": record.get("owner_path"),
+            "semantic_id": record.get("semantic_id"),
+            "phase_id": record.get("phase_id"),
             "semantic_stage": record.get("semantic_stage"),
             "layer_idx": record.get("layer_idx"),
             "stage_role": record.get("stage_role"),
@@ -645,13 +710,51 @@ def write_trace_file(events, output_json_path):
             "comm_id": record.get("comm_id"),
             "plan_id": record.get("plan_id"),
             "consumer_id": record.get("consumer_id"),
+            "consumer_phase": record.get("consumer_phase"),
             "depends_on": record.get("depends_on"),
+            "dependency_kind": record.get("dependency_kind"),
+            "dependency_status": record.get("dependency_status"),
+            "ready_rule": record.get("ready_rule"),
+            "overlap_policy": record.get("overlap_policy"),
+            "overlap_lanes": record.get("overlap_lanes"),
+            "event_index": record.get("event_index"),
+            "semantic_occurrence": record.get("semantic_occurrence"),
+            "microbatch_index": record.get("microbatch_index"),
+            "aggregation_policy": record.get("aggregation_policy"),
+            "logical_substep_count": record.get("logical_substep_count"),
+            "collective": record.get("collective"),
+            "lifecycle_stage": record.get("lifecycle_stage"),
+            "algorithm": record.get("algorithm"),
+            "algorithm_stages": record.get("algorithm_stages"),
+            "chunk_count": record.get("chunk_count"),
+            "payload_per_chunk_bytes": record.get("payload_per_chunk_bytes"),
+            "post_time_ms": record.get("post_time_ms"),
+            "completion_time_ms": record.get("completion_time_ms"),
+            "consumer_release_time_ms": record.get("consumer_release_time_ms"),
+            "lifecycle": record.get("lifecycle"),
+            "semantic_owner": record.get("semantic_owner"),
+            "layer_id": record.get("layer_id"),
+            "module_path": record.get("module_path"),
+            "semantic_phase": record.get("semantic_phase"),
+            "consumer_event": record.get("consumer_event"),
+            "iteration_boundary": record.get("iteration_boundary"),
+            "physical_decomposition": record.get("physical_decomposition"),
+            "measured_duration_used": bool(
+                record.get("measured_duration_used", False)),
+            "fusion_scope": record.get("fusion_scope"),
+            "physical_work_id": record.get("physical_work_id"),
+            "memory_transaction_owner": record.get("memory_transaction_owner"),
+            "physical_stage_role": record.get("physical_stage_role"),
+            "layout_contract": record.get("layout_contract"),
         })
     with open(ledger_path, "w", encoding="utf-8") as f:
         json.dump({
             "schema": "simumax_semantic_event_ledger_v2",
             "source": "model_structure_and_configuration",
-            "measured_data_used_as_parameters": False,
+            "provenance": ledger_provenance,
+            "measured_data_used_as_parameters": bool(
+                ledger_provenance.get(
+                    "performance_observations_used_as_parameters", False)),
             "events": ledger_events,
         }, f, indent=2)
     print(f"Processed {len(records)} logs. Saved to {output_json_path}.")

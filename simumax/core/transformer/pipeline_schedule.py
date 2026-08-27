@@ -46,17 +46,68 @@ class OptimizerSimulator(MetaModule):
         opt_info = self.perf_model._compute_optim_time(self.model_name)
 
         def optimizer_atoms():
-            atoms = [
-                AtomModel(
-                    fwd_cost=step['cost_ms'], bwd_cost=0,
-                    specific_name=step['name'])
-                for step in opt_info.get('orthogonal_optimizer_steps', [])
-            ]
+            # The optimizer queue is a structural consumer of the completed
+            # gradient synchronisation.  Keep this declaration in the trace
+            # metadata rather than changing any cost: it lets a validator
+            # distinguish "optimizer starts after RS" from a generic compute
+            # lane adjacency, for every model/strategy configuration.
+            optimizer_metadata = {
+                "semantic_stage": "optimizer.compute",
+                "kernel_role": "optimizer",
+                "stage_role": "compute",
+                "consumer_id": "optimizer/compute",
+                "depends_on": ["optimizer/gradient_sync"],
+                "dependency_kind": "optimizer_after_gradient_sync",
+                "dependency_status": "explicit",
+                "ready_rule": "after_gradient_sync",
+                "overlap_policy": "serial_after_barrier",
+                "overlap_lanes": ["comp"],
+            }
+            orthogonal_steps = opt_info.get('orthogonal_optimizer_steps', [])
+            # The analytical model computes the complete orthogonal update
+            # from model structure (parameter blocks, dtype and optimizer
+            # formula).  Emitting every arithmetic sub-step as an independent
+            # DES event is an implementation-detail expansion, not a
+            # portable training semantic.  Keep it available behind the
+            # explicit ``detailed`` strategy switch, but default to one
+            # logical phase so the trace is not mistaken for a CANN kernel
+            # trace.  No measured data is consulted here.
+            granularity = getattr(self.strategy, "optimizer_trace_granularity", "semantic")
+            if granularity == "detailed":
+                atoms = [
+                    AtomModel(
+                        fwd_cost=step['cost_ms'], bwd_cost=0,
+                        specific_name=step['name'], metadata=optimizer_metadata)
+                    for step in orthogonal_steps
+                ]
+            else:
+                orthogonal_cost = float(opt_info.get("orthogonal_optimizer_time", 0.0))
+                if orthogonal_cost <= 0.0 and orthogonal_steps:
+                    orthogonal_cost = sum(
+                        float(step.get("cost_ms", 0.0)) for step in orthogonal_steps
+                    )
+                if orthogonal_cost > 0.0:
+                    semantic_metadata = {
+                        **optimizer_metadata,
+                        "semantic_stage": "optimizer.orthogonal",
+                        "kernel_role": "optimizer_orthogonal",
+                        "aggregation_policy": "logical_phase",
+                        "logical_substep_count": len(orthogonal_steps),
+                    }
+                    atoms = [AtomModel(
+                        fwd_cost=orthogonal_cost,
+                        bwd_cost=0,
+                        specific_name="orthogonal_optimizer",
+                        metadata=semantic_metadata,
+                    )]
+                else:
+                    atoms = []
             atoms.append(AtomModel(
                 fwd_cost=(
                     opt_info.get('adam_time', 0)
                     + opt_info.get('optimizer_pass_time', 0)),
-                bwd_cost=0, specific_name='optimizer_step'))
+                bwd_cost=0, specific_name='optimizer_step',
+                metadata=optimizer_metadata))
             return atoms
 
         # Model-wise FSDP (zero_state >= 3 and fsdp_mode == "model-wise"):
@@ -130,7 +181,23 @@ class OptimizerSimulator(MetaModule):
             # (FSDP2 gap analysis doc section 3.6, decision #3).
             rs_ops = state.fsdp_rs_ops
             rs_wait = async_wait_collective(
-                rs_ops, call_stk=f"{self.call_stk}-fsdp_rs_complete")
+                rs_ops,
+                call_stk=f"{self.call_stk}-fsdp_rs_complete",
+                wait_phase="bwd",
+                consumer_phase="optimizer",
+                metadata={
+                    "semantic_stage": "optimizer.gradient_sync",
+                    "stage_role": "wait",
+                    "kernel_role": "gradient_sync",
+                    "consumer_id": "optimizer/gradient_sync",
+                    "consumer_event": "optimizer/compute",
+                    "dependency_kind": "gradient_sync_barrier",
+                    "dependency_status": "explicit",
+                    "ready_rule": "all_reduce_scatter_complete",
+                    "overlap_policy": "wait_for_dependencies",
+                    "overlap_lanes": ["comp"],
+                },
+            )
             self._step_only_layers = [rs_wait, *optimizer_atoms()]
             for layer in self._step_only_layers:
                 layer.prefill(args, self.call_stk, com_buff=com_buff)

@@ -4509,6 +4509,12 @@ class PerfLLM(PerfBase):
         """Write auditable forward-only intermediate results, when enabled."""
         if not self.system.forward_derivation_enabled or not save_path:
             return
+        provenance = self.system.provenance_audit()
+        calibration_profile = getattr(self.system, "calibration_profile", None)
+        calibration_enabled = (
+            isinstance(calibration_profile, dict)
+            and calibration_profile.get("mode") == "measured_calibration")
+        output_mode = "measured_calibration" if calibration_enabled else "forward_derived"
         operator_rows = list(
             self.system.forward_derivation_records["operators"].values())
         operator_groups = {}
@@ -4582,19 +4588,40 @@ class PerfLLM(PerfBase):
                     for fact in row.get("missing_implementation_facts", [])
                 })),
                 "predicted_time_ms": total_derived,
-                "performance_observations_used": False,
+                # Keep this row-level flag aligned with the actual multiplier
+                # lookup.  A calibrated profile may contain compute,
+                # communication, or memory entries selectively; calibration
+                # being loaded does not mean every row used measured data.
+                "performance_observations_used": any(
+                    row.get("performance_observations_used", False)
+                    for row in rows),
+                "performance_observations_used_as_parameters": any(
+                    row.get("performance_observations_used_as_parameters", False)
+                    for row in rows),
             })
         payload = {
-            "mode": "forward_derived",
+            "mode": output_mode,
             "provenance_policy": {
                 "allowed_inputs": [
                     "model_graph_and_shapes",
                     "training_and_parallel_strategy",
                     "hardware_and_library_implementation_facts",
                 ],
-                "performance_observations_used_as_parameters": False,
-                "measured_results_role": "validation_only",
+                "structural_observations_used": provenance[
+                    "structural_observations_used"],
+                "shape_observations_used": provenance[
+                    "shape_observations_used"],
+                "kernel_role_observations_used": provenance[
+                    "kernel_role_observations_used"],
+                "performance_duration_observations_used": provenance[
+                    "performance_duration_observations_used"],
+                "performance_observations_used_as_parameters": provenance[
+                    "performance_observations_used_as_parameters"],
+                "measured_results_role": (
+                    "aggregate_calibration_parameters" if calibration_enabled
+                    else "validation_only"),
             },
+            "provenance": provenance,
             "inputs": {
                 "forward_derivation": self.system.forward_derivation,
                 "hardware_spec": self.system.hardware_spec,
@@ -4603,6 +4630,21 @@ class PerfLLM(PerfBase):
             **self.system.forward_derivation_records,
             "operator_summary": operator_summary_rows,
         }
+        if calibration_enabled:
+            # Keep the calibrated profile auditable without copying measured
+            # event durations into the derivation output.  The profile itself
+            # contains only aggregate multipliers and source hashes.
+            payload["inputs"]["measured_calibration"] = {
+                "schema": calibration_profile.get("schema"),
+                "world_size": calibration_profile.get("world_size"),
+                "description": calibration_profile.get("description"),
+                "statistics": calibration_profile.get("statistics"),
+                "source": calibration_profile.get("source"),
+                "compute_entries": len(
+                    (calibration_profile.get("compute") or {}).get("entries", [])),
+                "communication_entries": len(
+                    (calibration_profile.get("communication") or {}).get("entries", [])),
+            }
         existing_plan = getattr(self.system, "communication_plan_document", None)
         if existing_plan and existing_plan.get("summary", {}).get("des_event_plan_count", 0):
             plan_document = existing_plan
@@ -4612,6 +4654,7 @@ class PerfLLM(PerfBase):
         payload["communication_plan"] = plan_document["plans"]
         payload["communication_plan_summary"] = plan_document["summary"]
         payload["communication_plan_provenance"] = plan_document["provenance"]
+        payload["runtime_spec"] = plan_document.get("runtime_spec")
         if overall is not None:
             payload["overall"] = overall
         os.makedirs(save_path, exist_ok=True)
@@ -4708,7 +4751,7 @@ class PerfLLM(PerfBase):
                 "identity_scope": plan.get("identity_scope"),
                 "dependency_status": (plan.get("dependencies") or {}).get("status"),
                 "runtime_status": runtime.get("status"),
-                "performance_observations_used": False,
+                "performance_observations_used": calibration_enabled,
             })
         if communication_efficiency_rows:
             pd.DataFrame(communication_efficiency_rows).to_csv(
@@ -4809,6 +4852,25 @@ class PerfLLM(PerfBase):
             "mfu_6nd_with_attn": metrics["mfu_6nd_with_attn"],
             "mfu": metrics["mfu"],
         }
+        # ``run_simulation`` writes structural DES audit fields before this
+        # metric patch.  Preserve those fields when the headline metrics are
+        # rewritten, otherwise the optimizer dependency audit would silently
+        # disappear from the final ``des_summary.json``.  These values come
+        # from the model event stream only; no measured trace is involved.
+        structural_summary = {}
+        if sim_save_path:
+            try:
+                with open(os.path.join(sim_save_path, "des_summary.json"),
+                          encoding="utf-8") as summary_file:
+                    structural_summary = json.load(summary_file)
+            except (OSError, TypeError, ValueError):
+                structural_summary = {}
+        for key in (
+                "communication_plan_version", "communication_plan_count",
+                "communication_plan_unknown_count", "communication_plan_partial_count",
+                "optimizer_lifecycle", "performance_observations_used_as_parameters"):
+            if key in structural_summary:
+                aligned[key] = structural_summary[key]
         for base in {sim_save_path, getattr(self, "_analysis_save_path", None)}:
             if not base:
                 continue

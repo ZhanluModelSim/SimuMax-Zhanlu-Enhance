@@ -16,6 +16,7 @@ from typing import Dict, List, Optional
 _RANK_PREFIX = re.compile(r"^rank(\d+)-")
 _LAYER_RE = re.compile(r"(?:mxxmodellayer|layer)[_-]?(\d+)", re.IGNORECASE)
 _MICROBATCH_RANK = re.compile(r"^(microbatch\d+)rank\d+$", re.IGNORECASE)
+_MICROBATCH = re.compile(r"^microbatch(\d+)$", re.IGNORECASE)
 
 
 def _normalise_token(value: object) -> str:
@@ -222,7 +223,9 @@ def _canonical_stage(text: str, name: str, kind: Optional[str],
 
 def _derive_semantic_metadata(segments: List[str], name: str,
                               operation: str, kind: Optional[str],
-                              metadata: Optional[Dict[str, object]]) -> Dict[str, object]:
+                              metadata: Optional[Dict[str, object]],
+                              stream: Optional[str] = None,
+                              lane: Optional[str] = None) -> Dict[str, object]:
     """Derive stable semantic fields from model-generated event context."""
     supplied = dict(metadata or {})
     text = "/".join(segments)
@@ -274,8 +277,85 @@ def _derive_semantic_metadata(segments: List[str], name: str,
         supplied.setdefault("comm_owner", comm_owner)
         supplied.setdefault("comm_role", comm_role or stage)
         supplied.setdefault("group_kind", group_kind)
+        # Keep one portable owner vocabulary for trace consumers.  The
+        # resource-level ``comm_owner`` remains available, while
+        # ``semantic_owner`` identifies the logical collective role.  Explicit
+        # model declarations (for example model-level gradient sync) win.
+        supplied.setdefault(
+            "semantic_owner",
+            comm_role or comm_stage or comm_owner or stage,
+        )
+        supplied.setdefault("semantic_phase", operation)
+        supplied.setdefault(
+            "layer_id",
+            f"layer{layer_idx}" if layer_idx is not None else "model",
+        )
+        supplied.setdefault(
+            "module_path",
+            supplied.get("owner_path") or "/".join(segments[:-1]),
+        )
+
+    # These fields describe the model's structural dependency and overlap
+    # contract.  They deliberately use categories and lane names rather than
+    # profiler timings or CANN/HCCL kernel names.  Explicit model metadata is
+    # retained when a caller has a stronger dependency declaration.
+    resource_lane = str(lane or stream or "comp")
+    explicit_dependency = bool(
+        supplied.get("depends_on") or supplied.get("dependency_ids")
+        or supplied.get("consumer_id")
+    )
+    if kind == "wait":
+        dependency_defaults = {
+            "dependency_kind": "consumer_barrier",
+            "dependency_status": "explicit" if explicit_dependency else "implicit_lifecycle",
+            "ready_rule": "all_dependencies_complete",
+            "overlap_policy": "wait_for_dependencies",
+            "overlap_lanes": ["comp"],
+        }
+    elif kind == "comm":
+        blocking = resource_lane in ("comp", "compute")
+        dependency_defaults = {
+            "dependency_kind": "communication_lifecycle",
+            "dependency_status": "explicit" if explicit_dependency else "implicit_lifecycle",
+            "ready_rule": "post_then_completion",
+            "overlap_policy": "blocking_collective" if blocking else "async_until_wait",
+            "overlap_lanes": ["comp"] if blocking else [resource_lane, "comp"],
+        }
+    elif kind == "runtime":
+        direction = str(supplied.get("offload_direction") or "").lower()
+        dependency_defaults = {
+            "dependency_kind": "runtime_transfer",
+            "dependency_status": "explicit" if explicit_dependency else "implicit_lane_order",
+            "ready_rule": (
+                "producer_complete_before_d2h"
+                if direction == "d2h" else "h2d_complete_before_consumer"
+            ),
+            "overlap_policy": supplied.get("overlap_policy") or "async",
+            "overlap_lanes": (
+                [resource_lane] if supplied.get("overlap_policy") == "serial"
+                else [resource_lane, "comp"]
+            ),
+        }
+    elif kind == "fused":
+        dependency_defaults = {
+            "dependency_kind": "resource_lane_order",
+            "dependency_status": "explicit" if explicit_dependency else "implicit_lane_order",
+            "ready_rule": "lane_start_after_inputs",
+            "overlap_policy": "multi_lane_fused",
+            "overlap_lanes": [resource_lane],
+        }
+    else:
+        dependency_defaults = {
+            "dependency_kind": "compute_lane_order",
+            "dependency_status": "explicit" if explicit_dependency else "implicit_lane_order",
+            "ready_rule": "previous_ready_on_lane",
+            "overlap_policy": "compute_lane_serial",
+            "overlap_lanes": [resource_lane],
+        }
+    for key, value in dependency_defaults.items():
+        supplied.setdefault(key, value)
+    supplied.setdefault("semantic_stage", stage)
     supplied.update({
-        "semantic_stage": stage,
         "layer_idx": layer_idx,
         "stage_role": (
             "communication" if kind == "comm" else
@@ -346,7 +426,58 @@ class SimuEvent:
     # event stream proves only lifecycle ordering, not the downstream tensor
     # consumer that determines communication masking.
     consumer_id: Optional[str] = None
+    # Semantic phase of the consumer that owns a wait/barrier.  This is
+    # separate from ``operation`` because a backward reduce-scatter may be
+    # issued in the backward queue but consumed by the optimizer tail.
+    consumer_phase: Optional[str] = None
     depends_on: Optional[List[str]] = None
+    # Structural dependency and overlap categories.  These are not measured
+    # runtime factors and do not encode CANN/HCCL kernel identities.
+    dependency_kind: Optional[str] = None
+    dependency_status: Optional[str] = None
+    ready_rule: Optional[str] = None
+    overlap_policy: Optional[str] = None
+    overlap_lanes: Optional[List[str]] = None
+    # Stable structural occurrence information.  These counters are assigned
+    # while the model emits the event stream and never depend on profiler
+    # event ids or measured durations.
+    event_index: Optional[int] = None
+    semantic_occurrence: Optional[int] = None
+    microbatch_index: Optional[int] = None
+    aggregation_policy: Optional[str] = None
+    logical_substep_count: Optional[int] = None
+    # CollectiveCall lifecycle metadata.  The nested object carries the
+    # portable structural contract and simulator-clock timestamps; measured
+    # profiler duration is never stored as a model parameter here.
+    collective: Optional[str] = None
+    lifecycle_stage: Optional[str] = None
+    algorithm: Optional[str] = None
+    algorithm_stages: Optional[int] = None
+    chunk_count: Optional[int] = None
+    payload_per_chunk_bytes: Optional[int] = None
+    post_time_ms: Optional[float] = None
+    completion_time_ms: Optional[float] = None
+    consumer_release_time_ms: Optional[float] = None
+    lifecycle: Optional[Dict[str, object]] = None
+    semantic_owner: Optional[str] = None
+    layer_id: Optional[str] = None
+    module_path: Optional[str] = None
+    semantic_phase: Optional[str] = None
+    consumer_event: Optional[str] = None
+    iteration_boundary: Optional[str] = None
+    physical_decomposition: Optional[str] = None
+    # Explicitly false for ordinary model-generated events.  A calibrated
+    # caller must opt in with ``True`` so provenance cannot be confused with
+    # an omitted/null field in exported ledgers.
+    measured_duration_used: bool = False
+    # Portable layout/physical-work ownership.  These fields describe how a
+    # semantic model event may be materialised by a backend; they are not
+    # profiler kernel ids and never contain measured durations.
+    fusion_scope: Optional[str] = None
+    physical_work_id: Optional[str] = None
+    memory_transaction_owner: Optional[str] = None
+    physical_stage_role: Optional[str] = None
+    layout_contract: Optional[Dict[str, object]] = None
 
 
 class EventSink:
@@ -360,6 +491,8 @@ class EventSink:
         # the primary simulation-side ordering key.
         self._comm_sequence_next: Dict[tuple, int] = {}
         self._comm_sequence_by_id: Dict[tuple, int] = {}
+        self._event_index = 0
+        self._semantic_occurrence_next: Dict[tuple, int] = {}
         # Spans whose call_stk lacks a 'rank<N>-' prefix are dropped here,
         # counted but otherwise ignored. This mirrors the legacy behavior
         # where such log lines were written to log.log but silently dropped
@@ -393,7 +526,41 @@ class EventSink:
             else:
                 scope = "model"
         semantic_meta = _derive_semantic_metadata(
-            segments, name or segments[-1], operation, kind, metadata)
+            segments, name or segments[-1], operation, kind, metadata,
+            stream=stream, lane=lane)
+        if kind in ("comm", "wait"):
+            lifecycle = dict(semantic_meta.get("lifecycle") or {})
+            lifecycle.setdefault("phase", operation)
+            if kind == "wait":
+                lifecycle.setdefault("event_stage", "consumer_release")
+                lifecycle.setdefault("consumer_release_time_ms", ed)
+            elif str(name or "").endswith("-post"):
+                lifecycle.setdefault("event_stage", "post")
+                lifecycle.setdefault("post_time_ms", st)
+            else:
+                lifecycle.setdefault("event_stage", "completion")
+                lifecycle.setdefault("completion_time_ms", ed)
+            lifecycle.setdefault("time_provenance", "simulator_clock")
+            semantic_meta["lifecycle"] = lifecycle
+        microbatch_index = None
+        for segment in segments:
+            microbatch_match = _MICROBATCH.match(str(segment))
+            if microbatch_match:
+                microbatch_index = int(microbatch_match.group(1))
+                break
+        # Count occurrences within a semantic stage, rather than within the
+        # full call-stack identity.  The latter is unique for every layer and
+        # consequently made every ``semantic_occurrence`` equal to zero.  A
+        # stage-local ordinal is useful to portable consumers (for example,
+        # the Nth VWN/Norm/MatMul occurrence in a microbatch) while remaining
+        # independent of profiler ids, durations, and hardware-specific
+        # kernel names.
+        occurrence_key = (
+            int(match.group(1)), operation, semantic_meta.get("semantic_stage"),
+            kind or "",
+        )
+        semantic_occurrence = self._semantic_occurrence_next.get(occurrence_key, 0)
+        self._semantic_occurrence_next[occurrence_key] = semantic_occurrence + 1
         if kind in ("comm", "wait"):
             comm_id = semantic_meta.get("comm_id") or gid
             comm_key = (
@@ -402,12 +569,13 @@ class EventSink:
                 semantic_meta.get("group_kind"),
                 semantic_meta.get("comm_stage"),
                 semantic_meta.get("comm_owner"),
-                # A repeated microbatch has the same model-generated comm id
-                # but a different semantic call-stack identity.  Keeping the
-                # semantic id in the sequence key prevents cross-microbatch
-                # plan aliases while post/completion/wait spans still reuse
-                # the same sequence within one call.
-                semantic_id,
+                # Sequence is a structural occurrence ordinal for one
+                # microbatch/stage/owner family.  Do not include the full
+                # semantic_id here: it contains layer identity and would
+                # reset every sequence to zero, making cross-layer order
+                # unusable.  The call-level comm_id/phase_id below still
+                # guarantees that post/completion/wait spans reuse one entry.
+                microbatch_index,
             )
             id_key = (comm_key, str(comm_id), phase_id)
             if id_key not in self._comm_sequence_by_id:
@@ -431,6 +599,8 @@ class EventSink:
                     f"{comm_id if comm_id is not None else 'unknown'}"
                 )
                 semantic_meta["plan_id"] = plan_id
+        event_index = self._event_index
+        self._event_index += 1
         self.events.append(SimuEvent(
             rank=int(match.group(1)),
             name=name or segments[-1],
@@ -473,8 +643,54 @@ class EventSink:
             comm_id=semantic_meta.get("comm_id"),
             plan_id=semantic_meta.get("plan_id"),
             consumer_id=semantic_meta.get("consumer_id"),
+            consumer_phase=semantic_meta.get("consumer_phase"),
             depends_on=semantic_meta.get("depends_on")
             or semantic_meta.get("dependency_ids"),
+            dependency_kind=semantic_meta.get("dependency_kind"),
+            dependency_status=semantic_meta.get("dependency_status"),
+            ready_rule=semantic_meta.get("ready_rule"),
+            overlap_policy=semantic_meta.get("overlap_policy"),
+            overlap_lanes=semantic_meta.get("overlap_lanes"),
+            event_index=event_index,
+            semantic_occurrence=semantic_occurrence,
+            microbatch_index=microbatch_index,
+            aggregation_policy=semantic_meta.get("aggregation_policy"),
+            logical_substep_count=semantic_meta.get("logical_substep_count"),
+            collective=semantic_meta.get("collective")
+            or (semantic_meta.get("lifecycle") or {}).get("collective"),
+            lifecycle_stage=semantic_meta.get("lifecycle_stage")
+            or (semantic_meta.get("lifecycle") or {}).get("event_stage"),
+            algorithm=semantic_meta.get("algorithm")
+            or (semantic_meta.get("lifecycle") or {}).get("algorithm"),
+            algorithm_stages=semantic_meta.get("algorithm_stages")
+            or (semantic_meta.get("lifecycle") or {}).get("algorithm_stages"),
+            chunk_count=semantic_meta.get("chunk_count")
+            or (semantic_meta.get("lifecycle") or {}).get("chunk_count"),
+            payload_per_chunk_bytes=semantic_meta.get("payload_per_chunk_bytes")
+            or (semantic_meta.get("lifecycle") or {}).get("payload_per_chunk_bytes"),
+            post_time_ms=(semantic_meta.get("lifecycle") or {}).get("post_time_ms"),
+            completion_time_ms=(semantic_meta.get("lifecycle") or {}).get(
+                "completion_time_ms"),
+            consumer_release_time_ms=(semantic_meta.get("lifecycle") or {}).get(
+                "consumer_release_time_ms"),
+            lifecycle=semantic_meta.get("lifecycle"),
+            semantic_owner=semantic_meta.get("semantic_owner"),
+            layer_id=semantic_meta.get("layer_id"),
+            module_path=semantic_meta.get("module_path"),
+            semantic_phase=(
+                semantic_meta.get("semantic_phase")
+                or semantic_meta.get("phase")
+                or operation
+            ),
+            consumer_event=semantic_meta.get("consumer_event"),
+            iteration_boundary=semantic_meta.get("iteration_boundary"),
+            physical_decomposition=semantic_meta.get("physical_decomposition"),
+            measured_duration_used=semantic_meta.get("measured_duration_used", False),
+            fusion_scope=semantic_meta.get("fusion_scope"),
+            physical_work_id=semantic_meta.get("physical_work_id"),
+            memory_transaction_owner=semantic_meta.get("memory_transaction_owner"),
+            physical_stage_role=semantic_meta.get("physical_stage_role"),
+            layout_contract=semantic_meta.get("layout_contract"),
         ))
 
 
@@ -526,7 +742,41 @@ def event_to_record(event: SimuEvent) -> dict:
         "comm_id": event.comm_id,
         "plan_id": event.plan_id,
         "consumer_id": event.consumer_id,
+        "consumer_phase": event.consumer_phase,
         "depends_on": event.depends_on,
+        "dependency_kind": event.dependency_kind,
+        "dependency_status": event.dependency_status,
+        "ready_rule": event.ready_rule,
+        "overlap_policy": event.overlap_policy,
+        "overlap_lanes": event.overlap_lanes,
+        "event_index": event.event_index,
+        "semantic_occurrence": event.semantic_occurrence,
+        "microbatch_index": event.microbatch_index,
+        "aggregation_policy": event.aggregation_policy,
+        "logical_substep_count": event.logical_substep_count,
+        "collective": event.collective,
+        "lifecycle_stage": event.lifecycle_stage,
+        "algorithm": event.algorithm,
+        "algorithm_stages": event.algorithm_stages,
+        "chunk_count": event.chunk_count,
+        "payload_per_chunk_bytes": event.payload_per_chunk_bytes,
+        "post_time_ms": event.post_time_ms,
+        "completion_time_ms": event.completion_time_ms,
+        "consumer_release_time_ms": event.consumer_release_time_ms,
+        "lifecycle": event.lifecycle,
+        "semantic_owner": event.semantic_owner,
+        "layer_id": event.layer_id,
+        "module_path": event.module_path,
+        "semantic_phase": event.semantic_phase,
+        "consumer_event": event.consumer_event,
+        "iteration_boundary": event.iteration_boundary,
+        "physical_decomposition": event.physical_decomposition,
+        "measured_duration_used": event.measured_duration_used,
+        "fusion_scope": event.fusion_scope,
+        "physical_work_id": event.physical_work_id,
+        "memory_transaction_owner": event.memory_transaction_owner,
+        "physical_stage_role": event.physical_stage_role,
+        "layout_contract": event.layout_contract,
     }
 
 

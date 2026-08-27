@@ -211,14 +211,30 @@ def _owner_for_group(group_kind: Any, stage: Any = None) -> Optional[str]:
 
 def _collective_family(value: Any) -> str:
     token = _normalised_name(value)
-    if "alltoall" in token or "all2all" in token or "a2a" in token:
+    raw = str(value or "").lower()
+    # Keep fixed-count ``all2all`` distinct from variable-count ``alltoallv``
+    # in semantic accounting.  Both use the same generic pairwise algorithm
+    # for cost derivation, but they are different logical call families.
+    if "alltoallv" in token or "all2allv" in token or "a2av" in token:
         return "alltoallv"
+    if "alltoall" in token or "all2all" in token or "a2a" in token:
+        return "alltoall"
     if "allreduce" in token or "synchallreduce" in token:
         return "all_reduce"
     if "reducescatter" in token or token in {"rs", "modelmoers", "fsdprs"}:
         return "reduce_scatter"
     if "allgather" in token or token in {"ag", "modelmoeag", "fsdpag"}:
         return "all_gather"
+    # DES events use compact semantic suffixes for model-level collectives
+    # (for example ``layer_dense_bwd_ag`` and ``router_topk_ids_agv``).  These
+    # are model metadata aliases, not profiler names.  Normalize them here so
+    # the same levels-derived call can be reused by the plan builder.
+    if token.endswith(("ag", "agv")) or re.search(
+            r"(?:^|[_-])(?:ag|agv)(?:[_-]|$)", raw):
+        return "all_gather"
+    if token.endswith(("rs", "rsv")) or re.search(
+            r"(?:^|[_-])(?:rs|rsv)(?:[_-]|$)", raw):
+        return "reduce_scatter"
     if token in {"p2p", "send", "recv"} or "sendrecv" in token:
         return "p2p"
     return str(value or "communication")
@@ -239,7 +255,10 @@ def _event_collective_family(event: Any) -> str:
         _get(event, "comm_role"),
         _get(event, "comm_stage"),
     ]
-    known = {"alltoallv", "all_reduce", "reduce_scatter", "all_gather", "p2p"}
+    known = {
+        "alltoall", "alltoallv", "all_reduce", "reduce_scatter",
+        "all_gather", "p2p",
+    }
     for candidate in candidates:
         family = _collective_family(candidate)
         if family in known:
@@ -276,6 +295,68 @@ def _provenance(system: Any) -> Dict[str, Any]:
     }
 
 
+def _runtime_profile_summary(system: Any) -> Dict[str, Any]:
+    """Expose software-runtime contracts without copying profiler results.
+
+    The communication plan is an interchange artifact.  Keeping the selected
+    CANN/HCCL policies next to each plan makes it possible to audit which
+    structural assumptions produced a call, while deliberately omitting
+    measured durations, counters, and calibration multipliers.
+    """
+
+    if system is None:
+        return {"status": "unknown", "reason": "system_profile_missing"}
+    cann = dict(getattr(system, "cann_runtime", {}) or {})
+    hccl = dict(getattr(system, "hccl_runtime", {}) or {})
+    compute = dict(cann.get("compute", {}) or {})
+    host_tiling = dict(compute.get("host_tiling", {}) or {})
+    network = dict(hccl.get("network", {}) or {})
+    runtime = dict(network.get("call_runtime", {}) or {})
+    algorithm = dict(network.get("algorithm_selection", {}) or {})
+    return {
+        "cann": {
+            "schema": cann.get("schema"),
+            "profile_kind": cann.get("profile_kind"),
+            "spec_status": cann.get("spec_status"),
+            "version": cann.get("version"),
+            "target_architecture": cann.get("target_architecture"),
+            "host_tiling_policy": host_tiling.get("policy"),
+            "host_tiling_input_fields": list(
+                host_tiling.get("input_fields", []) or []),
+            "host_tiling_output_fields": list(
+                host_tiling.get("output_fields", []) or []),
+            "tile_policy": host_tiling.get("tile_policy"),
+            "block_dim_policy": host_tiling.get("block_dim_policy"),
+            "workspace_policy": host_tiling.get("workspace_policy"),
+            "stage_dependency_policy": host_tiling.get(
+                "stage_dependency_policy"),
+            "alignment_constraints": compute.get("alignment_constraints"),
+            "source_refs": list(cann.get("source_refs", []) or []),
+        },
+        "hccl": {
+            "schema": hccl.get("schema"),
+            "profile_kind": hccl.get("profile_kind"),
+            "spec_status": hccl.get("spec_status"),
+            "version": hccl.get("version"),
+            "supported_collectives": list(
+                network.get("supported_collectives", []) or []),
+            "algorithm_selection_policy": algorithm.get("policy"),
+            "algorithm_level_scope": algorithm.get("level_scope"),
+            "runtime_execution_stages": runtime.get("execution_stages"),
+            "task_count_policy": runtime.get("task_count_policy"),
+            "descriptor_policy": runtime.get("descriptor_policy"),
+            "completion_policy": runtime.get("completion_policy"),
+            "resource_request": network.get("resource_request"),
+            "completion_rule": runtime.get("completion_rule"),
+            "wait_rule": runtime.get("wait_rule"),
+            "barrier_rule": runtime.get("barrier_rule"),
+            "source_refs": list(hccl.get("source_refs", []) or []),
+        },
+        "performance_observations_used_as_parameters": False,
+        "measured_results_role": "validation_only",
+    }
+
+
 def _status(unknown_fields: Sequence[str]) -> str:
     if not unknown_fields:
         return "known"
@@ -293,6 +374,11 @@ def _runtime_facts(system: Any, op_name: Any, group_size: Optional[int],
     if callable(getter):
         cfg = dict(getter() or {})
     runtime_cfg = dict(cfg.get("call_runtime", {}) or {})
+    algorithm_selection = dict(cfg.get("algorithm_selection", {}) or {})
+    supported_collectives = list(cfg.get("supported_collectives", []) or [])
+    resource_request = cfg.get("resource_request")
+    hccl_profile = dict(getattr(system, "hccl_runtime", {}) or {})
+    profile_spec_status = hccl_profile.get("spec_status")
     compute_cfg = {}
     compute_getter = getattr(system, "_cann_compute_config", None)
     if callable(compute_getter):
@@ -303,6 +389,14 @@ def _runtime_facts(system: Any, op_name: Any, group_size: Optional[int],
             "call_runtime_overhead_us": None,
             "algorithm_stages": None,
             "runtime_task_count": None,
+            "algorithm_selection_policy": algorithm_selection.get("policy"),
+            "algorithm_level_scope": algorithm_selection.get("level_scope"),
+            "supported_collectives": supported_collectives,
+            "resource_request": resource_request,
+            "task_count_policy": runtime_cfg.get("task_count_policy"),
+            "descriptor_policy": runtime_cfg.get("descriptor_policy"),
+            "completion_policy": runtime_cfg.get("completion_policy"),
+            "runtime_profile_spec_status": profile_spec_status,
             "unknown_reason": "group_or_payload_missing",
         }
     algorithm, stages = collective_algorithm(op_name, group_size)
@@ -313,6 +407,14 @@ def _runtime_facts(system: Any, op_name: Any, group_size: Optional[int],
             "algorithm_stages": None,
             "runtime_task_count": None,
             "call_runtime_overhead_us": None,
+            "algorithm_selection_policy": algorithm_selection.get("policy"),
+            "algorithm_level_scope": algorithm_selection.get("level_scope"),
+            "supported_collectives": supported_collectives,
+            "resource_request": resource_request,
+            "task_count_policy": runtime_cfg.get("task_count_policy"),
+            "descriptor_policy": runtime_cfg.get("descriptor_policy"),
+            "completion_policy": runtime_cfg.get("completion_policy"),
+            "runtime_profile_spec_status": profile_spec_status,
             "unknown_reason": "algorithm_stage_count_missing",
         }
     # Match the canonical SystemConfig runtime formula.  Missing optional
@@ -332,6 +434,21 @@ def _runtime_facts(system: Any, op_name: Any, group_size: Optional[int],
         assumptions.append("tasks_per_stage:portable_default_1")
     chunk_bytes = runtime_cfg.get("descriptor_chunk_bytes", 0)
     tasks_per_chunk = runtime_cfg.get("tasks_per_additional_chunk", 0)
+    execution_stages = runtime_cfg.get(
+        "execution_stages", ["post", "task", "completion", "wait"])
+    if not isinstance(execution_stages, list):
+        execution_stages = [str(execution_stages)]
+    completion_cfg = dict(runtime_cfg.get("completion", {}) or {})
+    completion_fields = (
+        "completion_latency_us", "wait_latency_us", "barrier_latency_us")
+    completion_unknown_fields = [
+        name for name in completion_fields
+        if not isinstance(completion_cfg.get(name), (int, float))
+    ]
+    completion_overhead = sum(
+        max(0.0, float(completion_cfg.get(name, 0.0)))
+        for name in completion_fields
+        if isinstance(completion_cfg.get(name), (int, float)))
     missing = []
     if launch is None:
         missing.append("call_launch_latency_us")
@@ -347,6 +464,14 @@ def _runtime_facts(system: Any, op_name: Any, group_size: Optional[int],
             "algorithm_stages": stages,
             "runtime_task_count": None,
             "call_runtime_overhead_us": None,
+            "algorithm_selection_policy": algorithm_selection.get("policy"),
+            "algorithm_level_scope": algorithm_selection.get("level_scope"),
+            "supported_collectives": supported_collectives,
+            "resource_request": resource_request,
+            "task_count_policy": runtime_cfg.get("task_count_policy"),
+            "descriptor_policy": runtime_cfg.get("descriptor_policy"),
+            "completion_policy": runtime_cfg.get("completion_policy"),
+            "runtime_profile_spec_status": profile_spec_status,
             "unknown_reason": ";".join(missing),
             "assumptions": assumptions,
         }
@@ -356,7 +481,7 @@ def _runtime_facts(system: Any, op_name: Any, group_size: Optional[int],
     stage_tasks = int(stages) * max(1, int(active_levels)) * int(tasks_per_stage)
     descriptor_tasks = max(0, chunks - 1) * int(tasks_per_chunk)
     task_count = stage_tasks + descriptor_tasks
-    overhead = float(launch) + task_count * float(task_launch)
+    overhead = float(launch) + task_count * float(task_launch) + completion_overhead
     return {
         "status": "known",
         "execution_engine": runtime_cfg.get("execution_engine", "host_cpu_ts"),
@@ -370,8 +495,24 @@ def _runtime_facts(system: Any, op_name: Any, group_size: Optional[int],
         "call_launch_latency_us": float(launch),
         "task_launch_latency_us": float(task_launch),
         "call_runtime_overhead_us": overhead,
+        "algorithm_selection_policy": algorithm_selection.get("policy"),
+        "algorithm_level_scope": algorithm_selection.get("level_scope"),
+        "supported_collectives": supported_collectives,
+        "resource_request": resource_request,
+        "task_count_policy": runtime_cfg.get("task_count_policy"),
+        "descriptor_policy": runtime_cfg.get("descriptor_policy"),
+        "completion_policy": runtime_cfg.get("completion_policy"),
+        "runtime_profile_spec_status": profile_spec_status,
+        "execution_stages": execution_stages,
+        "completion_latency_us": completion_cfg.get("completion_latency_us"),
+        "wait_latency_us": completion_cfg.get("wait_latency_us"),
+        "barrier_latency_us": completion_cfg.get("barrier_latency_us"),
+        "completion_overhead_us": completion_overhead,
+        "runtime_profile_unknown_fields": completion_unknown_fields,
         "assumptions": assumptions,
-        "formula": "T_runtime=L_call+(stages*active_levels*tasks_per_stage+descriptor_tasks)*L_task",
+        "formula": (
+            "T_runtime=L_call+(stages*active_levels*tasks_per_stage+"
+            "descriptor_tasks)*L_task+T_completion+T_wait+T_barrier"),
     }
 
 
@@ -486,6 +627,150 @@ def _call_row_for_event(event: Any,
     }
 
 
+def _strategy_net_for_group(strategy: Any, group_kind: Any,
+                            system: Any = None) -> Optional[str]:
+    """Resolve the configured physical path for a semantic communication.
+
+    This is deliberately a configuration lookup.  It never inspects a
+    profiler trace and it does not infer a network from event duration.  When
+    a hierarchical topology exists, an unset/``auto`` selector uses the
+    canonical ``levels`` path; otherwise the strategy's explicit selector is
+    preserved.
+    """
+
+    kind = str(group_kind or "").lower()
+    field = {
+        "cp": "cp_net",
+        "dp_cp": "dp_net",
+        "dp": "dp_net",
+        "edp": "edp_net",
+        "ep": "ep_net",
+        "tp": "tp_net",
+        "etp": "etp_net",
+        "pp": "pp_net",
+    }.get(kind)
+    value = getattr(strategy, field, None) if field else None
+    if value in (None, "", "auto"):
+        value = getattr(strategy, "net", None)
+    if value in (None, "", "auto") and system is not None:
+        if (getattr(system, "topology", None) or {}).get("levels"):
+            value = getattr(system, "LEVELS_NET", "levels")
+    return str(value) if value not in (None, "") else None
+
+
+def _operation_for_family(family: str) -> Optional[str]:
+    """Map a semantic collective family to a supported cost-model operation."""
+
+    return {
+        # ``alltoall`` is a semantic fixed-count family, while the cost
+        # implementation is intentionally shared with the variable-count
+        # alltoallv operation.  Preserve the family label in the plan and
+        # use the existing operation only for formula lookup.
+        "alltoall": "alltoallv",
+        "alltoallv": "alltoallv",
+        "all_gather": "all_gather",
+        "reduce_scatter": "reduce_scatter",
+        "all_reduce": "all_reduce",
+        "p2p": "p2p",
+    }.get(family)
+
+
+def _derive_call_row_from_config(system: Any, strategy: Any, event: Any,
+                                 family: str, derivation_records: Mapping[str, Any]
+                                 ) -> Optional[Dict[str, Any]]:
+    """Materialize a missing call fact from model/config inputs.
+
+    A DES event carries the semantic payload before a collective's configured
+    scale/offset transformation.  Existing derivation rows store the actual
+    transferred bytes after that transformation, so exact byte equality is not
+    always a valid identity test.  Calling the same forward cost formula with
+    the event's structural fields produces the correct physical-level record
+    without using timing observations.  The result is tagged explicitly so
+    consumers can distinguish it from a direct table hit.
+    """
+
+    if system is None or strategy is None:
+        return None
+    if not getattr(system, "forward_derivation_enabled", False):
+        return None
+    group_kind = _get(event, "group_kind")
+    group_size = _get(event, "group_size")
+    payload = _get(event, "payload_bytes")
+    if group_size is None or payload is None:
+        return None
+    try:
+        group_size = int(group_size)
+        payload = int(payload)
+    except (TypeError, ValueError):
+        return None
+    if group_size <= 1 or payload <= 0:
+        return None
+    operation = _operation_for_family(family)
+    if operation is None:
+        return None
+    stage = (_get(event, "comm_stage") or _get(event, "comm_role")
+             or _get(event, "name") or family)
+    net = _strategy_net_for_group(strategy, group_kind, system=system)
+    if not net:
+        return None
+
+    communications = derivation_records.setdefault("communications", {}) \
+        if isinstance(derivation_records, dict) else None
+    if communications is None:
+        return None
+    before = set(communications)
+    try:
+        # The call reuses SystemConfig's normal levels/single-net formula.  It
+        # may append a forward derivation record, but it does not alter DES
+        # event timing or read any profiler artifact.
+        system.compute_net_op_time(
+            operation, payload, group_size, net=net,
+            comm_stage=str(stage), strategy=strategy, group_kind=group_kind,
+            # Preserve the event's semantic calibration context when the
+            # plan document materializes a structural derivation row.  The
+            # plan builder must not silently turn a role-scoped calibrated
+            # call into a role-free lookup (which previously made model-level
+            # AllGather/ReduceScatter appear to use the generic multiplier).
+            comm_direction=_get(event, "direction") or _get(event, "operation"),
+            comm_role=_get(event, "comm_role"))
+    except (AssertionError, KeyError, TypeError, ValueError):
+        return None
+
+    rows = list(communications.values())
+    target = f"levels:{str(stage).lower()}:call"
+    candidates = []
+    for row in rows:
+        row_stage = str(row.get("stage") or "").lower()
+        if row_stage != target and row_stage != str(stage).lower():
+            continue
+        if group_kind is not None and row.get("group_kind") is not None \
+                and str(row.get("group_kind")) != str(group_kind):
+            continue
+        if row.get("comm_num") is not None and int(row["comm_num"]) != group_size:
+            continue
+        if _collective_family(row.get("algorithm_family") or row.get("op_name")) != family:
+            continue
+        candidates.append(row)
+    if not candidates:
+        # A single-net profile may not use a ``levels:*:call`` stage.  Restrict
+        # the fallback to rows created by this invocation and the same
+        # structural family/group so it cannot silently borrow another call.
+        candidates = [
+            row for key, row in communications.items()
+            if key not in before
+            and _collective_family(row.get("algorithm_family") or row.get("op_name")) == family
+            and (group_kind is None or str(row.get("group_kind")) == str(group_kind))
+            and (row.get("comm_num") is None or int(row["comm_num"]) == group_size)
+        ]
+    if not candidates:
+        return None
+    result = dict(candidates[-1])
+    result["mapping_status"] = "config_derived"
+    result["event_payload_bytes"] = payload
+    result["payload_transform_source"] = "network_operation_scale_offset"
+    return result
+
+
 def _ideal_transfer_time_ms(levels: Sequence[Mapping[str, Any]],
                             composition_policy: Optional[str] = None) -> Optional[float]:
     phase_times = []
@@ -580,6 +865,23 @@ def _plan_key(event: Any, ordinal: int) -> Tuple[Any, ...]:
     return (str(semantic), str(operation), str(comm_id), sequence, segment)
 
 
+def _is_unscoped_wait(event: Any) -> bool:
+    """Return whether a wait is only a dependency marker, not a call.
+
+    FSDP/DES can emit a barrier-like wait event with no collective id, group,
+    or payload. Treating its generated plan_id as a communication identity
+    creates a fabricated unknown call. The event remains in the semantic
+    ledger and DES trace; it is excluded from the call-level table until an
+    explicit consumer edge exists.
+    """
+
+    if _get(event, "kind") != "wait":
+        return False
+    return not any(_get(event, field) is not None for field in (
+        "comm_id", "gid", "group_kind", "group_size", "payload_bytes",
+    ))
+
+
 def build_plans_from_events(events: Iterable[Any], system: Any = None,
                             strategy: Any = None,
                             derivation_records: Optional[Mapping[str, Any]] = None,
@@ -589,6 +891,8 @@ def build_plans_from_events(events: Iterable[Any], system: Any = None,
     grouped: Dict[Tuple[Any, ...], List[Any]] = defaultdict(list)
     for ordinal, event in enumerate(events or []):
         if _get(event, "kind") not in ("comm", "wait"):
+            continue
+        if _is_unscoped_wait(event):
             continue
         if (_get(event, "comm_id") is None and _get(event, "gid") is None
                 and _get(event, "plan_id") is None):
@@ -615,6 +919,15 @@ def build_plans_from_events(events: Iterable[Any], system: Any = None,
             f"/s{sequence if sequence is not None else 'u'}"
             f"/{_safe_token(comm_id)}")
         call_row = _call_row_for_event(primary, derivation_records)
+        if (call_row is None
+                or call_row.get("mapping_status") in {
+                    "ambiguous", "payload_mismatch"
+                }):
+            config_row = _derive_call_row_from_config(
+                system, strategy, primary, family,
+                derivation_records if derivation_records is not None else {})
+            if config_row is not None:
+                call_row = config_row
         call_mapping_status = call_row.get("mapping_status") if call_row else "not_found"
         composition_policy = call_row.get("composition_policy") if call_row else None
         levels = []
@@ -707,12 +1020,54 @@ def build_plans_from_events(events: Iterable[Any], system: Any = None,
             and not str(_get(row, "name") or "").endswith("-post")
             and _event_cost(row) > 0)
         lifecycle = {
+            "schema": "collective_call_v1",
+            "collective": family,
+            "owner": _get(primary, "comm_owner") or _owner_for_group(group_kind, op_name),
+            "phase": operation,
+            "sequence": _get(primary, "comm_sequence"),
+            "segment_index": _get(primary, "comm_segment_index"),
+            "payload_bytes": int(payload) if payload is not None else None,
+            "algorithm": algorithm,
+            "algorithm_stages": stages,
             "event_count": len(rows),
             "rank_count": len({_get(row, "rank") for row in rows}),
             "post_count": post_count,
             "completion_count": completion_count,
             "wait_count": wait_count,
         }
+        primary_lifecycle = dict(_get(primary, "lifecycle") or {})
+        lifecycle_facts = {
+            key: primary_lifecycle.get(key)
+            for key in (
+                "chunk_count",
+                "payload_per_chunk_bytes",
+                "chunk_count_source",
+                "lifecycle_components",
+                "runtime",
+                "provenance",
+            )
+            if key in primary_lifecycle
+        }
+        if lifecycle_facts:
+            lifecycle.update(lifecycle_facts)
+        post_times = []
+        completion_times = []
+        release_times = []
+        for row in rows:
+            row_lifecycle = dict(_get(row, "lifecycle") or {})
+            if row_lifecycle.get("post_time_ms") is not None:
+                post_times.append(float(row_lifecycle["post_time_ms"]))
+            if row_lifecycle.get("completion_time_ms") is not None:
+                completion_times.append(float(row_lifecycle["completion_time_ms"]))
+            if row_lifecycle.get("consumer_release_time_ms") is not None:
+                release_times.append(float(row_lifecycle["consumer_release_time_ms"]))
+        lifecycle.update({
+            "post_time_ms": min(post_times) if post_times else None,
+            "completion_time_ms": max(completion_times) if completion_times else None,
+            "consumer_release_time_ms": max(release_times) if release_times else None,
+            "time_provenance": "simulator_clock" if (
+                post_times or completion_times or release_times) else "not_emitted",
+        })
         lifecycle.update(_simulated_overlap(rows))
         edges = []
         if post_count and completion_count:
@@ -967,4 +1322,5 @@ def build_communication_plan_document(
             "measured_results_role": "validation_only",
         },
         "provenance": _provenance(system),
+        "runtime_spec": _runtime_profile_summary(system),
     }
